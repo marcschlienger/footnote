@@ -1,0 +1,223 @@
+/* Footnote — self-hosted deep-research server. Copyright (C) 2026 Marc Schlienger
+   Licensed under the GNU AGPL v3.0 or later; see the LICENSE file.
+   Paper-and-ink look, same family as Margin: cream paper, slate text,
+   a red rule, blue ink for the app's own marks. */
+
+:root {
+  --paper: #F5EEDC;
+  --paper-deep: #EDE2C9;
+  --ink: #33394A;
+  --ink-soft: #5D6883;
+  --rule-red: #C43D33;
+  --pen-blue: #3D6BB3;
+  --ok: #3E7A4E;
+  --card: #FBF7EB;
+  --serif: "Iowan Old Style", "Palatino", "Georgia", serif;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font: 16px/1.55 var(--sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+main {
+  max-width: 40rem;
+  margin: 0 auto;
+  padding: 1.5rem 1.1rem 3rem;
+  padding-top: calc(1.5rem + env(safe-area-inset-top));
+}
+
+/* Header ------------------------------------------------------------- */
+header {
+  display: flex;
+  align-items: center;
+  gap: .8rem;
+  margin-bottom: 1.4rem;
+}
+header img { border-radius: 10px; }
+h1 {
+  margin: 0;
+  font: 700 1.7rem/1.1 var(--serif);
+  letter-spacing: .01em;
+}
+.tagline { margin: .15rem 0 0; color: var(--ink-soft); font-size: .92rem; }
+
+/* Ask form ----------------------------------------------------------- */
+form#ask {
+  background: var(--card);
+  border: 1px solid #DACFB2;
+  border-left: 3px solid var(--rule-red);
+  border-radius: 10px;
+  padding: .9rem;
+  box-shadow: 0 1px 3px rgba(60, 50, 20, .07);
+}
+textarea {
+  width: 100%;
+  border: none;
+  background: transparent;
+  resize: vertical;
+  font: 1.05rem/1.5 var(--serif);
+  color: var(--ink);
+  min-height: 4.2rem;
+}
+textarea:focus { outline: none; }
+textarea::placeholder { color: #A79F8A; }
+
+.controls {
+  display: flex;
+  gap: .6rem;
+  margin-top: .6rem;
+  align-items: center;
+}
+select {
+  flex: 1;
+  font: .95rem var(--sans);
+  color: var(--ink-soft);
+  padding: .5rem .55rem;
+  border: 1px solid #D0C5A8;
+  border-radius: 8px;
+  background: var(--paper);
+}
+button {
+  font: 600 1rem var(--sans);
+  padding: .55rem 1.1rem;
+  border: none;
+  border-radius: 8px;
+  background: var(--pen-blue);
+  color: #FBF7EB;
+  cursor: pointer;
+}
+button:active { transform: translateY(1px); }
+button[disabled] { opacity: .55; cursor: default; }
+button .dagger { margin-left: .35rem; font-family: var(--serif); }
+button.ghost {
+  background: transparent;
+  color: var(--pen-blue);
+  border: 1px dashed var(--pen-blue);
+  font-weight: 500;
+  width: 100%;
+}
+
+#flash {
+  margin: .8rem 0 0;
+  padding: .55rem .8rem;
+  border-radius: 8px;
+  font-size: .93rem;
+  background: #E8F0E4;
+  color: var(--ok);
+}
+#flash.error { background: #F6E3E1; color: var(--rule-red); }
+#push-offer { margin-top: .8rem; }
+
+/* Jobs list ---------------------------------------------------------- */
+#jobs-section h2 {
+  font: 700 1.15rem var(--serif);
+  margin: 1.8rem 0 .6rem;
+  border-bottom: 2px solid var(--rule-red);
+  padding-bottom: .25rem;
+}
+#jobs-section .count {
+  font: 500 .8rem var(--sans);
+  color: var(--ink-soft);
+  margin-left: .5rem;
+}
+ul#jobs { list-style: none; margin: 0; padding: 0; }
+li.job {
+  background: var(--card);
+  border: 1px solid #E2D8BE;
+  border-radius: 10px;
+  padding: .75rem .9rem;
+  margin-bottom: .6rem;
+}
+.job .q {
+  font: 600 1rem/1.35 var(--serif);
+  margin: 0 0 .3rem;
+  overflow-wrap: anywhere;
+}
+.job .meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .35rem .7rem;
+  align-items: center;
+  font-size: .84rem;
+  color: var(--ink-soft);
+}
+.badge {
+  font: 600 .74rem var(--sans);
+  padding: .12rem .5rem;
+  border-radius: 99px;
+  color: #FBF7EB;
+  background: var(--ink-soft);
+  text-transform: uppercase;
+  letter-spacing: .04em;
+}
+.badge.researching, .badge.archiving, .badge.saving, .badge.queued {
+  background: var(--pen-blue);
+}
+.badge.done { background: var(--ok); }
+.badge.failed { background: var(--rule-red); }
+.job .progress { flex-basis: 100%; }
+.job .links { flex-basis: 100%; display: flex; gap: .9rem; }
+.job a { color: var(--pen-blue); text-decoration: none; font-weight: 600; }
+.job a:hover { text-decoration: underline; }
+.job .del {
+  background: none; border: none; color: var(--ink-soft);
+  font-size: .84rem; padding: 0; cursor: pointer; margin-left: auto;
+}
+.job .del:hover { color: var(--rule-red); }
+.spin {
+  display: inline-block; width: .8em; height: .8em;
+  border: 2px solid var(--pen-blue); border-top-color: transparent;
+  border-radius: 50%; animation: spin 1s linear infinite;
+  vertical-align: -.1em; margin-right: .3rem;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+footer { margin-top: 2.5rem; color: var(--ink-soft); font-size: .8rem; }
+footer a { color: var(--pen-blue); }
+
+/* Rendered report view (server-side /jobs/{id}/report) ---------------- */
+body.report { background: var(--paper); }
+.report-body {
+  max-width: 44rem;
+  margin: 0 auto;
+  padding: 1.5rem 1.2rem 4rem;
+  font: 1.02rem/1.65 var(--serif);
+}
+.report-body h1, .report-body h2, .report-body h3 { font-family: var(--serif); }
+.report-body h1 { font-size: 1.6rem; line-height: 1.25; }
+.report-body h2 {
+  font-size: 1.25rem;
+  border-bottom: 2px solid var(--rule-red);
+  padding-bottom: .2rem;
+  margin-top: 2rem;
+}
+.report-body a { color: var(--pen-blue); }
+.report-body blockquote {
+  margin: .6rem 0 .6rem .2rem;
+  padding: .1rem 0 .1rem .8rem;
+  border-left: 3px solid var(--paper-deep);
+  color: var(--ink-soft);
+}
+.report-body code, .report-body pre {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: .88em;
+  background: var(--paper-deep);
+  border-radius: 4px;
+  padding: .08em .3em;
+}
+.report-body pre { padding: .7em .9em; overflow-x: auto; }
+.report-body table { border-collapse: collapse; }
+.report-body th, .report-body td {
+  border: 1px solid #D0C5A8; padding: .3rem .6rem;
+}
+
+@media (max-width: 480px) {
+  .controls { flex-direction: column; align-items: stretch; }
+}

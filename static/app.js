@@ -1,0 +1,236 @@
+// Footnote — self-hosted deep-research server. Copyright (C) 2026 Marc Schlienger
+// Licensed under the GNU AGPL v3.0 or later; see the LICENSE file.
+
+/* Front-end logic: submit questions, poll job status, manage push. */
+
+const $ = (id) => document.getElementById(id);
+const ACTIVE = new Set(["queued", "researching", "archiving", "saving"]);
+let pollTimer = null;
+let pushConfigured = false;
+
+// --------------------------------------------------------------------
+// Boot
+// --------------------------------------------------------------------
+
+(async function boot() {
+  if ("serviceWorker" in navigator) {
+    try { await navigator.serviceWorker.register("/service-worker.js"); }
+    catch (e) { console.warn("SW registration failed", e); }
+  }
+  try {
+    const health = await fetchJSON("/health");
+    pushConfigured = health.push_configured;
+    $("server-note").textContent =
+      `Saving to ${health.output_dir}` +
+      (health.notion_configured ? " · mirrored to Notion" : "");
+    if (!health.parallel_configured) {
+      flash("PARALLEL_API_KEY is not configured on the server — research " +
+            "jobs will fail. See README.", true);
+    }
+  } catch (e) { /* offline shell — the list will populate when back online */ }
+  offerPush();
+  refreshJobs();
+})();
+
+// --------------------------------------------------------------------
+// Submit
+// --------------------------------------------------------------------
+
+$("ask").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const question = $("question").value.trim();
+  if (question.length < 8) return;
+  $("go").disabled = true;
+  try {
+    const res = await fetchJSON("/research", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question, processor: $("processor").value }),
+    });
+    $("question").value = "";
+    flash(res.message + " — you can close this page; results land in your notes.");
+    offerPush();
+    refreshJobs();
+  } catch (e) {
+    flash("Could not start research: " + e.message, true);
+  } finally {
+    $("go").disabled = false;
+  }
+});
+
+// --------------------------------------------------------------------
+// Jobs list + polling
+// --------------------------------------------------------------------
+
+async function refreshJobs() {
+  clearTimeout(pollTimer);
+  let data;
+  try { data = await fetchJSON("/jobs"); }
+  catch (e) { pollTimer = setTimeout(refreshJobs, 15000); return; }
+
+  const list = $("jobs");
+  $("jobs-section").hidden = data.jobs.length === 0;
+  $("active-count").textContent =
+    data.active ? `${data.active} running` : "";
+  list.innerHTML = "";
+  for (const job of data.jobs) list.appendChild(renderJob(job));
+
+  pollTimer = setTimeout(refreshJobs, data.active > 0 ? 5000 : 60000);
+}
+
+function renderJob(job) {
+  const li = document.createElement("li");
+  li.className = "job";
+
+  const q = document.createElement("p");
+  q.className = "q";
+  q.textContent = job.question;
+  li.appendChild(q);
+
+  const meta = document.createElement("div");
+  meta.className = "meta";
+
+  const badge = document.createElement("span");
+  badge.className = "badge " + job.status;
+  badge.textContent = job.status;
+  meta.appendChild(badge);
+
+  meta.appendChild(text("span", job.processor));
+  meta.appendChild(text("span", when(job.created_at)));
+
+  if (ACTIVE.has(job.status)) {
+    const p = document.createElement("span");
+    p.className = "progress";
+    p.innerHTML = `<span class="spin"></span>`;
+    p.appendChild(document.createTextNode(job.progress || "Working…"));
+    meta.appendChild(p);
+  } else if (job.status === "failed") {
+    const p = text("span", job.error || "Failed");
+    p.className = "progress";
+    p.style.color = "var(--rule-red)";
+    meta.appendChild(p);
+  } else if (job.status === "done") {
+    const links = document.createElement("span");
+    links.className = "links";
+    links.appendChild(link(`/jobs/${job.id}/report`, "Report"));
+    links.appendChild(link(`/jobs/${job.id}/report.md`, ".md"));
+    if (job.notion_url) links.appendChild(link(job.notion_url, "Notion"));
+    if (job.progress) {
+      const note = text("span", job.progress.replace(/^Done — /, ""));
+      note.style.cssText = "color:var(--ink-soft);font-weight:400;margin-left:auto";
+      links.appendChild(note);
+    }
+    meta.appendChild(links);
+  }
+
+  if (!ACTIVE.has(job.status)) {
+    const del = document.createElement("button");
+    del.className = "del";
+    del.textContent = "remove";
+    del.onclick = async () => {
+      await fetchJSON(`/jobs/${job.id}`, { method: "DELETE" }).catch(() => {});
+      refreshJobs();
+    };
+    meta.appendChild(del);
+  }
+
+  li.appendChild(meta);
+  return li;
+}
+
+// --------------------------------------------------------------------
+// Push notifications
+// --------------------------------------------------------------------
+
+async function offerPush() {
+  const offer = $("push-offer");
+  if (!pushConfigured || !("Notification" in window) ||
+      !("serviceWorker" in navigator) || !("PushManager" in window)) {
+    offer.hidden = true;
+    return;
+  }
+  if (Notification.permission === "granted") {
+    await subscribePush().catch(() => {});
+    offer.hidden = true;
+    return;
+  }
+  if (Notification.permission === "denied") { offer.hidden = true; return; }
+  offer.hidden = false;
+  $("enable-push").onclick = async () => {
+    try {
+      const perm = await Notification.requestPermission();
+      if (perm === "granted") { await subscribePush(); offer.hidden = true; }
+    } catch (e) { flash("Could not enable notifications: " + e.message, true); }
+  };
+}
+
+async function subscribePush() {
+  const reg = await navigator.serviceWorker.ready;
+  let sub = await reg.pushManager.getSubscription();
+  if (!sub) {
+    const { publicKey } = await fetchJSON("/vapid-public-key");
+    sub = await reg.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: b64ToUint8(publicKey),
+    });
+  }
+  await fetchJSON("/subscribe", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(sub.toJSON()),
+  });
+}
+
+function b64ToUint8(base64) {
+  const pad = "=".repeat((4 - (base64.length % 4)) % 4);
+  const raw = atob((base64 + pad).replace(/-/g, "+").replace(/_/g, "/"));
+  return Uint8Array.from(raw, (c) => c.charCodeAt(0));
+}
+
+// --------------------------------------------------------------------
+// Helpers
+// --------------------------------------------------------------------
+
+async function fetchJSON(url, opts) {
+  const res = await fetch(url, opts);
+  if (!res.ok) {
+    let msg = res.statusText;
+    try {
+      const body = await res.json();
+      msg = body.detail || body.message || msg;
+      if (Array.isArray(msg)) msg = msg.map((m) => m.msg).join("; ");
+    } catch (_) {}
+    throw new Error(msg);
+  }
+  return res.json();
+}
+
+function flash(message, isError = false) {
+  const el = $("flash");
+  el.textContent = message;
+  el.className = isError ? "error" : "";
+  el.hidden = false;
+  if (!isError) setTimeout(() => { el.hidden = true; }, 8000);
+}
+
+function link(href, label) {
+  const a = document.createElement("a");
+  a.href = href;
+  a.textContent = label;
+  if (href.startsWith("http")) a.target = "_blank";
+  return a;
+}
+
+function text(tag, content) {
+  const el = document.createElement(tag);
+  el.textContent = content;
+  return el;
+}
+
+function when(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  const days = (Date.now() - d.getTime()) / 86400000;
+  if (days < 1) return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  return d.toLocaleDateString([], { month: "short", day: "numeric" });
+}

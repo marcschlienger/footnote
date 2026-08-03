@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- Footnote: a page whose body text ends, a footnote separator rule, and
+       the note itself marked with a dagger. Sibling of Margin's icon — same
+       paper, slate text and red rule; the reader's mark is blue ink. The
+       dagger is the traditional second footnote symbol, after Margin's
+       asterisk. Few bold shapes, no thin lines — must survive 16x16. -->
+  <rect width="64" height="64" rx="14" fill="#EDE2C9"/>
+  <!-- body text -->
+  <g stroke="#5D6883" stroke-width="5" stroke-linecap="round">
+    <line x1="11" y1="15" x2="53" y2="15"/>
+    <line x1="11" y1="27" x2="46" y2="27"/>
+  </g>
+  <!-- footnote separator: short and left-aligned, as in print -->
+  <line x1="11" y1="38" x2="33" y2="38" stroke="#C43D33" stroke-width="3.5"/>
+  <!-- the dagger — blue ink, mid-luminance for iOS dark-icon rendering -->
+  <g stroke="#3D6BB3" stroke-width="4" stroke-linecap="round">
+    <line x1="15" y1="43.5" x2="15" y2="57.5"/>
+    <line x1="10.8" y1="47" x2="19.2" y2="47"/>
+  </g>
+  <!-- the footnote line: smaller type than the body -->
+  <line x1="27" y1="51" x2="53" y2="51" stroke="#5D6883" stroke-width="4"
+        stroke-linecap="round"/>
+</svg>

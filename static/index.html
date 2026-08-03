@@ -1,0 +1,61 @@
+<!doctype html>
+<!-- Footnote — self-hosted deep-research server. Copyright (C) 2026 Marc Schlienger
+     Licensed under the GNU AGPL v3.0 or later; see the LICENSE file. -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Footnote</title>
+  <meta name="description" content="Ask a question, get a cited research dossier in your notes.">
+  <link rel="manifest" href="/manifest.json">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="icon" href="/favicon-32.png" type="image/png" sizes="32x32">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+  <meta name="theme-color" content="#EDE2C9">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<main>
+  <header>
+    <img src="/favicon.svg" alt="" width="44" height="44">
+    <div>
+      <h1>Footnote</h1>
+      <p class="tagline">Ask a question — get a cited dossier in your notes.</p>
+    </div>
+  </header>
+
+  <form id="ask">
+    <textarea id="question" rows="3" required minlength="8" maxlength="4000"
+      placeholder="What do you want researched?&#10;e.g. What is the current evidence on creatine and cognition?"></textarea>
+    <div class="controls">
+      <select id="processor" title="Research depth">
+        <option value="base">Quick look &nbsp;·&nbsp; ~1–2 min</option>
+        <option value="core" selected>Standard &nbsp;·&nbsp; ~2–5 min</option>
+        <option value="pro">Deep &nbsp;·&nbsp; ~5–10 min</option>
+        <option value="ultra">Exhaustive &nbsp;·&nbsp; ~10–30 min</option>
+        <option value="ultra4x">Heroic &nbsp;·&nbsp; up to 90 min</option>
+      </select>
+      <button type="submit" id="go">Research<span class="dagger">†</span></button>
+    </div>
+  </form>
+
+  <p id="flash" hidden></p>
+
+  <div id="push-offer" hidden>
+    <button id="enable-push" class="ghost">🔔 Notify me when research finishes</button>
+  </div>
+
+  <section id="jobs-section" hidden>
+    <h2>Research<span class="count" id="active-count"></span></h2>
+    <ul id="jobs"></ul>
+  </section>
+
+  <footer>
+    <p id="server-note"></p>
+  </footer>
+</main>
+<script src="/static/app.js"></script>
+</body>
+</html>
