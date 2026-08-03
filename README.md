@@ -1,6 +1,11 @@
 # Footnote
 
-> \* see Margin. &nbsp;† this one goes and finds out.
+> † the proof that didn't fit in the margin.
+
+Fermat jotted the original read-it-later note — a marvelous claim, proof
+deferred for lack of space — and it took the world 358 years to chase the
+evidence down. [Margin](../margin) is where claims like that get saved.
+Footnote is the app that goes and chases.
 
 Footnote is a self-hosted deep-research server — the research-out counterpart
 to [Margin](../margin)'s read-it-later. Ask it a question and it runs a real
@@ -118,8 +123,11 @@ anything beyond that, set `FOOTNOTE_TOKEN` in `.env` — every endpoint except
 
 ## Name and icon
 
-“Footnote” is Margin's sibling: Margin keeps what you want to read, Footnote
-goes and finds out, and everything it claims hangs off a citation. The icon
+“Footnote” is Margin's sibling, and the name continues Margin's Fermat
+epigraph: his margin note is the canonical claim filed *without* its
+evidence — the proof didn't fit. A footnote is the part of the page where
+the proof goes. Margin keeps what you want to read; Footnote goes and finds
+out, and everything it claims hangs off a citation. The icon
 continues the family — the same paper and red rule, but here the rule is a
 footnote separator, and the reader's blue-ink mark is the **dagger (†)**,
 typography's second footnote symbol after Margin's asterisk (\*).
