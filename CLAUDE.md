@@ -1,87 +1,50 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Claude Code (claude.ai/code) when working with
+code in this repository.
 
 ## Project Overview
 
-Research Assistant PWA - an automated research orchestration tool that:
-- Accepts research questions via a web interface
-- Performs deep searches using Parallel.ai API
-- Crawls references using Firecrawl.dev API (extracts markdown)
-- Saves results to Notion (or alternative note-taking app)
-- Sends push notifications on completion
+Footnote — a self-hosted deep-research server (sibling of ../margin, same
+conventions). Ask a question via the PWA / iOS Shortcut / curl; a background
+job runs Parallel.ai deep research, optionally archives cited sources with
+Firecrawl, and writes a cited Markdown dossier into OUTPUT_DIR (a synced notes
+folder). Web Push notifies on completion; Notion mirroring is optional.
 
-## Tech Stack
+## Layout
 
-- **Backend:** FastAPI (Python 3.9+), httpx for async HTTP, pywebpush for notifications
-- **Frontend:** PWA with vanilla HTML/CSS/JS, Service Workers, Web Push API
-- **External APIs:** Parallel.ai (search), Firecrawl.dev (crawling), Notion API (storage)
+- `app.py` — FastAPI app: routes, token auth middleware, JSON job/subscription
+  stores (`data/`), the `run_research` orchestrator, PWA shell serving.
+- `pipeline.py` — external APIs: Parallel Task API (create run + long-poll
+  result, `basis` → citations), Firecrawl v2 scrape, report/dossier writer,
+  optional Notion mirror.
+- `static/` — PWA (index.html, app.js, style.css, service-worker.js,
+  manifest.json, icon.svg + generated PNGs).
+- `deploy/` — `gen_icons.py` (re-render PNGs from icon.svg), systemd unit.
+- `tests/` — pytest, no network (httpx.MockTransport + TestClient).
 
-## Development Commands
+## Commands
 
-### Backend
 ```bash
-cd backend
-pip install -r requirements.txt --break-system-packages
-uvicorn main:app --reload --host 0.0.0.0 --port 8000
+.venv/bin/python -m pytest            # run tests
+./start.sh                            # run server (port 8010)
+.venv/bin/python deploy/gen_icons.py  # regenerate icons after editing SVG
 ```
 
-### Frontend
-```bash
-cd frontend
-python -m http.server 8080
-```
+## Verified API contracts (do not "fix" from memory)
 
-### Generate VAPID Keys (for push notifications)
-```bash
-pip install py-vapid --break-system-packages
-vapid --gen
-```
+- Parallel: `POST https://api.parallel.ai/v1/tasks/runs` (header `x-api-key`),
+  result via `GET …/runs/{id}/result?timeout=N` — blocks, 408 while running;
+  citations live in `output.basis[].citations[]` (url/title/excerpts).
+- Firecrawl: `POST https://api.firecrawl.dev/v2/scrape` (Bearer),
+  `{url, formats:["markdown"], onlyMainContent:true}` →
+  `{success, data:{markdown, metadata:{title}}}`.
 
-### Run Tests
-```bash
-cd backend
-pytest tests/
-```
+## Conventions
 
-## Architecture
-
-```
-PWA Frontend (index.html, app.js, service-worker.js)
-         │
-         │ HTTPS/REST
-         ▼
-FastAPI Backend (main.py)
-    │
-    ├── services/parallel_ai.py  → Parallel.ai API
-    ├── services/firecrawl.py    → Firecrawl.dev API
-    ├── services/notion.py       → Notion API
-    └── services/notifications.py → Web Push
-```
-
-## Key API Endpoints
-
-- `POST /research` - Start new research job (returns job_id)
-- `GET /research/{job_id}` - Check job status
-- `GET /` - Health check
-
-## Environment Variables
-
-Required in `backend/.env`:
-```
-PARALLEL_AI_API_KEY=
-FIRECRAWL_API_KEY=
-NOTION_API_KEY=
-NOTION_DATABASE_ID=
-VAPID_PUBLIC_KEY=
-VAPID_PRIVATE_KEY=
-VAPID_CLAIM_EMAIL=
-```
-
-## Implementation Notes
-
-- All external API calls must be async using httpx.AsyncClient
-- Use FastAPI BackgroundTasks for long-running research operations
-- Job status stored in memory (consider database for production)
-- HTTPS required for PWA features and push notifications
-- CORS must be configured to allow frontend origin
+- Single-app, personal-use philosophy: no database, JSON stores written
+  atomically; jobs resume after restart via the stored Parallel run_id.
+- AGPL header on every source file, like Margin.
+- Paper-and-ink UI palette shared with Margin (see static/style.css :root).
+- Report layout: one folder per question in OUTPUT_DIR, report .md named
+  after the question, archived sources in `sources/NN title.md`.

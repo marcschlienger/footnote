@@ -1,0 +1,23 @@
+[Unit]
+Description=Footnote — deep-research server (instance %i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=/opt/footnote
+# Per-person settings: PORT, OUTPUT_DIR, FOOTNOTE_TOKEN, API keys
+EnvironmentFile=/etc/footnote/%i.env
+ExecStart=/opt/footnote/.venv/bin/python app.py
+Restart=on-failure
+RestartSec=5
+
+# Hardening — moderate: the app needs the user's home (saves in OUTPUT_DIR)
+# and its own data/ directory for job state.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

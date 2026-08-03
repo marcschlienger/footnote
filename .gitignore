@@ -29,3 +29,7 @@ htmlcov/
 dist/
 build/
 *.egg-info/
+
+# Footnote
+data/
+server.log
