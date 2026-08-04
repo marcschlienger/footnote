@@ -20,8 +20,12 @@ folder). Web Push notifies on completion; Notion mirroring is optional.
   optional Notion mirror.
 - `static/` — PWA (index.html, app.js, style.css, service-worker.js,
   manifest.json, icon.svg + generated PNGs).
-- `deploy/` — `gen_icons.py` (re-render PNGs from icon.svg), systemd unit.
+- `deploy/` — `gen_icons.py` (re-render PNGs from icon.svg), systemd unit,
+  `install.sh` + `add-instance.sh` (Ubuntu, one instance per person).
 - `tests/` — pytest, no network (httpx.MockTransport + TestClient).
+- `description.md` — architecture doc (job lifecycle, API contracts, dossier
+  format, design decisions); `README.md` — full user-facing reference. Keep
+  both in sync with behavior changes.
 
 ## Commands
 
