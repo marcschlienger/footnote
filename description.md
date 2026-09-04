@@ -492,6 +492,11 @@ Behavior notes:
 - **Configuration surface**: on load the app calls `/health` and shows a
   red flash if `PARALLEL_API_KEY` is missing or the output folder is not
   writable — the two failures worth catching before the first question.
+- **Nothing navigates away.** Installed to a Home Screen there is no back
+  button, so any link the browser decides to *open* rather than save strands
+  the reader — which is what tapping ".md" did. Every file link cancels its
+  own navigation, fetches the bytes and hands the browser a blob, so the app
+  stays exactly where it was while the file is saved.
 - **Reading in place**: both the dossier and any archived copy can be opened
   inside the card ("read here"), fetched as a sanitised fragment. Open
   readers are remembered by URL and their HTML is cached, so a poll — every

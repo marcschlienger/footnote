@@ -165,9 +165,11 @@ function renderJob(job) {
       links.appendChild(link(`/jobs/${job.id}/report`, "Report"));
       links.appendChild(readInline(`/jobs/${job.id}/report?embed=1`, li,
                                    "read here", "close", meta));
-      links.appendChild(link(`/jobs/${job.id}/report.md`, ".md"));
+      links.appendChild(downloadLink(`/jobs/${job.id}/report.md`, ".md",
+                                     job.report_name));
       links.appendChild(sourcesToggle(job));
-      links.appendChild(link(`/jobs/${job.id}/bundle.zip`, "Everything (.zip)"));
+      links.appendChild(downloadLink(`/jobs/${job.id}/bundle.zip`,
+                                     "Everything (.zip)"));
     }
     if (job.notion_url) links.appendChild(link(job.notion_url, "Notion"));
     if (job.progress) {
@@ -259,7 +261,8 @@ async function fillSources(jobId, panel) {
   foot.className = "srcs-foot";
   foot.appendChild(text("span",
     `${data.archived} of ${data.cited} archived locally · `));
-  foot.appendChild(link(data.bundle_url, "download report + sources (.zip)"));
+  foot.appendChild(downloadLink(data.bundle_url,
+                                "download report + sources (.zip)"));
   panel.appendChild(foot);
 }
 
@@ -276,7 +279,7 @@ function renderSource(src) {
   row.className = "src-links";
   if (src.archived) {
     row.appendChild(readHere(src, li));
-    row.appendChild(link(src.download_url, ".md"));
+    row.appendChild(downloadLink(src.download_url, ".md", src.file));
     if (src.url) row.appendChild(link(src.url, "original ↗"));
     row.appendChild(text("span", size(src.bytes)));
   } else {
@@ -442,6 +445,47 @@ function flash(message, isError = false) {
   el.className = isError ? "error" : "";
   el.hidden = false;
   if (!isError) setTimeout(() => { el.hidden = true; }, 8000);
+}
+
+// A download that cannot navigate. An installed PWA has no back button, so a
+// link the browser decides to *open* rather than save is a one-way trip out
+// of the app — which is what tapping ".md" was. Fetching the bytes and handing
+// the browser a blob keeps this document exactly where it is.
+function downloadLink(href, label, filename) {
+  const a = link(href, label);
+  a.download = filename || "";
+  a.onclick = (event) => {
+    event.preventDefault();
+    saveFile(href, filename).catch((e) =>
+      flash("Could not download that file: " + e.message, true));
+  };
+  return a;
+}
+
+async function saveFile(href, filename) {
+  const res = await fetch(href);
+  if (!res.ok) throw new Error(res.statusText || `HTTP ${res.status}`);
+  const name = filename ||
+    nameFromDisposition(res.headers.get("content-disposition")) || "download";
+  const url = URL.createObjectURL(await res.blob());
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  // Long enough for the browser to have taken the bytes.
+  setTimeout(() => URL.revokeObjectURL(url), 30000);
+}
+
+function nameFromDisposition(header) {
+  if (!header) return "";
+  const encoded = /filename\*=utf-8''([^;]+)/i.exec(header);
+  if (encoded) {
+    try { return decodeURIComponent(encoded[1]); } catch (e) { /* fall through */ }
+  }
+  const plain = /filename="([^"]+)"/i.exec(header);
+  return plain ? plain[1] : "";
 }
 
 function link(href, label) {

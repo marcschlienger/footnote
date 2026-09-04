@@ -872,6 +872,24 @@ def test_a_dossier_can_be_read_without_leaving_the_app(client, tmp_path):
     assert 'href="sources/01 Paper A.md"' in standalone   # correct on its page
 
 
+def test_downloads_never_navigate_away_from_the_app():
+    """An installed PWA has no back button; a navigation is a one-way trip.
+
+    Every file link has to go through downloadLink, which cancels the
+    navigation and hands the browser a blob instead.
+    """
+    app_js = (Path(__file__).resolve().parent.parent
+              / "static" / "app.js").read_text()
+    assert "preventDefault" in app_js and "createObjectURL" in app_js
+    # No plain link() to something that downloads.
+    for pattern in (r"link\(`?/jobs/\$\{job\.id\}/report\.md",
+                    r"link\(`?/jobs/\$\{job\.id\}/bundle\.zip",
+                    r"link\(src\.download_url",
+                    r"link\(data\.bundle_url"):
+        assert not re.search(r"(?<!download)" + pattern, app_js), pattern
+    assert app_js.count("downloadLink(") >= 5      # four uses and the definition
+
+
 def test_the_pwa_can_read_in_place():
     app_js = (Path(__file__).resolve().parent.parent
               / "static" / "app.js").read_text()
