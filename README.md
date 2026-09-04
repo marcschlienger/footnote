@@ -501,8 +501,11 @@ Tailscale, WireGuard) and/or use the per-instance `FOOTNOTE_TOKEN`.
   status live, read finished reports, and open **Sources** on any finished
   dossier to read the archived pages in the browser, download one as
   Markdown, or take the report and every source as a single zip. **read
-  here** opens a dossier or an archived copy inside the card, without
-  leaving the page; every standalone page has a link back to the app. A dossier
+  here** opens a dossier or an archived copy inside the card, and **.md**
+  shows the file's own text with Copy, Save and (over HTTPS) Share. Nothing
+  in the app navigates to a file: iOS Safari answers that with a
+  view-or-download sheet you cannot get back from. Every standalone page has
+  a link back to the app. A dossier
   you have opened once stays readable with no network at all — the service
   worker keeps the report and its sources, and says so when the list it is
   showing you is the last one it saw. On

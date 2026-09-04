@@ -197,6 +197,13 @@ li.job {
   cursor: pointer;
 }
 .job .linkish:hover { text-decoration: underline; }
+/* Open state without renaming the control: two buttons both reading "close"
+   say nothing about which panel they close. */
+.job .linkish[aria-expanded="true"] {
+  text-decoration: underline;
+  text-underline-offset: .25em;
+}
+.job .linkish[aria-expanded="true"]::after { content: " ▾"; }
 
 /* Source panel inside a job card ------------------------------------- */
 .sources {
@@ -224,6 +231,39 @@ li.job {
 }
 .sources .src-links a { font-weight: 600; }
 .srcs-foot { margin: .75rem 0 0; font-size: .8rem; }
+
+/* A file's own text, shown in place — nothing here navigates. */
+.file-view {
+  margin: .5rem 0 .2rem;
+  padding: .55rem .7rem;
+  background: var(--paper);
+  border: 1px solid #E2D8BE;
+  border-left: 3px solid var(--ink-soft);
+  border-radius: 8px;
+}
+.file-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: .3rem .8rem;
+  font-size: .8rem;
+  color: var(--ink-soft);
+  margin-bottom: .4rem;
+}
+.file-actions > span:first-child {
+  flex-basis: 100%;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  overflow-wrap: anywhere;
+}
+.file-text {
+  margin: 0;
+  max-height: 18rem;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: .8rem/1.45 ui-monospace, "SF Mono", Menlo, monospace;
+  color: var(--ink);
+}
 
 /* An archived copy read in place, inside the job card. */
 .src-body {
@@ -300,6 +340,15 @@ body.report { background: var(--paper); }
   margin-top: 2rem;
 }
 .report-body a { color: var(--pen-blue); }
+.report-body .linkish {
+  background: none;
+  border: none;
+  padding: 0;
+  font: 600 .8rem var(--sans);
+  color: var(--pen-blue);
+  cursor: pointer;
+}
+.report-body .linkish:hover { text-decoration: underline; }
 /* A link whose URL was rejected as unsafe keeps its text but loses its href —
    it should not go on looking clickable. */
 .report-body a:not([href]) { color: inherit; }

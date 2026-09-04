@@ -165,10 +165,10 @@ function renderJob(job) {
       links.appendChild(link(`/jobs/${job.id}/report`, "Report"));
       links.appendChild(readInline(`/jobs/${job.id}/report?embed=1`, li,
                                    "read here", "close", meta));
-      links.appendChild(downloadLink(`/jobs/${job.id}/report.md`, ".md",
-                                     job.report_name));
+      links.appendChild(fileButton(`/jobs/${job.id}/report.md`, ".md",
+                                   job.report_name, li, meta));
       links.appendChild(sourcesToggle(job));
-      links.appendChild(downloadLink(`/jobs/${job.id}/bundle.zip`,
+      links.appendChild(bundleButton(`/jobs/${job.id}/bundle.zip`,
                                      "Everything (.zip)"));
     }
     if (job.notion_url) links.appendChild(link(job.notion_url, "Notion"));
@@ -261,7 +261,7 @@ async function fillSources(jobId, panel) {
   foot.className = "srcs-foot";
   foot.appendChild(text("span",
     `${data.archived} of ${data.cited} archived locally · `));
-  foot.appendChild(downloadLink(data.bundle_url,
+  foot.appendChild(bundleButton(data.bundle_url,
                                 "download report + sources (.zip)"));
   panel.appendChild(foot);
 }
@@ -279,7 +279,7 @@ function renderSource(src) {
   row.className = "src-links";
   if (src.archived) {
     row.appendChild(readHere(src, li));
-    row.appendChild(downloadLink(src.download_url, ".md", src.file));
+    row.appendChild(fileButton(src.download_url, ".md", src.file, li, row));
     if (src.url) row.appendChild(link(src.url, "original ↗"));
     row.appendChild(text("span", size(src.bytes)));
   } else {
@@ -303,17 +303,17 @@ function forgetReaders(jobId) {
   for (const url of [...readerCache.keys()]) if (url.startsWith(prefix)) readerCache.delete(url);
 }
 
-function readInline(url, host, openLabel, closeLabel, after) {
+function readInline(url, host, openLabel, _closeLabel, after) {
   const button = document.createElement("button");
   button.className = "linkish";
   const close = () => {
     host.querySelector(":scope > .src-body")?.remove();
     openReaders.delete(url);
-    button.textContent = openLabel;
+    button.setAttribute("aria-expanded", "false");
   };
   const open = async () => {
     openReaders.add(url);
-    button.textContent = closeLabel;
+    button.setAttribute("aria-expanded", "true");
     const panel = document.createElement("div");
     panel.className = "src-body";
     panel.textContent = readerCache.has(url) ? "" : "Loading…";
@@ -340,10 +340,11 @@ function readInline(url, host, openLabel, closeLabel, after) {
     } catch (e) {
       panel.textContent = "Could not read it: " + e.message;
       openReaders.delete(url);
-      button.textContent = openLabel;
+      button.setAttribute("aria-expanded", "false");
     }
   };
   button.textContent = openLabel;
+  button.setAttribute("aria-expanded", "false");
   button.onclick = () =>
     host.querySelector(":scope > .src-body") ? close() : open();
   // Deferred: at this point the card is still being assembled, so the row
@@ -447,34 +448,141 @@ function flash(message, isError = false) {
   if (!isError) setTimeout(() => { el.hidden = true; }, 8000);
 }
 
-// A download that cannot navigate. An installed PWA has no back button, so a
-// link the browser decides to *open* rather than save is a one-way trip out
-// of the app — which is what tapping ".md" was. Fetching the bytes and handing
-// the browser a blob keeps this document exactly where it is.
-function downloadLink(href, label, filename) {
-  const a = link(href, label);
-  a.download = filename || "";
-  a.onclick = (event) => {
-    event.preventDefault();
-    saveFile(href, filename).catch((e) =>
-      flash("Could not download that file: " + e.message, true));
+// Getting at a file without ever navigating.
+//
+// A link to a .md is a navigation, and what happens next is the browser's
+// decision: iOS Safari navigates to it (or to a blob: URL) and shows a
+// view-or-download sheet, from which there is no way back to the app. So
+// tapping ".md" opens the text here instead, with the ways of taking it away
+// offered from inside the page — copy, share, save — none of which navigate.
+function fileButton(href, label, filename, host, after) {
+  const button = document.createElement("button");
+  button.className = "linkish";
+  button.textContent = label;
+  button.setAttribute("aria-expanded", "false");
+  button.onclick = () => {
+    const showing = host.querySelector(":scope > .file-view");
+    if (showing) {
+      showing.remove();
+      button.setAttribute("aria-expanded", "false");
+      return;
+    }
+    // The label stays put: two toggles both saying "close" tells you nothing
+    // about which panel you are closing.
+    button.setAttribute("aria-expanded", "true");
+    const panel = document.createElement("div");
+    panel.className = "file-view";
+    panel.textContent = "Loading…";
+    host.insertBefore(panel, (after && after.nextSibling) || null);
+    showFile(panel, href, filename).catch((e) => {
+      panel.textContent = "Could not read that file: " + e.message;
+    });
   };
-  return a;
+  return button;
 }
 
-async function saveFile(href, filename) {
+async function showFile(panel, href, filename) {
   const res = await fetch(href);
   if (!res.ok) throw new Error(res.statusText || `HTTP ${res.status}`);
   const name = filename ||
     nameFromDisposition(res.headers.get("content-disposition")) || "download";
-  const url = URL.createObjectURL(await res.blob());
+  const body = await res.text();
+
+  panel.textContent = "";
+  const actions = document.createElement("div");
+  actions.className = "file-actions";
+  actions.appendChild(text("span", name));
+  actions.appendChild(action("Copy", async () => {
+    await navigator.clipboard.writeText(body);
+    flash("Copied to the clipboard.");
+  }));
+  // Offered only where it exists: on iOS this is a sheet over the page, so
+  // dismissing it returns here. It needs a secure context.
+  if (canShareFile(name, body)) {
+    actions.appendChild(action("Share", () => shareFile(name, body)));
+  }
+  actions.appendChild(action("Save", () => saveFile(name, body)));
+  panel.appendChild(actions);
+
+  const pre = document.createElement("pre");
+  pre.className = "file-text";
+  pre.textContent = body;
+  panel.appendChild(pre);
+}
+
+function action(label, run) {
+  const button = document.createElement("button");
+  button.className = "linkish";
+  button.textContent = label;
+  button.onclick = () => Promise.resolve()
+    .then(run)
+    .catch((e) => flash(`Could not ${label.toLowerCase()}: ` + e.message, true));
+  return button;
+}
+
+// A zip has nothing to show, so it is fetched and handed over directly:
+// the share sheet where that exists, a blob otherwise. Still a button, so
+// the page cannot navigate to it either way.
+function bundleButton(href, label) {
+  const button = document.createElement("button");
+  button.className = "linkish";
+  button.textContent = label;
+  button.onclick = () => {
+    button.disabled = true;
+    takeBundle(href)
+      .catch((e) => flash("Could not download that file: " + e.message, true))
+      .finally(() => { button.disabled = false; });
+  };
+  return button;
+}
+
+async function takeBundle(href) {
+  const res = await fetch(href);
+  if (!res.ok) throw new Error(res.statusText || `HTTP ${res.status}`);
+  const name = nameFromDisposition(res.headers.get("content-disposition"))
+    || "footnote.zip";
+  const blob = await res.blob();
+  const file = new File([blob], name, { type: "application/zip" });
+  try {
+    if (navigator.canShare && navigator.canShare({ files: [file] })) {
+      await navigator.share({ files: [file], title: name });
+      return;
+    }
+  } catch (e) { /* the sheet was dismissed, or sharing is unavailable */ }
+  const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
   a.download = name;
   document.body.appendChild(a);
   a.click();
   a.remove();
-  // Long enough for the browser to have taken the bytes.
+  setTimeout(() => URL.revokeObjectURL(url), 30000);
+}
+
+function asFile(name, body) {
+  return new File([body], name, { type: "text/markdown" });
+}
+
+function canShareFile(name, body) {
+  try {
+    return !!navigator.canShare && navigator.canShare({ files: [asFile(name, body)] });
+  } catch (e) {
+    return false;
+  }
+}
+
+function shareFile(name, body) {
+  return navigator.share({ files: [asFile(name, body)], title: name });
+}
+
+function saveFile(name, body) {
+  const url = URL.createObjectURL(new Blob([body], { type: "text/markdown" }));
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 30000);
 }
 

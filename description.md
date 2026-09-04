@@ -492,11 +492,17 @@ Behavior notes:
 - **Configuration surface**: on load the app calls `/health` and shows a
   red flash if `PARALLEL_API_KEY` is missing or the output folder is not
   writable — the two failures worth catching before the first question.
-- **Nothing navigates away.** Installed to a Home Screen there is no back
-  button, so any link the browser decides to *open* rather than save strands
-  the reader — which is what tapping ".md" did. Every file link cancels its
-  own navigation, fetches the bytes and hands the browser a blob, so the app
-  stays exactly where it was while the file is saved.
+- **Nothing navigates to a file.** A link to a `.md` is a navigation whose
+  outcome the browser chooses, and iOS Safari chooses a view-or-download
+  sheet with no way back — in a tab as well as installed. Handing it a
+  `blob:` URL instead does not help, because it navigates to that too. So
+  there is no anchor: `.md` is a button that shows the file's text in place,
+  with Copy, Save, and — where the Web Share API exists, which needs a secure
+  context — Share, whose sheet sits over the page. The zip has nothing to
+  show, so it is fetched and handed over the same way. The standalone report
+  and source pages carry `static/document.js`, which upgrades their own
+  download links to the same behaviour and leaves them ordinary links when
+  scripting is unavailable.
 - **Reading in place**: both the dossier and any archived copy can be opened
   inside the card ("read here"), fetched as a sanitised fragment. Open
   readers are remembered by URL and their HTML is cached, so a poll — every

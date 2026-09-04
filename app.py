@@ -903,7 +903,8 @@ def _page(title: str, nav: str, body: str, status_code: int = 200) -> HTMLRespon
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{escape(title)} — Footnote</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-<link rel="stylesheet" href="/static/style.css"></head>
+<link rel="stylesheet" href="/static/style.css">
+<script src="/static/document.js" defer></script></head>
 <body class="report"><main class="report-body">
 <p class="page-nav">{nav}</p>
 {body}</main></body></html>""")
@@ -1313,9 +1314,11 @@ async def report_html(job_id: str, embed: int = 0):
             _render_markdown(text, base=f"/jobs/{job_id}/report"))
     rendered = _render_markdown(text)
     nav = (f'<a href="/">← Footnote</a> &nbsp;·&nbsp; '
-           f'<a href="/jobs/{job_id}/report.md" download>Download .md</a>'
+           f'<a href="/jobs/{job_id}/report.md" download data-file="text">'
+           f'Download .md</a>'
            f' &nbsp;·&nbsp; '
-           f'<a href="/jobs/{job_id}/bundle.zip">Download everything (.zip)</a>')
+           f'<a href="/jobs/{job_id}/bundle.zip" download data-file="archive">'
+           f'Download everything (.zip)</a>')
     return _page(path.stem, nav, rendered)
 
 
@@ -1453,7 +1456,8 @@ async def report_source(job_id: str, name: str, raw: int = 0, embed: int = 0):
     if _safe_url(origin):
         nav.append(f'<a href="{escape(origin, quote=True)}" target="_blank" '
                    f'rel="noopener noreferrer">Original page ↗</a>')
-    nav.append('<a href="?raw=1" download>Download .md</a>')
+    nav.append('<a href="?raw=1" download data-file="text">'
+                   'Download .md</a>')
     heading = (f'<h1>{escape(title)}</h1>'
                f'<p class="source-note">Archived copy{retrieved}</p>')
     return _page(title, " &nbsp;·&nbsp; ".join(nav), heading + rendered)

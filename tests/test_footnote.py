@@ -872,22 +872,42 @@ def test_a_dossier_can_be_read_without_leaving_the_app(client, tmp_path):
     assert 'href="sources/01 Paper A.md"' in standalone   # correct on its page
 
 
-def test_downloads_never_navigate_away_from_the_app():
-    """An installed PWA has no back button; a navigation is a one-way trip.
-
-    Every file link has to go through downloadLink, which cancels the
-    navigation and hands the browser a blob instead.
-    """
+def test_nothing_in_the_app_navigates_to_a_file():
+    """iOS Safari navigates to a file — or to a blob: URL — and shows a
+    view-or-download sheet with no way back. So no file is reachable through
+    an anchor at all: .md opens its text in place, the zip is fetched and
+    handed over, and both are buttons."""
     app_js = (Path(__file__).resolve().parent.parent
               / "static" / "app.js").read_text()
-    assert "preventDefault" in app_js and "createObjectURL" in app_js
-    # No plain link() to something that downloads.
-    for pattern in (r"link\(`?/jobs/\$\{job\.id\}/report\.md",
-                    r"link\(`?/jobs/\$\{job\.id\}/bundle\.zip",
-                    r"link\(src\.download_url",
-                    r"link\(data\.bundle_url"):
-        assert not re.search(r"(?<!download)" + pattern, app_js), pattern
-    assert app_js.count("downloadLink(") >= 5      # four uses and the definition
+    for target in ("/report.md", "bundle.zip", "src.download_url",
+                   "data.bundle_url"):
+        for match in re.finditer(re.escape(target), app_js):
+            line = app_js[app_js.rfind("\n", 0, match.start()) + 1:
+                          app_js.find("\n", match.start())]
+            assert "link(" not in line or "fileButton(" in line \
+                or "bundleButton(" in line, line.strip()
+    assert "fileButton(" in app_js and "bundleButton(" in app_js
+    # The ways out of the panel, none of which leave the page.
+    assert "clipboard.writeText" in app_js
+    assert "navigator.canShare" in app_js and "navigator.share" in app_js
+    assert "createObjectURL" in app_js
+
+
+def test_the_standalone_pages_do_not_navigate_to_files_either(client, tmp_path):
+    """Their "Download .md" was a plain link, which is the same trap."""
+    _finished_job(tmp_path)
+    for url in ("/jobs/abcdefabcdef/report",
+                "/jobs/abcdefabcdef/sources/01 Paper A.md"):
+        page = client.get(url).text
+        assert "/static/document.js" in page, url
+        assert 'data-file="text"' in page, url
+    assert 'data-file="archive"' in client.get("/jobs/abcdefabcdef/report").text
+
+    doc_js = (Path(__file__).resolve().parent.parent
+              / "static" / "document.js").read_text()
+    assert "preventDefault" in doc_js
+    assert "nameFromDisposition" in doc_js      # not the URL's last segment
+    assert "navigator.canShare" in doc_js and "createObjectURL" in doc_js
 
 
 def test_the_pwa_can_read_in_place():
