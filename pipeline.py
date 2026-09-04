@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import math
 import random
 import re
 import time
@@ -133,6 +134,33 @@ def scrub_surrogates(text: str) -> str:
     return _LONE_SURROGATE.sub("\ufffd", text) if isinstance(text, str) else ""
 
 
+def clean_json(value, _depth: int = 0):
+    """A structure that json.dump cannot refuse.
+
+    Applied where data is stored rather than field by field: a list of field
+    names is exactly the kind of thing that goes stale, and the store has to
+    hold whatever a job accumulated. Strings are scrubbed, keys are made
+    strings, non-finite floats become null (NaN is not JSON and does not
+    survive a reload), and anything unrecognised becomes its str().
+    """
+    if _depth > 32:                     # cyclic or absurd; not our data
+        return None
+    if isinstance(value, str):
+        return scrub_surrogates(value)
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {scrub_surrogates(str(k)): clean_json(v, _depth + 1)
+                for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [clean_json(v, _depth + 1) for v in value]
+    return scrub_surrogates(str(value))
+
+
 def has_lone_surrogate(text: str) -> bool:
     """Whether this string cannot be written as UTF-8.
 
@@ -143,13 +171,16 @@ def has_lone_surrogate(text: str) -> bool:
     return bool(_LONE_SURROGATE.search(text))
 
 
-def _text(value, fallback: str = "") -> str:
-    """A provider field that has to be a string, whatever arrived.
+def clean_text(value, fallback: str = "") -> str:
+    """Text from outside, made into something this app can keep.
 
-    Everything here crossed a network from someone else's JSON. A title that
-    is a list reaches slug_for and takes the whole dossier down with a
-    TypeError from unicodedata.normalize, long after the scrape it came from
-    was recorded as a success.
+    The one rule applied at every ingress: a value that is not a string
+    becomes the fallback (containers) or its str() (scalars), and anything
+    UTF-8 cannot represent is replaced. Everything here crossed a network or
+    came off a disk someone else can write to. A title that is a list reaches
+    slug_for and takes the whole dossier down with a TypeError from
+    unicodedata.normalize, long after the scrape it came from was recorded as
+    a success; a lone surrogate does the same on the next save.
     """
     if isinstance(value, str):
         # Providers relay text off the open web, which can carry unpaired
@@ -330,10 +361,10 @@ async def fetch_task_result(
 def _parse_task_result(data: dict, run_id: str) -> ResearchResult:
     run = data.get("run")
     run = run if isinstance(run, dict) else {}
-    status = _text(run.get("status"), fallback="completed") or "completed"
+    status = clean_text(run.get("status"), fallback="completed") or "completed"
     if status != "completed":
         error = run.get("error")
-        err = _text((error if isinstance(error, dict) else {}).get("message"),
+        err = clean_text((error if isinstance(error, dict) else {}).get("message"),
                     fallback=status)
         raise PipelineError(f"Parallel run {run_id} ended as {status}: {err}")
 
@@ -342,7 +373,7 @@ def _parse_task_result(data: dict, run_id: str) -> ResearchResult:
     content = output.get("content", "")
     if isinstance(content, dict):     # json output type — flatten to text
         content = "\n\n".join(f"## {k}\n\n{v}" for k, v in content.items())
-    content = _text(content)
+    content = clean_text(content)
     if not content.strip():
         raise PipelineError(f"Parallel run {run_id} returned an empty report")
 
@@ -352,21 +383,21 @@ def _parse_task_result(data: dict, run_id: str) -> ResearchResult:
     for basis in _as_list(output.get("basis")):
         if not isinstance(basis, dict):
             continue
-        confidence = confidence or _text(basis.get("confidence"))
-        reasoning = reasoning or _text(basis.get("reasoning"))
+        confidence = confidence or clean_text(basis.get("confidence"))
+        reasoning = reasoning or clean_text(basis.get("reasoning"))
         for cit in _as_list(basis.get("citations")):
             if not isinstance(cit, dict):
                 continue
-            url = _text(cit.get("url")).strip()
+            url = clean_text(cit.get("url")).strip()
             if not url or url in seen:
                 continue
             seen.add(url)
             citations.append(
                 Citation(
                     url=url,
-                    title=_text(cit.get("title")).strip(),
-                    excerpts=[_text(e) for e in _as_list(cit.get("excerpts"))
-                              if _text(e)],
+                    title=clean_text(cit.get("title")).strip(),
+                    excerpts=[clean_text(e) for e in _as_list(cit.get("excerpts"))
+                              if clean_text(e)],
                 )
             )
     return ResearchResult(
@@ -388,9 +419,9 @@ def _err_detail(resp: httpx.Response) -> str:
         body = resp.json()
         err = body.get("error") if isinstance(body, dict) else None
         message = err.get("message") if isinstance(err, dict) else None
-        return _text(message) or _text(resp.text)[:200]
+        return clean_text(message) or clean_text(resp.text)[:200]
     except Exception:                                      # noqa: BLE001
-        return _text(resp.text)[:200]
+        return clean_text(resp.text)[:200]
 
 
 # ---------------------------------------------------------------------------
@@ -544,7 +575,7 @@ async def scrape_sources(
             else:
                 copy = await _scrape_one(client, api_key, cit, limiter)
         except Exception as exc:                           # noqa: BLE001
-            copy = SourceCopy(cit.url, cit.title, "", False, _text(str(exc))[:200])
+            copy = SourceCopy(cit.url, cit.title, "", False, clean_text(str(exc))[:200])
         state["done"] += 1
         if on_progress:
             try:
@@ -594,7 +625,7 @@ async def _scrape_one(
                     timeout=httpx.Timeout(90.0, connect=15.0),
                 )
         except Exception as exc:                           # noqa: BLE001
-            error = _text(str(exc))[:200]
+            error = clean_text(str(exc))[:200]
             if attempt == MAX_ATTEMPTS:
                 break
             await asyncio.sleep(min(backoff * random.uniform(0.5, 1.5),
@@ -622,9 +653,9 @@ async def _scrape_one(
         # whether a page counts as archived.
         if resp.status_code == 200 and data.get("success") is True:
             page = data.get("data") or {}
-            md = _text(page.get("markdown"))
+            md = clean_text(page.get("markdown"))
             metadata = page.get("metadata")
-            title = _text((metadata if isinstance(metadata, dict) else {}).get(
+            title = clean_text((metadata if isinstance(metadata, dict) else {}).get(
                 "title"), fallback=cit.title)
             if not md.strip():
                 return SourceCopy(cit.url, title, "", False, "empty extraction")
@@ -635,7 +666,7 @@ async def _scrape_one(
             # answer: say so, and treat it like the other transient faults.
             error = f"HTTP {resp.status_code} with an unreadable body"
         else:
-            error = _text(data.get("error"))[:200] or f"HTTP {resp.status_code}"
+            error = clean_text(data.get("error"))[:200] or f"HTTP {resp.status_code}"
         retryable = malformed or resp.status_code in RETRYABLE_STATUS
         if not retryable or attempt == MAX_ATTEMPTS:
             break
@@ -893,8 +924,10 @@ def split_front_matter(text: str) -> tuple:
         value = value.strip()
         if len(value) > 1 and value[0] == value[-1] == '"':
             value = value[1:-1].replace('\\"', '"').replace("\\\\", "\\")
-        meta[key.strip()] = value
-    return meta, text[end + 4:].lstrip("\n")
+        # The notes folder is editable by people and sync clients: what comes
+        # back out of it is outside text like any other.
+        meta[clean_text(key.strip())] = clean_text(value)
+    return meta, clean_text(text[end + 4:].lstrip("\n"))
 
 
 def date_str() -> str:
@@ -978,7 +1011,7 @@ async def save_to_notion(
         created = None
     if not isinstance(created, dict):
         raise PipelineError("Notion returned an unreadable response")
-    return _text(created.get("url"))
+    return clean_text(created.get("url"))
 
 
 def _notion_block(kind: str, text: str, link: str | None = None) -> dict:

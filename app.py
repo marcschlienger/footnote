@@ -173,10 +173,12 @@ class JsonStore:
             if not isinstance(loaded, dict):
                 raise json.JSONDecodeError(
                     f"expected an object, found {type(loaded).__name__}", "", 0)
-            # Escaped-in surrogates come back as surrogates; scrub them before
-            # anything tries to serialize this record to a client.
-            # One damaged record must not cost the rest of the history.
-            self.data = {k: v for k, v in loaded.items() if isinstance(v, dict)}
+            # One damaged record must not cost the rest of the history, and
+            # what survives is cleaned here rather than field by field: an
+            # escaped surrogate in the file comes back as a surrogate, and
+            # would break the next response carrying it.
+            self.data = pipeline.clean_json(
+                {k: v for k, v in loaded.items() if isinstance(v, dict)})
             dropped = len(loaded) - len(self.data)
             if dropped:
                 print(f"{path.name}: ignored {dropped} malformed record"
@@ -200,17 +202,13 @@ class JsonStore:
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=self.path.parent, suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(self.data, fh, ensure_ascii=False, indent=1)
-        except UnicodeEncodeError:
-            # Text that UTF-8 cannot represent — an unpaired surrogate — is
-            # refused at the door, but one slipping through must not wedge
-            # every future save. Escaping it keeps the history writable.
-            print(f"{self.path.name}: escaping text that is not valid UTF-8",
-                  flush=True)
-            with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(self.data, fh, ensure_ascii=True, indent=1)
+        # clean_json rather than a fallback: escaping a surrogate kept the
+        # file writable but reloaded it as a surrogate, so the problem came
+        # back on the next read. Cleaning here makes the file structurally
+        # unable to hold something a later load could choke on.
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(pipeline.clean_json(self.data), fh,
+                      ensure_ascii=False, indent=1)
         os.replace(tmp, self.path)
 
 
@@ -287,11 +285,7 @@ def _normalize_jobs() -> None:
             if field in job and not isinstance(job[field], str):
                 job[field] = str(job[field])
                 changed = True
-        if _scrub_job_text(job):
-            # A surrogate that reached the file — escaped there by save()'s
-            # fallback — comes back as a surrogate and would break every
-            # response carrying this job.
-            changed = True
+
         for field in _JOB_SEMANTIC_FIELDS:
             if field in job and not isinstance(job[field], str):
                 del job[field]                    # absent beats nonsense
@@ -312,31 +306,6 @@ def _normalize_jobs() -> None:
     if changed:
         jobs.save()
         print("job history repaired on load", flush=True)
-
-
-# Everything on a job that is ever sent to a client or written to a file.
-_JOB_SCRUBBED = ("question", "progress", "error", "report_name", "notion_url",
-                 "processor", "status", "created_at", "finished_at")
-_CITATION_SCRUBBED = ("url", "title", "file", "note")
-
-
-def _scrub_job_text(job: dict) -> bool:
-    """Replace unencodable text on a stored record; True if anything changed."""
-    changed = False
-    for field in _JOB_SCRUBBED:
-        value = job.get(field)
-        if isinstance(value, str) and pipeline.has_lone_surrogate(value):
-            job[field] = pipeline.scrub_surrogates(value)
-            changed = True
-    for citation in job.get("citations") or []:
-        if not isinstance(citation, dict):
-            continue
-        for field in _CITATION_SCRUBBED:
-            value = citation.get(field)
-            if isinstance(value, str) and pipeline.has_lone_surrogate(value):
-                citation[field] = pipeline.scrub_surrogates(value)
-                changed = True
-    return changed
 
 
 def _resumable(job: dict) -> bool:
@@ -411,12 +380,19 @@ def _trim_jobs() -> None:
             del jobs.data[job_id]
 
 
+def _put_job(job_id: str, record: dict) -> None:
+    """The only way a record enters the store — cleaned, whatever built it."""
+    jobs.data[job_id] = pipeline.clean_json(record)
+
+
 def _update_job(job_id: str, **fields) -> None:
     job = jobs.data.get(job_id)
     if job is None:
         return
     job.update(fields)
-    _scrub_job_text(job)        # provider text arrives through here too
+    # Provider text arrives through here; cleaning the whole record beats a
+    # list of field names that has to be kept in step with the record.
+    _put_job(job_id, job)
     jobs.save()
 
 
@@ -866,6 +842,19 @@ in a browser cookie afterwards. (API clients: send an
 </body></html>"""
 
 
+def _token_matches(presented: str) -> bool:
+    """compare_digest refuses non-ASCII strings outright, with a TypeError.
+
+    A token in a query string is whatever the client sent, so the comparison
+    is done on bytes — a non-ASCII token is simply wrong, not a 500.
+    """
+    try:
+        return secrets.compare_digest(presented.encode("utf-8", "surrogatepass"),
+                                      FOOTNOTE_TOKEN.encode("utf-8", "surrogatepass"))
+    except (UnicodeEncodeError, AttributeError):
+        return False
+
+
 def _request_token(request: Request) -> str:
     auth = request.headers.get("authorization", "")
     if auth.lower().startswith("bearer "):
@@ -884,7 +873,7 @@ async def _require_token(request: Request, call_next):
     ):
         return await call_next(request)
 
-    if not secrets.compare_digest(_request_token(request), FOOTNOTE_TOKEN):
+    if not _token_matches(_request_token(request)):
         if "text/html" in request.headers.get("accept", ""):
             return HTMLResponse(_UNAUTHORIZED_HTML, status_code=401)
         return JSONResponse(
@@ -989,11 +978,11 @@ async def start_research(req: ResearchRequest):
         raise HTTPException(422, f"unknown processor {processor!r}; "
                                  f"one of: {', '.join(ALL_PROCESSORS)}")
     job_id = uuid.uuid4().hex[:12]
-    jobs.data[job_id] = {
+    _put_job(job_id, {
         "id": job_id, "question": req.question, "processor": processor,
         "status": "queued", "progress": "Queued", "created_at": _now(),
         "run_id": "", "report_path": "", "notion_url": "", "error": "",
-    }
+    })
     _trim_jobs()
     jobs.save()
     task = asyncio.create_task(run_research(job_id))
@@ -1096,7 +1085,7 @@ async def report_markdown(job_id: str):
 @app.get("/jobs/{job_id}/report")
 async def report_html(job_id: str):
     path = _report_file(job_id)
-    _, text = pipeline.split_front_matter(path.read_text(encoding="utf-8"))
+    _, text = pipeline.split_front_matter(_read_file(path))
     nav = (f'<a href="/">← Footnote</a> &nbsp;·&nbsp; '
            f'<a href="/jobs/{job_id}/report.md" download>Download .md</a>'
            f' &nbsp;·&nbsp; '
@@ -1117,6 +1106,13 @@ def _source_file(job_id: str, name: str) -> Path:
 
 def _str(value) -> str:
     return value if isinstance(value, str) else ""
+
+
+def _read_file(path: Path) -> str:
+    """Read a dossier file. It lives in a folder other software writes to, so
+    bytes that are not UTF-8 are shown as replacement characters rather than
+    turned into a 500."""
+    return path.read_text(encoding="utf-8", errors="replace")
 
 
 def _size(path: Path) -> int:
@@ -1210,7 +1206,7 @@ async def report_source(job_id: str, name: str, raw: int = 0):
     path = _source_file(job_id, name)
     if raw:
         return FileResponse(path, media_type="text/markdown", filename=path.name)
-    meta, text = pipeline.split_front_matter(path.read_text(encoding="utf-8"))
+    meta, text = pipeline.split_front_matter(_read_file(path))
     origin = meta.get("source", "")
     nav = [f'<a href="/jobs/{job_id}/report">← Report</a>']
     if _safe_url(origin):

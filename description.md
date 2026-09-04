@@ -147,48 +147,43 @@ bound the caller passes is a bound.
 
 ### Nothing arrives trusted
 
-Both providers' payloads cross a network as someone else's JSON, and the
-places that hurt are not the obvious ones. A title that comes back as a list
-passes every truthiness check, is recorded as a successful scrape, and then
-takes the whole dossier down inside `unicodedata.normalize` — long after the
-step that produced it. So every scalar is coerced where it enters (`_text`),
-every container is type-checked before it is indexed, and a response whose
-shape is wrong — a list where an object belongs, a `data` that is not an
-object — is treated exactly like a body that would not parse: named as
-unreadable and retried, rather than becoming a misleading "empty extraction"
-or an `AttributeError` from the first `.get()`.
+Both providers' payloads cross a network as someone else's JSON, the state
+files and the dossier folder are written by other software, and the request
+body is whatever a client sent. These were fixed one at a time for several
+rounds — a title, then an error string, then a stored value, then a hostname
+— which is the signature of patching instances instead of a class. So they
+are enumerated, and each has one rule.
 
-The result endpoint gets the same treatment for a different reason. The run
-behind it is finished and paid for, so a 429 or a bad gateway *in front of*
-the result is not a reason to throw it away: those are retried inside the
-existing deadline instead of failing the job.
+| Boundary | Rule |
+|---|---|
+| Parallel: create-run, result, error bodies | `clean_text` on every scalar, `_as_list` on every collection; a wrong-shaped body is retried, not crashed on |
+| Firecrawl: markdown, title, **error** | same; the error path matters as much as the success path, since both reach the dossier |
+| Notion: response | checked as an object, URL through `clean_text` and `is_http_url` before it is stored |
+| HTTP request bodies | validated by type and content (`_question_problem`, `_valid_subscription`); a 422 is rendered with `ensure_ascii`, because the default handler echoes the input that could not be encoded |
+| Query and path parameters | `limit` is a bounded int; a source name is matched against the files on disk; the token is compared as **bytes**, since `compare_digest` raises `TypeError` on a non-ASCII string |
+| `jobs.json`, `subscriptions.json` | `clean_json` on load *and* on save; not valid UTF-8, not JSON, or not an object of records → quarantined under a fresh name |
+| Dossier files (report, sources) | read with `errors="replace"`; frontmatter values through `clean_text` |
+| Filenames written | `slug_for` budgets UTF-8 **bytes**, and every file is written through `scrub_surrogates` |
+| Environment | integers validated with a minimum, `DEFAULT_PROCESSOR` against the real list, both at startup |
 
-One class deserves naming because it keeps coming back: text that survives
-JSON *decoding* but cannot be JSON *encoded*. A client can send `"\ud800"`, and
-Python will hold the unpaired surrogate happily — until `json.dump` refuses
-it, at which point the job store cannot be written again and every later job
-is lost. So questions carrying one are refused at the door, provider text has
-them replaced, `JsonStore.save` falls back to escaping rather than failing,
-and the 422 that reports the refusal is serialized with `ensure_ascii` —
-because the default handler echoes the offending input, which is the very
-thing that could not be encoded.
+Two helpers carry all of it. `clean_text` is the ingress rule: not a string
+becomes the fallback or its `str()`, and anything UTF-8 cannot represent is
+replaced. `clean_json` is the structural one, applied where data is *stored*
+rather than field by field — a list of field names is exactly the thing that
+goes stale, and it did: the first two attempts at this enumerated fields and
+missed the ones added since. Keys become strings, non-finite floats become
+null (`NaN` is not JSON and does not survive a reload), and anything
+unrecognised becomes its `str()`, so `json.dump` cannot refuse what the store
+holds.
 
-The ingress points are wider than the obvious ones, and each was found only
-after the previous fix: a provider's **error** text lands in the dossier and
-the job store exactly like a title does; `save()`'s escaping fallback means a
-value that got in once comes *back* as a surrogate on the next load, so
-stored records are scrubbed on the way in (nested citation fields included)
-and on every update; a state file that is not valid UTF-8 at all is
-quarantined like malformed JSON rather than raising `UnicodeDecodeError`
-before the app exists; and `_one_line` scrubs as a last resort, since every
-value written to a file passes through it. A hostname is checked the same
-way — `https://\ud800` parsed as a valid authority and then failed inside
-`uuid5` when a subscription was registered.
+The one thing that rule costs: a path that is not valid UTF-8 — possible on
+Linux, where filenames are bytes — is scrubbed on its way into the store, and
+that job's report then reads as unavailable. It could not have been stored as
+JSON at all, so the choice was between a degraded record and no store.
 
-Filenames have their own version of the same lesson: `slug_for` budgets in
-UTF-8 *bytes*, not characters, because ext4 limits a path component to 255
-bytes and 64 emoji are 256 — a limit that would only ever be hit after the
-research was paid for.
+A test drives hostile values through every row of that table in one go and
+then asserts the store still saves and `/jobs` still answers. Each protection
+was checked by removing it and watching that test fail.
 
 ## External API contracts
 

@@ -1950,6 +1950,140 @@ def test_legacy_subscriptions_are_dropped_on_load(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# The boundary sweep: every place outside text enters, one rule at each
+# ---------------------------------------------------------------------------
+
+# What gets pushed through each boundary. The surrogate is the one that keeps
+# coming back: it survives JSON decoding and cannot be JSON encoded.
+HOSTILE = ["\ud800", "a\ud800b", "\x00nul", "\x1b[31m", "x" * 5000,
+           ["a", "list"], {"a": "dict"}, 12345, True, None, float("nan")]
+
+
+def test_clean_text_is_total():
+    """Whatever arrives, a string comes out — and it can be encoded."""
+    for value in HOSTILE:
+        out = pipeline.clean_text(value)
+        assert isinstance(out, str)
+        out.encode("utf-8")                       # would raise on a surrogate
+
+
+def test_clean_json_makes_serialisation_total():
+    """The store cannot hold something json.dump would refuse."""
+    hostile = {"str": "\ud800", "nested": {"list": HOSTILE},
+               "nan": float("nan"), "inf": float("inf"),
+               7: "non-string key", "set": {"a"}, "path": Path("/tmp/x")}
+    encoded = json.dumps(pipeline.clean_json(hostile))
+    assert json.loads(encoded)                    # and it survives a round trip
+    assert json.loads(encoded)["nan"] is None
+
+
+def test_the_store_round_trips_anything_it_is_given(tmp_path):
+    """Write, reload, write again: no value can wedge it."""
+    store = app_module.JsonStore(tmp_path / "jobs.json")
+    store.data["abcdefabcdef"] = {"id": "abcdefabcdef", "junk": HOSTILE,
+                                  "error": "\ud800", "n": float("inf")}
+    store.save()
+    again = app_module.JsonStore(tmp_path / "jobs.json")
+    assert not pipeline.has_lone_surrogate(json.dumps(again.data))
+    again.save()                                  # and again, from the reload
+
+
+def test_hostile_provider_payloads_never_fail_a_job(tmp_path):
+    """Parallel and Firecrawl, at every field, into a written dossier."""
+    payload = {"run": {"status": ["not", "a", "status"]},
+               "output": {"content": "The answer \ud800.",
+                          "basis": [{"confidence": {"h": 1}, "reasoning": 5,
+                                     "citations": [
+                                         {"url": "https://a.test/1",
+                                          "title": "t\ud800", "excerpts": [None, 3]},
+                                         {"url": ["nope"]}]}]}}
+    result = pipeline._parse_task_result(payload, "trun_x")
+    sources = [SourceCopy("https://a.test/1", "T\ud800", "# body \ud800",
+                          True),
+               SourceCopy("https://b.test/2", "B", "", False, "blocked \ud800")]
+    written = pipeline.write_report(tmp_path, "Hostile payload question",
+                                    "core", result, sources, job_id="abcdefabcdef")
+    # Everything on disk is readable UTF-8, and reading it back is clean.
+    for path in [written.path, *(written.path.parent / "sources").glob("*.md")]:
+        path.read_text(encoding="utf-8")
+        meta, body = pipeline.split_front_matter(path.read_text(encoding="utf-8"))
+        assert not pipeline.has_lone_surrogate(json.dumps([meta, body]))
+
+
+def test_every_http_boundary_survives_hostile_input(client, monkeypatch, tmp_path):
+    """Drive the request boundaries, then prove the store is still writable."""
+    monkeypatch.setattr(app_module, "PARALLEL_API_KEY", "k")
+    monkeypatch.setattr(app_module, "VAPID_PUBLIC_KEY", "pub")
+    monkeypatch.setattr(app_module, "VAPID_PRIVATE_KEY", "priv")
+    monkeypatch.setattr(app_module, "VAPID_CLAIM_EMAIL", "me@example.test")
+    app_module.jobs.data.clear()
+
+    # Request bodies, including bytes a JSON encoder could not have produced.
+    bodies = [b'{"question": "' + b"\\ud800" * 8 + b'"}',
+              b'{"question": "a fine question\\u0000here"}',
+              b'{"question": ["a", "list"]}',
+              b'{"question": "a perfectly fine question", "processor": 5}',
+              b'{"not json at all"',
+              b'{"question": "a perfectly fine question\xff"}']
+    for body in bodies:
+        resp = client.post("/research", content=body,
+                           headers={"Content-Type": "application/json"})
+        # 400 for a body that is not decodable at all, 422 for one that is
+        # decodable and refused; never 500, and never a job in the store.
+        assert resp.status_code in (200, 400, 422), (body, resp.status_code)
+
+    # Raw bytes, because a surrogate cannot be encoded into a request body by
+    # any client — it only ever arrives as a JSON escape.
+    for body in (b'{"endpoint": "https://\\ud800", '
+                 b'"keys": {"p256dh": "\\ud800", "auth": "x"}}',
+                 b'{"endpoint": "https://push.test/x", "keys": {"p256dh": null}}',
+                 b'{"endpoint": "https://push.test/x", "keys": "not a dict"}',
+                 b'{"endpoint": 5, "keys": {}}'):
+        resp = client.post("/subscribe", content=body,
+                           headers={"Content-Type": "application/json"})
+        assert resp.status_code == 422, (body, resp.status_code)
+
+    # Query and path parameters.
+    for url, params in (("/jobs", {"limit": "not a number"}), ("/jobs", {"limit": -1}),
+                        ("/research/%00", None), ("/jobs/..%2f..%2fetc/report", None),
+                        ("/jobs/abcdefabcdef/sources/%2e%2e%2fescape.md", None),
+                        ("/jobs", {"token": "cafe\u0301"})):
+        assert client.get(url, params=params).status_code in (200, 401, 404, 422)
+
+    # A surrogate cannot travel in a URL either, so the path-parameter side of
+    # that boundary is exercised where it is actually decided.
+    assert app_module._servable_report("\ud800") is None
+    assert not app_module._token_matches("\ud800")
+
+    # The point of all of it: the store still works.
+    app_module.jobs.save()
+    assert client.get("/jobs").status_code == 200
+    assert client.get("/health").status_code == 200
+    app_module.jobs.data.clear()
+    app_module.subs.data.clear()
+
+
+def test_a_non_ascii_token_is_wrong_not_fatal(locked_client):
+    """compare_digest refuses non-ASCII strings with a TypeError."""
+    assert not app_module._token_matches("café")
+    assert not app_module._token_matches("\ud800")
+    assert app_module._token_matches("sekrit")
+    assert locked_client.get("/jobs", params={"token": "café"}).status_code == 401
+
+
+def test_a_dossier_with_invalid_bytes_still_renders(client, tmp_path):
+    """The notes folder is written by other software, and sometimes badly."""
+    written = _finished_job(tmp_path)
+    written.path.write_bytes(
+        b'---\nquestion: "q"\n---\n\n# Body \xff\xfe invalid\n')
+    (written.path.parent / "sources" / "01 Paper A.md").write_bytes(
+        b'---\nsource: "https://a.test/1"\n---\n\nbody \xff\n')
+    assert client.get("/jobs/abcdefabcdef/report").status_code == 200
+    assert client.get("/jobs/abcdefabcdef/sources/01 Paper A.md").status_code == 200
+    assert client.get("/jobs/abcdefabcdef/sources").status_code == 200
+
+
+# ---------------------------------------------------------------------------
 # Service worker routing (the patterns it actually ships, not a copy of them)
 # ---------------------------------------------------------------------------
 
