@@ -209,7 +209,9 @@ def _push_one(sub: dict, payload: dict) -> bool:
         # subscription surfaces here rather than as a WebPushException. Keep
         # it: the device is not provably gone, and a notification is never
         # worth failing over.
-        print(f"push to {sub.get('endpoint', '?')[:60]} failed: {exc}", flush=True)
+        # The endpoint is a capability URL — anyone holding it can push to
+        # the device — so it stays out of the log.
+        print(f"push to a subscribed device failed: {exc}", flush=True)
         return True
 
 
@@ -227,7 +229,8 @@ async def notify_all(title: str, body: str, url: str = "/") -> None:
 
 
 async def _notify_all(title: str, body: str, url: str) -> None:
-    if webpush is None or not (VAPID_PRIVATE_KEY and VAPID_PUBLIC_KEY):
+    if webpush is None or not (VAPID_PRIVATE_KEY and VAPID_PUBLIC_KEY
+                               and VAPID_CLAIM_EMAIL):
         return
     payload = {"title": title, "body": body, "url": url,
                "icon": "/static/icon-192.png", "badge": "/static/icon-192.png"}
@@ -252,6 +255,8 @@ async def run_research(job_id: str) -> None:
         return
     client: httpx.AsyncClient = app.state.client
     question, processor = job["question"], job["processor"]
+    if _finish_if_already_written(job_id, job):
+        return
     try:
         # 1. Deep research on Parallel (created once; resumable by run_id)
         _update_job(job_id, status="researching",
@@ -268,7 +273,7 @@ async def run_research(job_id: str) -> None:
 
         # 2. Archive cited sources locally (optional, best-effort)
         sources = []
-        if FIRECRAWL_API_KEY and result.citations:
+        if FIRECRAWL_API_KEY and result.citations and MAX_SOURCES > 0:
             n = min(len(result.citations), MAX_SOURCES)
             _update_job(job_id, status="archiving",
                         progress=f"Archiving {n} cited source{'s' * (n != 1)}…")
@@ -280,11 +285,15 @@ async def run_research(job_id: str) -> None:
                 client, FIRECRAWL_API_KEY, result.citations, MAX_SOURCES,
                 app.state.limiter, on_progress=archived_so_far)
 
-        # 3. Write the dossier into the synced folder
+        # 3. Write the dossier into the synced folder. The path is stored
+        # the moment it exists: a restart between here and the final update
+        # would otherwise re-scrape (spending credits again) and write a
+        # second folder for research already filed.
         _update_job(job_id, status="saving", progress="Writing report…")
         written = await asyncio.to_thread(
             pipeline.write_report, OUTPUT_DIR, question, processor,
             result, sources)
+        _update_job(job_id, report_path=str(written.path))
 
         # 4. Optional Notion mirror
         notion_url = ""
@@ -292,8 +301,11 @@ async def run_research(job_id: str) -> None:
             try:
                 notion_url = await pipeline.save_to_notion(
                     client, NOTION_API_KEY, NOTION_DATABASE_ID, question, result)
-            except PipelineError as exc:
-                print(f"[{job_id}] notion mirror failed: {exc}", flush=True)
+            except Exception as exc:                       # noqa: BLE001
+                # Everything, not just PipelineError: a DNS failure or an HTML
+                # body where JSON was promised would otherwise escape and
+                # rewrite a dossier that is already on disk as failed.
+                print(f"[{job_id}] notion mirror failed: {_scrub(exc)}", flush=True)
 
         archived = sum(1 for s in sources if s.ok)
         summary = (f"{len(result.citations)} sources cited"
@@ -321,6 +333,25 @@ async def run_research(job_id: str) -> None:
         _update_job(job_id, status="failed", error=f"Unexpected error: {reason}",
                     progress=f"Failed: {reason}", finished_at=_now())
         await notify_all("Research failed", f"“{_ellipsize(question)}”: {reason}")
+
+
+def _finish_if_already_written(job_id: str, job: dict) -> bool:
+    """Close out a job whose dossier survived the restart that interrupted it.
+
+    Resuming means re-running the whole pipeline, and steps 2 and 3 are not
+    free or idempotent — Firecrawl charges again and write_report claims a
+    new folder. If the report is already on disk, the work is done; say so
+    rather than paying for a duplicate.
+    """
+    path = job.get("report_path") or ""
+    if not path or not Path(path).exists():
+        return False
+    if job.get("status") == "done":
+        return True
+    print(f"[{job_id}] dossier already written; not repeating it", flush=True)
+    _update_job(job_id, status="done", finished_at=job.get("finished_at") or _now(),
+                progress=job.get("progress") or "Done — recovered after a restart")
+    return True
 
 
 def _citation_records(result, sources: list, written) -> list:
@@ -399,18 +430,23 @@ _ALLOWED_ATTRS = {
     "code": frozenset({"class"}),      # language-* from fenced code blocks
     "pre": frozenset({"class"}),
 }
-_SAFE_SCHEMES = frozenset({"http", "https", "mailto"})
-_SCHEME = re.compile(r"^([a-zA-Z][a-zA-Z0-9+.-]*):")
+# One URL policy for the whole app: what the dossier is willing to link to
+# is what the renderer is willing to keep (pipeline.is_safe_url).
+_safe_url = pipeline.is_safe_url
 
 
-def _safe_url(url: str) -> bool:
-    """True for relative URLs and for the schemes a document may link to."""
+def _safe_image_url(url: str) -> bool:
+    """Images additionally have to satisfy the CSP, which allows no http:.
+
+    Letting the sanitizer keep an http image the policy then blocks would
+    give a silently broken picture instead of an honest missing one.
+    """
     if not url:
         return False
-    # Browsers ignore control characters inside a scheme ("java\tscript:").
-    bare = re.sub(r"[\x00-\x20]", "", url)
-    match = _SCHEME.match(bare)
-    return match is None or match.group(1).lower() in _SAFE_SCHEMES
+    bare = re.sub(r"[\x00-\x20]", "", url).lower()
+    if bare.startswith("data:image/") and "svg" not in bare.split(";", 1)[0]:
+        return True
+    return _safe_url(url) and not bare.startswith("http:")
 
 
 class _Sanitizer(HTMLParser):
@@ -433,7 +469,9 @@ class _Sanitizer(HTMLParser):
             value = value or ""
             if name not in allowed:
                 continue
-            if name in ("href", "src") and not _safe_url(value):
+            if name == "href" and not _safe_url(value):
+                continue
+            if name == "src" and not _safe_image_url(value):
                 continue
             parts.append(f'{name}="{escape(value, quote=True)}"')
         self.out.append("<" + " ".join(parts) + ">")
@@ -614,8 +652,10 @@ async def _require_token(request: Request, call_next):
 # inline script has nothing to execute even if the sanitizer were bypassed,
 # and connect-src 'self' means it would have nowhere to send anything. Styles
 # stay inline-capable (the markdown fallback carries a style attribute) and
-# images still load from the archived pages, which the sanitizer already
-# allows over http/https.
+# images still load from the archived pages. img-src has no http:, and the
+# sanitizer drops http: images to match — a picture that is going to be
+# blocked should be absent, not broken. data: images are allowed except SVG,
+# which is a script container.
 _SECURITY_HEADERS = {
     "content-security-policy": (
         "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
@@ -753,10 +793,24 @@ def _source_file(job_id: str, name: str) -> Path:
     """Resolve an archived source copy by file name only — never by path."""
     if "/" in name or "\\" in name or name.startswith("."):
         raise HTTPException(404, "Not found")
-    path = _report_file(job_id).parent / "sources" / name
-    if not path.is_file():
+    folder = _report_file(job_id).parent
+    path = folder / "sources" / name
+    if not path.is_file() or not _inside(path, folder):
         raise HTTPException(404, "No such source copy")
     return path
+
+
+def _inside(path: Path, folder: Path) -> bool:
+    """Whether path really lives under folder, symlinks resolved.
+
+    The dossier folder is a synced notes directory that people edit, so a
+    name inside it can be a link to somewhere else entirely.
+    """
+    try:
+        path.resolve().relative_to(folder.resolve())
+        return True
+    except (OSError, ValueError):
+        return False
 
 
 def _head(path: Path, limit: int = 1024) -> str:
@@ -854,7 +908,8 @@ def _zip_bundle(report: Path) -> bytes:
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as archive:
         archive.write(report, f"{folder.name}/{report.name}")
         for path in sorted((folder / "sources").glob("*.md")):
-            archive.write(path, f"{folder.name}/sources/{path.name}")
+            if _inside(path, folder):      # never follow a link out of it
+                archive.write(path, f"{folder.name}/sources/{path.name}")
     return buf.getvalue()
 
 
@@ -868,8 +923,17 @@ async def bundle_zip(job_id: str):
 
 @app.post("/subscribe")
 async def subscribe(req: SubscribeRequest):
-    if not (VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY):
-        raise HTTPException(503, "Push is not configured (VAPID keys missing)")
+    if not (VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY and VAPID_CLAIM_EMAIL):
+        raise HTTPException(503, "Push is not configured (VAPID keys or "
+                                 "VAPID_CLAIM_EMAIL missing)")
+    # Checked on the way in: a subscription that cannot be pushed to is
+    # otherwise kept forever and fails once per job, for every job.
+    if not pipeline.is_safe_url(req.endpoint, relative_ok=False):
+        raise HTTPException(422, "endpoint must be an http(s) URL")
+    missing = [k for k in ("p256dh", "auth")
+               if not isinstance(req.keys.get(k), str) or not req.keys[k]]
+    if missing:
+        raise HTTPException(422, f"keys is missing {', '.join(missing)}")
     key = uuid.uuid5(uuid.NAMESPACE_URL, req.endpoint).hex
     subs.data[key] = {"endpoint": req.endpoint, "keys": req.keys}
     subs.save()
@@ -899,8 +963,10 @@ async def health():
         "parallel_configured": bool(PARALLEL_API_KEY),
         "firecrawl_configured": bool(FIRECRAWL_API_KEY),
         "notion_configured": bool(NOTION_API_KEY and NOTION_DATABASE_ID),
+        # The claim email is not optional: pywebpush signs with a
+        # "mailto:{...}" subject, and push services reject an empty one.
         "push_configured": bool(VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY
-                                and webpush is not None),
+                                and VAPID_CLAIM_EMAIL and webpush is not None),
         "auth_required": bool(FOOTNOTE_TOKEN),
         "active_jobs": sum(j["status"] in ACTIVE_STATUSES
                            for j in jobs.data.values()),

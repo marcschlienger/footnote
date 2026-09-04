@@ -32,6 +32,7 @@ import unicodedata
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 import httpx
@@ -64,6 +65,24 @@ REPORT_SPEC = (
     "prose. Do not append a bibliography or link list — sources are attached "
     "separately from the citation metadata."
 )
+
+
+# Schemes a dossier may link to. Anything else is written as text: a
+# citation is data from the open web, and a Markdown file is portable — it
+# will be opened by notes apps that follow links without asking.
+SAFE_SCHEMES = frozenset({"http", "https", "mailto"})
+_SCHEME = re.compile(r"^([a-zA-Z][a-zA-Z0-9+.-]*):")
+
+
+def is_safe_url(url: str, relative_ok: bool = True) -> bool:
+    """True for the schemes above, and for relative URLs when allowed."""
+    if not url:
+        return False
+    # Browsers ignore control characters inside a scheme ("java\tscript:").
+    match = _SCHEME.match(re.sub(r"[\x00-\x20]", "", str(url)))
+    if match is None:
+        return relative_ok
+    return match.group(1).lower() in SAFE_SCHEMES
 
 
 class PipelineError(Exception):
@@ -315,7 +334,15 @@ def _retry_after(resp: httpx.Response, fallback_s: float) -> float:
     if header:
         try:
             return min(max(float(header), 0.0), MAX_BACKOFF_S)
-        except ValueError:                  # HTTP-date form: back off instead
+        except ValueError:
+            pass
+        try:                                # RFC 9110 allows an HTTP date
+            when = parsedate_to_datetime(header)
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+            wait = (when - datetime.now(timezone.utc)).total_seconds()
+            return min(max(wait, 0.0), MAX_BACKOFF_S)
+        except (TypeError, ValueError):
             pass
     return min(fallback_s * random.uniform(0.5, 1.5), MAX_BACKOFF_S)
 
@@ -350,16 +377,19 @@ async def scrape_sources(
 
     async def one(cit: Citation) -> SourceCopy:
         try:
-            async with limiter.sem:
-                if limiter.out_of_credits():
-                    copy = SourceCopy(cit.url, cit.title, "", False, OUT_OF_CREDITS)
-                else:
-                    copy = await _scrape_one(client, api_key, cit, limiter)
+            if limiter.out_of_credits():
+                copy = SourceCopy(cit.url, cit.title, "", False, OUT_OF_CREDITS)
+            else:
+                copy = await _scrape_one(client, api_key, cit, limiter)
         except Exception as exc:                           # noqa: BLE001
             copy = SourceCopy(cit.url, cit.title, "", False, str(exc)[:200])
         state["done"] += 1
         if on_progress:
-            on_progress(state["done"], len(todo))
+            try:
+                on_progress(state["done"], len(todo))
+            except Exception as exc:                       # noqa: BLE001
+                # A progress report is not worth a source, let alone a job.
+                print(f"progress callback failed: {exc}", flush=True)
         return copy
 
     return list(await asyncio.gather(*(one(c) for c in todo)))
@@ -380,16 +410,27 @@ async def _scrape_one(
         if limiter.out_of_credits():
             return SourceCopy(cit.url, cit.title, "", False, OUT_OF_CREDITS)
         try:
-            resp = await client.post(
-                f"{FIRECRAWL_BASE}/scrape",
-                headers={"Authorization": f"Bearer {api_key}"},
-                json={
-                    "url": cit.url,
-                    "formats": ["markdown"],
-                    "onlyMainContent": True,
-                },
-                timeout=httpx.Timeout(90.0, connect=15.0),
-            )
+            # The semaphore models Firecrawl's concurrent *browsers*, so it
+            # covers the request and nothing else — a worker sleeping out a
+            # backoff or waiting on the pacer is not using a browser, and
+            # holding a slot through that would make the real concurrency
+            # lower than the number configured.
+            async with limiter.sem:
+                # Checked here, holding the slot: a worker that queued while
+                # the credits were good must not spend one after a 402 has
+                # landed, or the batch bound becomes the batch size.
+                if limiter.out_of_credits():
+                    return SourceCopy(cit.url, cit.title, "", False, OUT_OF_CREDITS)
+                resp = await client.post(
+                    f"{FIRECRAWL_BASE}/scrape",
+                    headers={"Authorization": f"Bearer {api_key}"},
+                    json={
+                        "url": cit.url,
+                        "formats": ["markdown"],
+                        "onlyMainContent": True,
+                    },
+                    timeout=httpx.Timeout(90.0, connect=15.0),
+                )
         except Exception as exc:                           # noqa: BLE001
             error = str(exc)[:200]
             if attempt == MAX_ATTEMPTS:
@@ -508,7 +549,8 @@ def write_report(
         stitle = slug_for(src.title or src.url, 60)
         fname = f"{numbers.get(src.url, fallback):02d} {stitle}.md"
         body = (
-            f"---\nsource: {src.url}\ntitle: \"{_yaml_escape(src.title)}\"\n"
+            f'---\nsource: "{_yaml_escape(src.url)}"\n'
+            f'title: "{_yaml_escape(src.title)}"\n'
             f"retrieved: {date_str()}\n---\n\n{src.markdown.strip()}\n"
         )
         (folder / "sources" / fname).write_text(body, encoding="utf-8")
@@ -521,7 +563,7 @@ def write_report(
         f"processor: {processor}",
     ]
     if result.confidence:
-        lines.append(f"confidence: {result.confidence}")
+        lines.append(f'confidence: "{_yaml_escape(result.confidence)}"')
     lines += [f"sources: {len(result.citations)}", "app: Footnote", "---", ""]
     lines += [f"# {_one_line(question)}", "", result.content, ""]
 
@@ -529,7 +571,13 @@ def write_report(
         lines += ["## Sources", ""]
         for i, cit in enumerate(result.citations, start=1):
             label = cit.title or cit.url
-            entry = f"{i}. [{_md_label(label)}]({_md_url(cit.url)})"
+            if is_safe_url(cit.url, relative_ok=False):
+                entry = f"{i}. [{_md_label(label)}]({_md_url(cit.url)})"
+            else:
+                # Written as text: the dossier is portable, and the app that
+                # opens it next may follow links without asking.
+                entry = (f"{i}. {_md_label(label)} — not a web link: "
+                         f"`{_one_line(cit.url)}`")
             if cit.url in saved:
                 entry += f" — [local copy](<sources/{saved[cit.url]}>)"
             lines.append(entry)

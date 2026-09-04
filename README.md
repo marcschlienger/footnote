@@ -308,7 +308,7 @@ Details worth knowing:
 | Job/subscription state | `DATA_DIR` | `data/` next to `app.py` |
 | Bind address / port | `--host` / `--port` flags, or `HOST` / `PORT` | `0.0.0.0` / `8010` |
 | Default depth | `DEFAULT_PROCESSOR` | `core` |
-| Sources archived per dossier | `MAX_SOURCES` | `12` |
+| Sources archived per dossier | `MAX_SOURCES` (`0` disables archiving) | `12` |
 | Firecrawl requests per minute | `FIRECRAWL_RATE_LIMIT` (`0` disables pacing) | `10` — the free plan's limit |
 | Firecrawl requests in flight | `FIRECRAWL_CONCURRENCY` | `2` — the free plan's limit |
 | Cross-origin browser clients | `FOOTNOTE_CORS_ORIGINS` (comma-separated) | none — the PWA is same-origin |
@@ -345,8 +345,10 @@ Clients can present the token three ways, same contract as Margin:
 - **Browser cookie** — open `http://YOUR-SERVER:8010/?token=<token>` once
   and the token is stored in an `HttpOnly`, `SameSite=Strict` cookie
   (1 year), and the browser is then redirected to the same URL without the
-  token so it does not linger in history or logs; after that the PWA works
-  with no decoration. The home-screen app
+  token, so it stops appearing in the address bar and in later history
+  entries. That first request still carries it, so it appears once in the
+  server's access log — the redirect limits the exposure rather than erasing
+  it. After that the PWA works with no decoration. The home-screen app
   authenticates the same way — its cookie storage is separate from Safari's,
   so it shows a token form on first launch. Because the cookie is `Strict`,
   other websites can never ride it.
@@ -519,7 +521,9 @@ Tailscale, WireGuard) and/or use the per-instance `FOOTNOTE_TOKEN`.
   finish), and the dossier and the job summary both say so. The budget is
   shared by the whole server, not per job, because Firecrawl counts requests
   per key. On a paid plan, raise `FIRECRAWL_RATE_LIMIT` and
-  `FIRECRAWL_CONCURRENCY`.
+  `FIRECRAWL_CONCURRENCY`. The budget is per process, so if you run several
+  instances against one Firecrawl key, divide the limits between them in each
+  instance's env file — or give each one its own key.
 - Authentication is optional and coarse — one shared token per instance, no
   rate limiting. Keep the server on a private network regardless.
 - **The bundle zip is built in memory** and holds the report plus the

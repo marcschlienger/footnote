@@ -14,6 +14,11 @@
 # unless overridden in the per-user env file. Edit the env file to change
 # anything, then `systemctl restart footnote@<user>`. Idempotent — an
 # existing env file is kept untouched.
+#
+# Firecrawl's rate limit belongs to the API key, and each instance paces
+# itself independently. Instances sharing one key must therefore divide the
+# budget between them — e.g. FIRECRAWL_RATE_LIMIT=5 in each of two env files
+# on a free key that allows 10/min — or use one key per person.
 set -euo pipefail
 
 APP_DIR="${APP_DIR:-/opt/footnote}"

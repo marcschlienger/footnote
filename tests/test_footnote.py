@@ -10,7 +10,11 @@ No network access required — external APIs are mocked.
 import asyncio
 import io
 import json
+import re
+import time
 import zipfile
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
 from pathlib import Path
 
 import httpx
@@ -306,6 +310,28 @@ def test_scrape_reports_progress_as_copies_land():
     assert seen == [(1, 3), (2, 3), (3, 3)]
 
 
+def test_a_backing_off_worker_does_not_hold_a_browser_slot(monkeypatch):
+    """The semaphore models browsers in flight, not workers in existence."""
+    monkeypatch.setattr(pipeline, "BASE_BACKOFF_S", 0.2)
+    arrivals = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = json.loads(request.content)["url"]
+        arrivals.append(url)
+        if len(arrivals) == 1:             # the first source must retry
+            return httpx.Response(503, json={"success": False, "error": "busy"})
+        return _ok_scrape(request)
+
+    copies = _run_scrape(handler, 2, concurrency=1)
+    assert all(c.ok for c in copies)
+    # Order, not a stopwatch: the other source got the single slot while the
+    # first was sleeping out its backoff. Were the slot held across the sleep,
+    # the retry would have come second and this source last.
+    first, second, third = arrivals
+    assert second != first, arrivals        # the other source went next
+    assert third == first, arrivals         # then the retry
+
+
 def test_a_non_json_error_body_cannot_fail_the_job(monkeypatch):
     """An HTML 502 from a proxy is a failed source, never an exception."""
     monkeypatch.setattr(pipeline, "BASE_BACKOFF_S", 0.01)   # 502 is retryable
@@ -384,14 +410,14 @@ def test_write_report_layout(tmp_path):
     assert written.source_files == {"https://a.test/1": "01 Paper A.md"}
     text = report.read_text()
     assert 'question: "How do solid-state batteries work?"' in text
-    assert "confidence: medium" in text
+    assert 'confidence: "medium"' in text
     assert "[Paper A](https://a.test/1)" in text
     assert "local copy" in text                      # archived source linked
     assert "could not be archived" in text and "blocked" in text
     assert "> quoted bit" in text
     src_files = list((report.parent / "sources").glob("*.md"))
     assert len(src_files) == 1 and src_files[0].name.startswith("01 ")
-    assert "source: https://a.test/1" in src_files[0].read_text()
+    assert 'source: "https://a.test/1"' in src_files[0].read_text()
 
 
 def test_write_report_unique_folder(tmp_path):
@@ -808,6 +834,192 @@ def test_no_cross_origin_access_by_default():
     """A wildcard here would let any page spend the Parallel key."""
     assert app_module.CORS_ORIGINS == []
     assert not [m for m in app_module.app.user_middleware if "CORS" in str(m)]
+
+
+def test_a_notion_failure_cannot_fail_a_written_dossier(client, monkeypatch, tmp_path):
+    """The mirror is optional; the dossier is already on disk when it runs."""
+    monkeypatch.setattr(app_module, "PARALLEL_API_KEY", "k")
+    monkeypatch.setattr(app_module, "FIRECRAWL_API_KEY", "")
+    monkeypatch.setattr(app_module, "NOTION_API_KEY", "n")
+    monkeypatch.setattr(app_module, "NOTION_DATABASE_ID", "d")
+    monkeypatch.setattr(app_module, "OUTPUT_DIR", tmp_path)
+
+    async def fake_result(*a, **kw):
+        return _sample_result()
+
+    async def notion_explodes(*a, **kw):
+        raise httpx.ConnectError("dns went away")   # not a PipelineError
+
+    monkeypatch.setattr(pipeline, "start_task_run",
+                        lambda *a, **kw: _immediately("trun_x"))
+    monkeypatch.setattr(pipeline, "fetch_task_result", fake_result)
+    monkeypatch.setattr(pipeline, "save_to_notion", notion_explodes)
+
+    resp = client.post("/research", json={"question": "A perfectly fine question"})
+    job_id = resp.json()["job_id"]
+    for _ in range(50):
+        if app_module.jobs.data[job_id]["status"] not in app_module.ACTIVE_STATUSES:
+            break
+        time.sleep(0.02)
+    job = app_module.jobs.data[job_id]
+    assert job["status"] == "done", job.get("error")
+    assert Path(job["report_path"]).exists()
+
+
+def _immediately(value):
+    async def done():
+        return value
+    return done()
+
+
+def test_a_restart_does_not_buy_the_research_twice(client, tmp_path, monkeypatch):
+    """Resuming a job whose dossier is on disk must not re-scrape or re-write."""
+    written = pipeline.write_report(tmp_path, "Interrupted question", "core",
+                                    _sample_result(), [])
+    app_module.jobs.data["res1"] = {
+        "id": "res1", "question": "Interrupted question", "processor": "core",
+        "status": "saving", "created_at": "2026-01-01T00:00:00Z",
+        "run_id": "trun_x", "report_path": str(written.path)}
+
+    def refuse(*a, **kw):
+        raise AssertionError("the pipeline was run again")
+
+    monkeypatch.setattr(pipeline, "fetch_task_result", refuse)
+    monkeypatch.setattr(pipeline, "scrape_sources", refuse)
+    monkeypatch.setattr(pipeline, "write_report", refuse)
+
+    asyncio.run(app_module.run_research("res1"))
+    assert app_module.jobs.data["res1"]["status"] == "done"
+    assert len(list(tmp_path.iterdir())) == 1        # no duplicate folder
+
+
+def test_zero_max_sources_skips_archiving_entirely(client, monkeypatch, tmp_path):
+    monkeypatch.setattr(app_module, "MAX_SOURCES", 0)
+    monkeypatch.setattr(app_module, "FIRECRAWL_API_KEY", "k")
+    monkeypatch.setattr(app_module, "OUTPUT_DIR", tmp_path)
+
+    def refuse(*a, **kw):
+        raise AssertionError("archiving was entered with MAX_SOURCES=0")
+
+    monkeypatch.setattr(pipeline, "scrape_sources", refuse)
+    monkeypatch.setattr(pipeline, "start_task_run",
+                        lambda *a, **kw: _immediately("trun_x"))
+
+    async def fake_result(*a, **kw):
+        return _sample_result()
+
+    monkeypatch.setattr(pipeline, "fetch_task_result", fake_result)
+    asyncio.run(app_module.run_research(_queue_job(client)))
+
+
+def _queue_job(client):
+    job_id = "zero1"
+    app_module.jobs.data[job_id] = {
+        "id": job_id, "question": "A perfectly fine question",
+        "processor": "core", "status": "queued", "created_at": "2026-01-01T00:00:00Z",
+        "run_id": "", "report_path": "", "notion_url": "", "error": ""}
+    return job_id
+
+
+def test_subscriptions_are_checked_when_they_are_registered(client, monkeypatch):
+    monkeypatch.setattr(app_module, "VAPID_PUBLIC_KEY", "pub")
+    monkeypatch.setattr(app_module, "VAPID_PRIVATE_KEY", "priv")
+    monkeypatch.setattr(app_module, "VAPID_CLAIM_EMAIL", "me@example.test")
+    good = {"endpoint": "https://push.test/x",
+            "keys": {"p256dh": "abc", "auth": "def"}}
+    assert client.post("/subscribe", json=good).status_code == 200
+
+    assert client.post("/subscribe", json={**good, "keys": {}}).status_code == 422
+    assert client.post("/subscribe",
+                       json={**good, "endpoint": "javascript:alert(1)"}
+                       ).status_code == 422
+    app_module.subs.data.clear()
+
+
+def test_push_needs_a_claim_email_before_it_claims_to_work(client, monkeypatch):
+    monkeypatch.setattr(app_module, "VAPID_PUBLIC_KEY", "pub")
+    monkeypatch.setattr(app_module, "VAPID_PRIVATE_KEY", "priv")
+    monkeypatch.setattr(app_module, "VAPID_CLAIM_EMAIL", "")
+    assert client.get("/health").json()["push_configured"] is False
+    assert client.post("/subscribe", json={
+        "endpoint": "https://push.test/x",
+        "keys": {"p256dh": "a", "auth": "b"}}).status_code == 503
+
+
+def test_a_symlink_out_of_the_dossier_is_not_served(client, tmp_path):
+    written = _finished_job(tmp_path)
+    secret = tmp_path / "elsewhere.md"
+    secret.write_text("not part of the dossier")
+    link = written.path.parent / "sources" / "99 sneaky.md"
+    try:
+        link.symlink_to(secret)
+    except OSError:
+        pytest.skip("symlinks unavailable")
+    assert client.get("/jobs/xyz/sources/99 sneaky.md").status_code == 404
+    with zipfile.ZipFile(io.BytesIO(client.get("/jobs/xyz/bundle.zip").content)) as z:
+        assert not any("sneaky" in n for n in z.namelist())
+
+
+def test_a_citation_that_is_not_a_web_link_is_not_linked(tmp_path):
+    result = ResearchResult(
+        content="b", citations=[Citation("javascript:alert(1)", "Click me")],
+        confidence="", reasoning="")
+    text = pipeline.write_report(tmp_path, "Scheme question", "core",
+                                 result, []).path.read_text()
+    assert "](javascript:" not in text and "](<javascript:" not in text
+    assert "1. Click me — not a web link: `javascript:alert(1)`" in text
+
+
+def test_retry_after_accepts_an_http_date():
+    soon = format_datetime(datetime.now(timezone.utc) + timedelta(seconds=30))
+    resp = httpx.Response(429, headers={"Retry-After": soon})
+    assert 20 <= pipeline._retry_after(resp, 2.0) <= 31
+
+    past = format_datetime(datetime.now(timezone.utc) - timedelta(days=1))
+    assert pipeline._retry_after(
+        httpx.Response(429, headers={"Retry-After": past}), 2.0) == 0
+
+
+def test_source_frontmatter_survives_a_hostile_url(tmp_path):
+    result = ResearchResult(content="b",
+                            citations=[Citation("https://a.test/1", "T")],
+                            confidence="", reasoning="")
+    written = pipeline.write_report(
+        tmp_path, "Hostile url question", "core", result,
+        [SourceCopy("https://a.test/1\nmalicious: yes", "T", "# body", True)])
+    copy = next((written.path.parent / "sources").iterdir())
+    meta, _ = pipeline.split_front_matter(copy.read_text())
+    assert "malicious" not in meta
+    assert meta["source"] == "https://a.test/1 malicious: yes"
+
+
+# ---------------------------------------------------------------------------
+# Service worker routing (the patterns it actually ships, not a copy of them)
+# ---------------------------------------------------------------------------
+
+def _sw_pattern(name):
+    """Pull a route predicate's regex out of the shipped service worker."""
+    source = (Path(__file__).resolve().parent.parent
+              / "static" / "service-worker.js").read_text()
+    literal = re.search(rf"const {name} = \(url\) =>\s*/(.+?)/\.test",
+                        source, re.S).group(1)
+    return re.compile(literal.replace("\\/", "/"))   # JS escapes its delimiter
+
+
+def test_the_worker_caches_pages_but_not_the_index_or_downloads():
+    """Written pages are immutable; the sources index describes a live folder."""
+    dossier, index = _sw_pattern("isDossier"), _sw_pattern("isSourceIndex")
+
+    for path in ("/jobs/abc/report", "/jobs/abc/sources/01 a.md"):
+        assert dossier.search(path), path          # cache-first
+        assert not index.search(path), path
+
+    assert index.search("/jobs/abc/sources")       # network-first
+    assert not dossier.search("/jobs/abc/sources")
+
+    for path in ("/jobs/abc/report.md", "/jobs/abc/bundle.zip", "/jobs", "/health"):
+        assert not dossier.search(path), path      # never cached
+        assert not index.search(path), path
 
 
 # ---------------------------------------------------------------------------

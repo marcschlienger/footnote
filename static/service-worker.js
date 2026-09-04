@@ -51,12 +51,18 @@ self.addEventListener("activate", (event) => {
 const isShell = (url) =>
   SHELL.includes(url.pathname) || url.pathname.startsWith("/static/");
 
-// The rendered report and the archived source pages (including the JSON index
-// the source panel reads) — but not `?raw=1` downloads, `report.md`, or the
-// bundle zip, which are files to save rather than pages to read.
+// The rendered report and the archived source pages — written once and never
+// changed, so they are worth serving from the cache. Not `?raw=1` downloads,
+// `report.md` or the bundle zip, which are files to save rather than pages to
+// read, and not the sources index below.
 const isDossier = (url) =>
-  /^\/jobs\/[^/]+\/(report|sources)(\/|$)/.test(url.pathname) &&
+  /^\/jobs\/[^/]+\/(report$|sources\/)/.test(url.pathname) &&
   !url.searchParams.has("raw");
+
+// The sources index describes files that live in a notes folder people edit,
+// so it is not immutable like the pages it lists: serve it fresh, and fall
+// back to the last copy only when the network is gone.
+const isSourceIndex = (url) => /^\/jobs\/[^/]+\/sources$/.test(url.pathname);
 
 self.addEventListener("fetch", (event) => {
   if (event.request.method !== "GET") return;
@@ -67,7 +73,12 @@ self.addEventListener("fetch", (event) => {
     event.respondWith(networkFirst(event.request, SHELL_CACHE));
   } else if (isDossier(url)) {
     event.respondWith(cacheThenRefresh(event));
+  } else if (isSourceIndex(url)) {
+    // Per job, so it belongs with the dossier pages it describes.
+    event.respondWith(networkFirst(event.request, DOSSIER_CACHE, true));
   } else if (url.pathname === "/jobs") {
+    // In the untrimmed cache: the job list is one entry and must not be
+    // evicted by the dossiers it points at.
     event.respondWith(networkFirst(event.request, SHELL_CACHE, true));
   }
 });
@@ -96,6 +107,10 @@ async function cacheThenRefresh(event) {
       await trim(cache, DOSSIER_MAX);
     } else if (res.status === 401) {
       await forgetEverything();
+    } else if (res.status === 404 || res.status === 410) {
+      // The job was deleted. Reports resolve only through the job store, so
+      // the cache must not keep answering for one that is gone.
+      await cache.delete(event.request);
     }
     return res;
   });

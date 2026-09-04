@@ -61,8 +61,11 @@ queued ──► researching ──► archiving ──► saving ──► done
   safety (below). Footnote long-polls the result endpoint.
 - **archiving** — only entered when a Firecrawl key is configured and the
   result cites sources; scrapes up to `MAX_SOURCES` pages concurrently.
-- **saving** — dossier being written; then the optional Notion mirror (its
-  failure is logged, never fatal).
+- **saving** — dossier being written; the path is stored the moment the file
+  exists, so a restart in the next instant finishes the job instead of paying
+  Firecrawl again and writing a second folder. Then the optional Notion
+  mirror, whose failure is logged and never fatal — *any* failure, not only a
+  PipelineError, since the dossier is already on disk by then.
 - **done / failed** — terminal. Push notifications fire for both. A done
   job also keeps its citation list (URL, title, the file its copy went to,
   and the archiving error if there wasn't one) — capped at
@@ -178,13 +181,23 @@ limit of 0 turns pacing off). `_Pacer` admits a request only once the oldest
 start in the 60-second window has aged out, holding its lock across the
 sleep so waiters take turns instead of waking together and bursting.
 
-The budget belongs to **the API key, not the job**: the app builds one
-`ScrapeLimiter` in `lifespan` and every scrape shares it. A limiter per job
+The budget belongs to **the API key, not the job** — within a process: the
+app builds one `ScrapeLimiter` in `lifespan` and every scrape shares it. A limiter per job
 would be no limiter at all — two jobs archiving at once would double both
 numbers, and a restart resumes every unfinished job simultaneously. The
 exhausted-credits flag lives there too, so one job's 402 answers for the jobs
 queued behind it; it expires after `CREDIT_COOLDOWN_S` so a top-up or the
 monthly reset is noticed without a restart.
+
+**The limiter does not cross process boundaries**, and the Ubuntu layout runs
+one service per person against API keys that may be shared in
+`/opt/footnote/.env`. Two instances archiving at once would then present the
+key with twice the configured rate and twice the browsers. Nothing in a
+single process can see its siblings, so this is a deployment decision: give
+each instance its own Firecrawl key, or divide the limits between them in
+each `/etc/footnote/<user>.env` (`FIRECRAWL_RATE_LIMIT=5` apiece for two
+instances on one free key). A cross-process lock would be the wrong shape for
+an app whose whole premise is one small process per person.
 
 Archiving cannot fail a dossier, and that is enforced rather than intended:
 every path out of `scrape_sources` produces a `SourceCopy`, including a
@@ -248,8 +261,13 @@ point:
   so paths with spaces survive strict Markdown parsers; they resolve both in
   a notes app and in Footnote's own report view (which serves
   `/jobs/{id}/sources/{file}` for exactly this reason).
-- **Escaping** assumes hostile text, because most of it came off the web: a
-  frontmatter value is collapsed to one line before quoting (a question typed
+- **Only web links are written as links.** A citation URL whose scheme is not
+  http, https or mailto is listed as text in a code span instead: the dossier
+  is a portable Markdown file, and the next app to open it may follow a link
+  without asking.
+- **Escaping** assumes hostile text, because most of it came off the web:
+  every frontmatter value (the question, a source URL, a title, the
+  confidence) is collapsed to one line and quoted (a question typed
   into a textarea can contain newlines, which would otherwise end the scalar
   and turn the rest into bogus keys), link labels have their brackets
   escaped, and a URL with spaces or parentheses takes the angle-bracket form.
@@ -389,13 +407,19 @@ optionally hardened one notch.
 - **Response headers back the sanitizer up.** Every response carries a CSP
   (`script-src 'self'`, `connect-src 'self'`, `frame-ancestors 'none'`,
   `base-uri 'none'`), `X-Content-Type-Options: nosniff` and
-  `Referrer-Policy: no-referrer`. The middleware is declared last so it wraps
+  `Referrer-Policy: no-referrer`. The sanitizer and the policy agree on
+  images: `img-src` has no `http:`, so the sanitizer drops `http:` images
+  too — a picture the policy is going to block should be absent rather than
+  broken — and `data:` images are kept except SVG, which is a script
+  container. The middleware is declared last so it wraps
   the token check too — the 401 page and the token redirect are responses
   like any other. Styles keep `'unsafe-inline'` (the no-markdown fallback
   carries a style attribute) and images still load from the archived pages.
 - **`?token=` is bounced.** Once the cookie is set, a browser navigation is
-  redirected to the same URL without the token, so it does not sit in
-  history, access logs or cache keys. Only navigations: an API client sending
+  redirected to the same URL without the token, so it stops appearing in the
+  address bar, in later history entries and in cache keys. The *first*
+  request still carries it, so it appears once in the access log — the
+  redirect limits the exposure, it does not erase it. Only navigations: an API client sending
   `?token=` gets its answer, not a redirect it might not follow.
 - **A changed token does not reach a device that is offline.** The service
   worker drops both caches as soon as a request comes back 401, so revoking
