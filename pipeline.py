@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import math
+import socket
 import random
 import re
 import time
@@ -42,13 +43,14 @@ import httpx
 
 PARALLEL_BASE = "https://api.parallel.ai/v1"
 # A run id goes into a URL path; keep it to what cannot change its shape.
-_RUN_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+_RUN_ID = re.compile(r"[A-Za-z0-9_.:-]{1,128}")
 # A DNS name: labels of letters, digits and inner hyphens. IP literals are
 # handled separately, since urlsplit().hostname strips a v6 address's
 # brackets and leaves colons behind.
 _HOSTNAME = re.compile(
-    r"^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?"
-    r"(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*$")
+    r"[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?"
+    r"(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*")
+MAX_HOSTNAME_BYTES = 253        # RFC 1035, which idna does not enforce
 FIRECRAWL_BASE = "https://api.firecrawl.dev/v2"
 
 # Task API processors, cheap/fast → expensive/deep, with a generous overall
@@ -86,8 +88,12 @@ _SCHEME = re.compile(r"^([a-zA-Z][a-zA-Z0-9+.-]*):")
 
 
 def valid_run_id(run_id) -> bool:
-    """The same shape a freshly returned run id has to satisfy."""
-    return isinstance(run_id, str) and bool(_RUN_ID.match(run_id))
+    """The same shape a freshly returned run id has to satisfy.
+
+    fullmatch, not match: `$` also matches before a terminal newline, so
+    "trun_x\n" passed and was then sent as a differently encoded path.
+    """
+    return isinstance(run_id, str) and bool(_RUN_ID.fullmatch(run_id))
 
 
 def is_http_url(url: str) -> bool:
@@ -114,20 +120,22 @@ def is_http_url(url: str) -> bool:
     if not host:
         return False
     try:
-        # Compare the ASCII form: the regex below is an ASCII rule, and
-        # "bücher.example" is a perfectly good host whose punycode passes it.
-        ascii_host = host.encode("idna").decode("ascii")
-    except (UnicodeError, ValueError):
-        ascii_host = host if host.isascii() else None
-        if ascii_host is None:
-            return False
-    try:
         ipaddress.ip_address(host)      # a literal address is a fine host
         return True
     except ValueError:
         pass
+    try:
+        # Compare the ASCII form: the regex below is an ASCII rule, and
+        # "bücher.example" is a perfectly good host whose punycode passes it.
+        ascii_host = host.encode("idna").decode("ascii")
+    except (UnicodeError, ValueError):
+        # No fallback to the original: the encoder rejects an over-long label
+        # for a reason, and falling back admitted exactly what it refused.
+        return False
+    if len(ascii_host) > MAX_HOSTNAME_BYTES:
+        return False                    # idna checks labels, not the whole name
     # A bare "." or "_" is syntactically an authority and addresses nothing.
-    return bool(_HOSTNAME.match(ascii_host))
+    return bool(_HOSTNAME.fullmatch(ascii_host))
 
 
 def _as_list(value) -> list:
@@ -220,15 +228,31 @@ def is_push_endpoint(url: str) -> bool:
     if parsed.username or parsed.password:
         return False
     host = (parsed.hostname or "").lower()
-    if host in ("localhost",) or host.endswith(".localhost"):
+    if host == "localhost" or host.endswith(".localhost"):
         return False
+    address = _as_address(host)
+    if address is not None:
+        # is_global rather than a list of "not private, not reserved…": it is
+        # the classification that also covers carrier-grade NAT (100.64/10),
+        # which is neither private nor reserved and is not the open internet.
+        return address.is_global
+    return True                         # a name; the library resolves it
+
+
+def _as_address(host: str):
+    """The address this host denotes, including the resolver's shorthands.
+
+    "127.1", "2130706433" and "0x7f000001" all reach 127.0.0.1 — inet_aton
+    accepts them and so does every resolver, while ipaddress alone does not.
+    """
     try:
-        address = ipaddress.ip_address(host)
+        return ipaddress.ip_address(host)
     except ValueError:
-        return True                     # a name; the library resolves it
-    return not (address.is_private or address.is_loopback or address.is_reserved
-                or address.is_link_local or address.is_multicast
-                or address.is_unspecified)
+        pass
+    try:
+        return ipaddress.ip_address(socket.inet_aton(host))
+    except (OSError, ValueError):
+        return None
 
 
 def scrapable(citations: list, max_sources: int) -> list:
@@ -319,7 +343,7 @@ async def start_task_run(
     # Not coerced: 123 is not a run id, and _text would happily make it "123"
     # and interpolate that into every later URL.
     run_id = raw.strip() if isinstance(raw, str) else ""
-    if not run_id or not _RUN_ID.match(run_id):
+    if not valid_run_id(run_id):
         # Not retried: the POST may well have created a run, and asking again
         # would pay for a second one while the first goes unrecorded.
         raise PipelineError(
@@ -910,7 +934,7 @@ def archived_source_files(report: Path) -> dict:
         if not path.is_file() or not _inside(path, report.parent):
             continue
         try:
-            meta, _ = split_front_matter(_read_front_matter(path))
+            meta, _ = split_front_matter(read_front_matter(path))
         except OSError:
             continue
         if meta.get("source"):
@@ -926,7 +950,7 @@ def _inside(path: Path, folder: Path) -> bool:
         return False
 
 
-def _read_front_matter(path: Path, cap: int = 64 * 1024) -> str:
+def read_front_matter(path: Path, cap: int = 64 * 1024) -> str:
     """Read as far as the closing delimiter rather than a fixed guess.
 
     A long source URL or title can push the block past any fixed prefix; the

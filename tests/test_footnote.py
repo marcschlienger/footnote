@@ -1070,6 +1070,145 @@ def test_normalization_validates_rather_than_stringifies(monkeypatch):
     app_module.jobs.data.clear()
 
 
+def test_the_repaired_marker_survives_rekeying(tmp_path, monkeypatch):
+    """A damaged record was rekeyed out from under its own repair flag."""
+    path = tmp_path / "jobs.json"
+    path.write_text(json.dumps({"bad": {                 # not a usable key
+        "id": "bad", "question": "\ud800" * 8, "processor": "core",
+        "status": "researching", "created_at": "2026-01-01T00:00:00Z"}},
+        ensure_ascii=True))
+    store = app_module.JsonStore(path)
+    assert store.repaired == {"bad"}
+
+    app_module.jobs.data.clear()
+    app_module.jobs.data.update(store.data)
+    monkeypatch.setattr(app_module.jobs, "repaired", set(store.repaired))
+    monkeypatch.setattr(app_module.jobs, "save", lambda: None)
+    app_module._normalize_jobs()
+
+    key, = app_module.jobs.data
+    assert re.fullmatch(r"[0-9a-f]{12}", key)            # it was rekeyed
+    assert key in app_module.jobs.repaired                # the marker moved
+    job = app_module.jobs.data[key]
+    assert job["status"] == "failed" and "damaged" in job["error"]
+    # The repaired question would otherwise have passed every later check:
+    # eight replacement characters is a long enough question.
+    assert app_module._resumable(dict(job, status="researching"))
+    app_module.jobs.data.clear()
+
+
+def test_two_keys_that_clean_alike_do_not_collide(tmp_path):
+    """Cleaning the outer dictionary merged one record into the other."""
+    path = tmp_path / "jobs.json"
+    path.write_text('{"\\ud800": {"id": "a", "status": "done"}, '
+                    '"\ufffd": {"id": "b", "status": "done"}}')
+    store = app_module.JsonStore(path)
+    # The unusable key is dropped, not merged onto the usable one.
+    assert list(store.data) == ["\ufffd"]
+    assert store.data["\ufffd"]["id"] == "b"
+
+
+def test_a_finished_job_is_not_failed_over_its_run_id(monkeypatch):
+    """Its dossier exists; the run id is bookkeeping nobody reads again."""
+    app_module.jobs.data.clear()
+    monkeypatch.setattr(app_module.jobs, "save", lambda: None)
+    app_module.jobs.data["abcdefabcdef"] = {
+        "id": "abcdefabcdef", "question": "a perfectly fine question",
+        "processor": "core", "status": "done",
+        "created_at": "2026-01-01T00:00:00Z", "run_id": "not a run id",
+        "report_path": "/somewhere/x.md"}
+    app_module._normalize_jobs()
+    job = app_module.jobs.data["abcdefabcdef"]
+    assert job["status"] == "done"                       # still findable
+    assert "run_id" not in job
+    app_module.jobs.data.clear()
+
+
+def test_a_trailing_newline_does_not_pass_for_an_id():
+    """`$` matches before a terminal newline; fullmatch does not."""
+    assert not pipeline.valid_run_id("trun_x\n")
+    assert pipeline.valid_run_id("trun_x")
+    assert not app_module._JOB_ID.fullmatch("abcdefabcdef\n")
+    assert app_module._JOB_ID.fullmatch("abcdefabcdef")
+
+
+def test_the_push_policy_covers_the_resolver_shorthands():
+    """127.1 and 2130706433 reach 127.0.0.1 through any resolver."""
+    for host in ("127.1", "2130706433", "0x7f000001", "0177.0.0.1"):
+        assert not pipeline.is_push_endpoint(f"https://{host}/x"), host
+    # Carrier-grade NAT is neither private nor reserved, and is not the
+    # open internet either.
+    assert not pipeline.is_push_endpoint("https://100.64.0.1/x")
+    assert pipeline.is_push_endpoint("https://fcm.googleapis.com/fcm/send/a")
+
+
+def test_push_does_not_follow_a_redirect(monkeypatch):
+    """A 307 preserves the POST, to an address nothing checked."""
+    session = app_module._push_session()
+    if session is None:
+        pytest.skip("requests not installed")
+    captured = {}
+
+    def fake_request(*args, **kwargs):
+        captured.update(kwargs)
+        return None
+
+    monkeypatch.setattr(session, "request", lambda *a, **k: (
+        captured.update(k), None)[1], raising=False)
+    session.request("POST", "https://push.test/x")
+    assert session.max_redirects == 0
+
+
+def test_an_idna_failure_is_a_failure():
+    """The fallback admitted exactly what the encoder had rejected."""
+    assert not pipeline.is_http_url("https://" + "a" * 64 + ".test/")
+    assert not pipeline.is_http_url("https://" + ("a." * 160) + "test/")
+    assert pipeline.is_http_url("https://bücher.example/")
+    assert pipeline.is_http_url("https://a.test/")
+
+
+def test_the_orphan_index_reads_a_whole_frontmatter_block(client, tmp_path):
+    """A long source URL was cut off, losing the original and the title."""
+    long_url = "https://a.test/" + "x" * 3000
+    written = pipeline.write_report(
+        tmp_path, "Long orphan question", "core",
+        ResearchResult("b", [Citation(long_url, "Long")], "", ""),
+        [SourceCopy(long_url, "Long", "# body", True)])
+    app_module.OUTPUT_DIR = tmp_path
+    app_module.jobs.data["abcdefabcdef"] = {
+        "id": "abcdefabcdef", "question": "a perfectly fine question",
+        "processor": "core", "status": "done",
+        "created_at": "2026-01-01T00:00:00Z",
+        "report_path": str(written.path)}          # no citations: the orphan path
+    source, = client.get("/jobs/abcdefabcdef/sources").json()["sources"]
+    assert source["url"] == long_url
+    assert source["title"] == "Long"
+
+
+def test_an_oversized_body_is_refused_before_it_is_read(client):
+    huge = json.dumps({"question": "x" * 200_000})
+    resp = client.post("/research", content=huge,
+                       headers={"Content-Type": "application/json"})
+    assert resp.status_code == 413
+
+
+def test_push_keys_are_bounded_before_they_are_decoded():
+    """Matching a regex against megabytes to learn the length is wasteful."""
+    real = _push_keys()
+    assert app_module._valid_subscription(
+        {"endpoint": "https://push.test/x", "keys": real})
+    assert not app_module._valid_subscription(
+        {"endpoint": "https://push.test/x",
+         "keys": {"p256dh": "A" * 100_000, "auth": real["auth"]}})
+
+
+def test_a_relative_output_directory_is_refused():
+    add = (Path(__file__).resolve().parent.parent
+           / "deploy" / "add-instance.sh").read_text()
+    assert "output-dir must be an absolute path" in add
+    assert "-m 700 -- " in add                 # install(1) reads a leading dash
+
+
 def test_a_repaired_record_is_not_a_valid_one(tmp_path, monkeypatch):
     """Cleaning makes a record storable; it does not make it worth spending on."""
     path = tmp_path / "jobs.json"

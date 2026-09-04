@@ -65,6 +65,14 @@ fi
 # An existing env file is authoritative: a customized instance keeps its own
 # directories, and repairing the ones computed from this invocation's
 # arguments would tighten permissions on the wrong paths.
+# The output directory can also arrive as an argument, and that one was never
+# checked: a relative value is created next to wherever this was invoked and
+# then read by the service relative to /opt/footnote — two different places.
+case "$OUT" in
+  /*) ;;
+  *) echo "output-dir must be an absolute path, not: $OUT" >&2; exit 1 ;;
+esac
+
 # systemd's EnvironmentFile allows quoting, and sed strips only the literal
 # prefix — OUTPUT_DIR="/srv/My Notes" would otherwise come back with its
 # quotes attached and have install(1) create a relative directory of that
@@ -72,14 +80,23 @@ fi
 # matching quotes and accept the result only if it is an absolute path.
 read_env_path() {
   local raw
-  raw="$(sed -n "s/^$1=//p" "$ENV_FILE" | tail -1)"
+  raw="$(sed -n "s/^[[:space:]]*$1=//p" "$ENV_FILE" | tail -1)"
+  # Trim surrounding whitespace, then one layer of matching quotes.
+  raw="${raw#"${raw%%[![:space:]]*}"}"
+  raw="${raw%"${raw##*[![:space:]]}"}"
   case "$raw" in
     \"*\") raw="${raw#\"}"; raw="${raw%\"}" ;;
     \'*\') raw="${raw#\'}"; raw="${raw%\'}" ;;
   esac
   case "$raw" in
+    # Escapes and variable references are systemd syntax this cannot resolve.
+    # Say so rather than silently repairing the wrong directory.
+    *\\*|*'$'*) echo "cannot parse $1 in $ENV_FILE; leaving its directory alone" >&2
+                printf '' ;;
     /*) printf '%s' "$raw" ;;
-    *)  printf '' ;;
+    "") printf '' ;;
+    *)  echo "$1 in $ENV_FILE is not an absolute path; leaving it alone" >&2
+        printf '' ;;
   esac
 }
 
@@ -93,8 +110,8 @@ fi
 echo "==> Creating output directory $OUT and data directory $DATA"
 # 0700: a dossier is research someone paid for, and the host's default umask
 # is not a decision this script should inherit.
-install -d -o "$USER_NAME" -g "$GROUP_NAME" -m 700 "$OUT"
-install -d -o "$USER_NAME" -g "$GROUP_NAME" -m 700 "$DATA"
+install -d -o "$USER_NAME" -g "$GROUP_NAME" -m 700 -- "$OUT"
+install -d -o "$USER_NAME" -g "$GROUP_NAME" -m 700 -- "$DATA"
 
 echo "==> Enabling footnote@$USER_NAME"
 systemctl daemon-reload

@@ -83,6 +83,11 @@ try:                             # ships with pywebpush; validates public keys
 except ModuleNotFoundError:
     _ec = None
 
+try:                             # ships with pywebpush; carries the push POST
+    import requests as _requests
+except ModuleNotFoundError:
+    _requests = None
+
 def _load_env() -> None:
     """Read .env if it is there and readable — and start either way.
 
@@ -170,6 +175,13 @@ ACTIVE_STATUSES = ("queued", "researching", "archiving", "saving")
 # Tiny JSON stores (jobs, push subscriptions) — atomic rewrite on change
 # ---------------------------------------------------------------------------
 
+def _storable_key(key) -> bool:
+    """A key that can be written, read back, and addressed unchanged."""
+    return (isinstance(key, str) and key != ""
+            and not pipeline.has_lone_surrogate(key)
+            and key == pipeline.clean_text(key))
+
+
 class JsonStore:
     def __init__(self, path: Path):
         self.path = path
@@ -186,15 +198,25 @@ class JsonStore:
             # what survives is cleaned here rather than field by field: an
             # escaped surrogate in the file comes back as a surrogate, and
             # would break the next response carrying it.
-            records = {k: v for k, v in loaded.items() if isinstance(v, dict)}
-            self.data = pipeline.clean_json(records)
-            # Cleaning makes a record storable; it does not make it *valid*.
-            # Eight surrogates become eight replacement characters, which is
-            # a long enough question to pass every later check and be sent to
-            # Parallel again. Remember which records were altered so semantic
-            # validation can refuse them.
-            self.repaired = {key for key, value in records.items()
-                             if self.data.get(key) != value}
+            # Records are cleaned one at a time with their keys left alone:
+            # cleaning the outer dictionary let two keys ("\ud800" and the
+            # replacement character it becomes) collide, so one record
+            # silently overwrote the other.
+            for key, value in loaded.items():
+                if not isinstance(value, dict):
+                    continue
+                if not _storable_key(key):
+                    print(f"{path.name}: dropped a record whose key cannot be "
+                          f"used", flush=True)
+                    continue
+                cleaned = pipeline.clean_json(value)
+                self.data[key] = cleaned
+                # Cleaning makes a record storable; it does not make it
+                # *valid*. Eight surrogates become eight replacement
+                # characters, which is a long enough question to pass every
+                # later check and be sent to Parallel again.
+                if cleaned != value:
+                    self.repaired.add(key)
             dropped = len(loaded) - len(self.data)
             if dropped:
                 print(f"{path.name}: ignored {dropped} malformed record"
@@ -224,8 +246,12 @@ class JsonStore:
         # unable to hold something a later load could choke on.
         # The cleaned structure becomes the store, not just the bytes: the
         # invariant is about what is held in memory, and a copy that only the
-        # file gets is an invariant nobody can rely on.
-        self.data = pipeline.clean_json(self.data)
+        # file gets is an invariant nobody can rely on. Values only — a key
+        # is already required to be storable, and cleaning keys is how two of
+        # them came to collide.
+        self.data = {key: pipeline.clean_json(value)
+                     for key, value in self.data.items()
+                     if _storable_key(key)}
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(self.data, fh, ensure_ascii=False, indent=1)
         os.replace(tmp, self.path)
@@ -245,7 +271,7 @@ _JOB_SEMANTIC_FIELDS = ("question", "processor", "status", "run_id",
 _TERMINAL_STATUSES = ("done", "failed")
 QUESTION_MIN, QUESTION_MAX = 8, 4000
 # Store keys become public job ids and go straight into URLs.
-_JOB_ID = re.compile(r"^[0-9a-f]{12}$")
+_JOB_ID = re.compile(r"[0-9a-f]{12}")     # used with fullmatch
 # Tab and newline are fine in a typed question; NUL and friends are not.
 _CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
@@ -283,7 +309,7 @@ def _normalize_jobs() -> None:
     corrupt record made to look runnable.
     """
     changed = False
-    for job_id in [k for k in jobs.data if not _JOB_ID.match(str(k))]:
+    for job_id in [k for k in jobs.data if not _JOB_ID.fullmatch(str(k))]:
         # The key is the public id and goes into URLs. A hand-edited file can
         # hold anything; rekey rather than drop, so the history survives and
         # every record stays addressable.
@@ -291,6 +317,11 @@ def _normalize_jobs() -> None:
         fresh = uuid.uuid4().hex[:12]
         record["id"] = fresh
         jobs.data[fresh] = record
+        if job_id in jobs.repaired:
+            # The marker travels with the record. Without this the damaged
+            # job was rekeyed out from under its own repair flag and resumed.
+            jobs.repaired.discard(job_id)
+            jobs.repaired.add(fresh)
         print(f"job history: rekeyed an unusable job id to {fresh}", flush=True)
         changed = True
 
@@ -321,11 +352,17 @@ def _normalize_jobs() -> None:
                        progress="Failed: damaged job record")
             changed = True
         elif job.get("run_id") and not pipeline.valid_run_id(job["run_id"]):
-            # The run may exist and be paid for, but it cannot be fetched and
-            # starting over would pay for a second one.
-            job.update(status="failed", finished_at=_now(),
-                       error="Stored run id is unusable; not resumed",
-                       progress="Failed: unusable run id")
+            if job["status"] in ACTIVE_STATUSES:
+                # The run may exist and be paid for, but it cannot be fetched
+                # and starting over would pay for a second one.
+                job.update(status="failed", finished_at=_now(),
+                           error="Stored run id is unusable; not resumed",
+                           progress="Failed: unusable run id")
+            else:
+                # A finished job has a dossier. The run id is bookkeeping
+                # nobody will read again; failing the job over it would hide
+                # the research behind it.
+                del job["run_id"]
             changed = True
         elif job["status"] in ACTIVE_STATUSES and not _resumable(job):
             job.update(status="failed", finished_at=_now(),
@@ -354,7 +391,9 @@ def _resumable(job: dict) -> bool:
 
 # Web Push key sizes: an uncompressed P-256 point, and the auth secret.
 _KEY_BYTES = {"p256dh": 65, "auth": 16}
-_BASE64URL = re.compile(r"^[A-Za-z0-9_-]+={0,2}$")
+_BASE64URL = re.compile(r"[A-Za-z0-9_-]+={0,2}")   # used with fullmatch
+# Encoded length of exactly that many bytes, padding included.
+_KEY_CHARS = {name: (size + 2) // 3 * 4 for name, size in _KEY_BYTES.items()}
 
 
 def _valid_subscription(sub) -> bool:
@@ -369,7 +408,11 @@ def _valid_subscription(sub) -> bool:
         return False
     for name, size in _KEY_BYTES.items():
         value = sub["keys"].get(name)
-        if not isinstance(value, str) or not _BASE64URL.match(value):
+        # Length before decoding: base64 of N bytes is a known size, and
+        # matching a regex against megabytes to learn that is wasteful.
+        if not isinstance(value, str) or not (0 < len(value) <= _KEY_CHARS[name]):
+            return False
+        if not _BASE64URL.fullmatch(value):
             return False        # the decoder ignores trailing rubbish
         try:
             # base64url without padding, as the Push API hands it over.
@@ -453,6 +496,22 @@ def _update_job(job_id: str, **fields) -> None:
 # Web Push
 # ---------------------------------------------------------------------------
 
+def _push_session():
+    """A requests session that refuses redirects, or None if requests is absent."""
+    if _requests is None:
+        return None
+    session = _requests.Session()
+    session.max_redirects = 0
+    original = session.request
+
+    def no_redirects(*args, **kwargs):
+        kwargs["allow_redirects"] = False
+        return original(*args, **kwargs)
+
+    session.request = no_redirects
+    return session
+
+
 def _push_one(sub: dict, payload: dict) -> bool:
     """Blocking pywebpush call; returns False if the subscription is dead."""
     try:
@@ -464,6 +523,9 @@ def _push_one(sub: dict, payload: dict) -> bool:
             # Without this the library waits forever, and one unreachable
             # device holds a slot against every other device's notification.
             timeout=PUSH_TIMEOUT_S,
+            # A 307/308 preserves the POST, so following one would send the
+            # payload to an address that was never checked.
+            requests_session=_push_session(),
         )
         return True
     except WebPushException as exc:
@@ -988,6 +1050,24 @@ async def _security_headers(request: Request, call_next):
     return response
 
 
+MAX_BODY_BYTES = 64 * 1024       # a question is 4000 chars; keys are ~90
+
+
+@app.middleware("http")
+async def _limit_body(request: Request, call_next):
+    """Refuse an oversized body before it is read into memory.
+
+    Content-Length only: a chunked upload has none, and bounding that means
+    reading the stream, which is more machinery than a personal server on a
+    private network needs.
+    """
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > MAX_BODY_BYTES:
+        return JSONResponse({"detail": "request body too large"},
+                            status_code=413)
+    return await call_next(request)
+
+
 @app.exception_handler(RequestValidationError)
 async def _validation_error(request: Request, exc: RequestValidationError):
     """A 422 that can always be encoded.
@@ -1182,9 +1262,9 @@ def _size(path: Path) -> int:
         return 0
 
 
-def _head(path: Path, limit: int = 1024) -> str:
-    with path.open(encoding="utf-8", errors="replace") as fh:
-        return fh.read(limit)
+def _head(path: Path) -> str:
+    """The delimiter-aware reader, so a long source URL is not cut in half."""
+    return pipeline.read_front_matter(path)
 
 
 def _source_entries(job: dict, folder: Path) -> list:
@@ -1311,8 +1391,8 @@ async def subscribe(req: SubscribeRequest):
     # otherwise kept forever and fails once per job, for every job.
     if not _valid_subscription({"endpoint": req.endpoint, "keys": req.keys}):
         raise HTTPException(
-            422, "a subscription needs an http(s) endpoint and string "
-                 "p256dh and auth keys")   # mailto: is a link, not an endpoint
+            422, "a subscription needs an https endpoint on a public address, "
+                 "and p256dh and auth keys of the sizes the Push API sends")
     if (len(subs.data) >= MAX_SUBSCRIPTIONS
             and uuid.uuid5(uuid.NAMESPACE_URL, req.endpoint).hex not in subs.data):
         raise HTTPException(409, f"too many devices registered "
