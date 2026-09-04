@@ -312,6 +312,11 @@ Details worth knowing:
 | Firecrawl requests per minute | `FIRECRAWL_RATE_LIMIT` (`0` disables pacing) | `10` — the free plan's limit |
 | Firecrawl requests in flight | `FIRECRAWL_CONCURRENCY` | `2` — the free plan's limit |
 | Cross-origin browser clients | `FOOTNOTE_CORS_ORIGINS` (comma-separated) | none — the PWA is same-origin |
+
+Numeric settings are validated at startup: a non-numeric or out-of-range
+`MAX_SOURCES`, `FIRECRAWL_RATE_LIMIT` or `FIRECRAWL_CONCURRENCY`, or a
+`DEFAULT_PROCESSOR` that is not a processor, refuses to start with a message
+naming the setting rather than failing on the first request.
 | API token | `FOOTNOTE_TOKEN` | unset — no authentication |
 | Push keys | `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `VAPID_CLAIM_EMAIL` | unset — push disabled |
 | Notion mirror | `NOTION_API_KEY`, `NOTION_DATABASE_ID` | unset — mirror disabled |
@@ -339,7 +344,9 @@ Clients can present the token three ways, same contract as Margin:
   strings do appear in the server's access log.
 - **Browser cookie** — open `http://YOUR-SERVER:8010/?token=<token>` once
   and the token is stored in an `HttpOnly`, `SameSite=Strict` cookie
-  (1 year); after that the PWA works with no decoration. The home-screen app
+  (1 year), and the browser is then redirected to the same URL without the
+  token so it does not linger in history or logs; after that the PWA works
+  with no decoration. The home-screen app
   authenticates the same way — its cookie storage is separate from Safari's,
   so it shows a token form on first launch. Because the cookie is `Strict`,
   other websites can never ride it.

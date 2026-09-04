@@ -181,7 +181,10 @@ sleep so waiters take turns instead of waking together and bursting.
 The budget belongs to **the API key, not the job**: the app builds one
 `ScrapeLimiter` in `lifespan` and every scrape shares it. A limiter per job
 would be no limiter at all — two jobs archiving at once would double both
-numbers, and a restart resumes every unfinished job simultaneously.
+numbers, and a restart resumes every unfinished job simultaneously. The
+exhausted-credits flag lives there too, so one job's 402 answers for the jobs
+queued behind it; it expires after `CREDIT_COOLDOWN_S` so a top-up or the
+monthly reset is noticed without a restart.
 
 Archiving cannot fail a dossier, and that is enforced rather than intended:
 every path out of `scrape_sources` produces a `SourceCopy`, including a
@@ -315,6 +318,10 @@ Behavior notes:
 - **Polling, not websockets**: `/jobs` every 5 s while anything is active,
   every 60 s otherwise. Research takes minutes — realtime infrastructure
   would be all cost, no benefit.
+- **The depth picker's five labels are curated**, not the server's processor
+  list — friendly names are the point, and the API takes the full list for
+  anything scripted. Which of them starts selected comes from `/processors`,
+  so the picker agrees with the server's `DEFAULT_PROCESSOR`.
 - **The depth picker** maps friendly labels to processors ("Quick look" →
   `base`, "Standard" → `core`, "Deep" → `pro`, "Exhaustive" → `ultra`,
   "Heroic" → `ultra4x`); the API accepts the full processor list for
@@ -324,7 +331,10 @@ Behavior notes:
   writable — the two failures worth catching before the first question.
 - **Source panels** expand in place on a finished job: the list comes from
   `/jobs/{id}/sources`, cached per job and re-expanded after every poll, so
-  a five-second refresh doesn't collapse what you are reading. Each entry
+  a five-second refresh doesn't collapse what you are reading. That cache
+  holds for a minute — it exists to stop the poll refetching, not to outlive
+  the folder it describes, since a copy can be moved in the notes app while
+  the page is open — and falls back to the stale copy when offline. Each entry
   links to the rendered copy, its `.md`, and the original page; the ones
   that could not be archived say why.
 - **Service worker**: one policy per kind of response, because they age
@@ -376,6 +386,24 @@ optionally hardened one notch.
 - Push is isolated from job outcome: `notify_all` swallows everything, since
   it is called from inside `run_research`'s `try` and a malformed
   subscription would otherwise rewrite a finished job as failed.
+- **Response headers back the sanitizer up.** Every response carries a CSP
+  (`script-src 'self'`, `connect-src 'self'`, `frame-ancestors 'none'`,
+  `base-uri 'none'`), `X-Content-Type-Options: nosniff` and
+  `Referrer-Policy: no-referrer`. The middleware is declared last so it wraps
+  the token check too — the 401 page and the token redirect are responses
+  like any other. Styles keep `'unsafe-inline'` (the no-markdown fallback
+  carries a style attribute) and images still load from the archived pages.
+- **`?token=` is bounced.** Once the cookie is set, a browser navigation is
+  redirected to the same URL without the token, so it does not sit in
+  history, access logs or cache keys. Only navigations: an API client sending
+  `?token=` gets its answer, not a redirect it might not follow.
+- **A changed token does not reach a device that is offline.** The service
+  worker drops both caches as soon as a request comes back 401, so revoking
+  the token clears the dossiers it cached on the next online visit — but a
+  device that never comes back online keeps what it already read until its
+  site data is cleared. That is a property of browser storage, not something
+  a server can revoke; treat an installed PWA as holding the dossiers it has
+  opened.
 - API keys live in `.env` / systemd env files, never in the repo; the
   frontend never sees them.
 - What the token does *not* provide: per-user separation (that's the

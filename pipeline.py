@@ -232,6 +232,10 @@ MAX_ATTEMPTS = 3
 BASE_BACKOFF_S = 2.0
 MAX_BACKOFF_S = 120.0
 OUT_OF_CREDITS = "Firecrawl credits exhausted (HTTP 402)"
+# How long a 402 speaks for the whole key. Long enough that the jobs behind
+# it don't each rediscover the same wall, short enough that a top-up or the
+# monthly reset is noticed without a restart.
+CREDIT_COOLDOWN_S = 15 * 60
 
 
 class ScrapeLimiter:
@@ -251,6 +255,25 @@ class ScrapeLimiter:
         self.pacer = _Pacer(rate_limit)
         self.sem = asyncio.Semaphore(max(1, concurrency))
         self.concurrency = max(1, concurrency)
+        self._credits_gone_at = None
+
+    def out_of_credits(self) -> bool:
+        """Whether the key is known to be spent, as far as anyone can tell.
+
+        Credits belong to the key, so one job's 402 answers for the jobs
+        queued behind it. It expires: credits do come back — a top-up, or the
+        monthly reset — and a latched flag would silently stop archiving for
+        the life of the process.
+        """
+        if self._credits_gone_at is None:
+            return False
+        if time.monotonic() - self._credits_gone_at >= CREDIT_COOLDOWN_S:
+            self._credits_gone_at = None       # let one request find out
+            return False
+        return True
+
+    def note_out_of_credits(self) -> None:
+        self._credits_gone_at = time.monotonic()
 
 
 class _Pacer:
@@ -311,9 +334,10 @@ async def scrape_sources(
     key inside its request rate and browser count, a rate-limited or transient
     failure is retried honouring Retry-After, and the first 402 stops the
     batch — once the credits are gone every further request would fail
-    identically, and the dossier says so once instead of N times. Requests
-    already in flight when that 402 lands still complete, so up to
-    `limiter.concurrency` are spent, not one.
+    identically, and the dossier says so once instead of N times — for this
+    job and for the ones queued behind it, since the credits belong to the
+    key. Requests already in flight when that 402 lands still complete, so up
+    to `limiter.concurrency` are spent, not one.
 
     Archiving is best-effort and can never fail the job: every path out of
     here is a SourceCopy, including the ones that had no business happening.
@@ -322,15 +346,15 @@ async def scrape_sources(
     enough under pacing to be worth reporting.
     """
     todo = citations[:max_sources]
-    state = {"out_of_credits": False, "done": 0}
+    state = {"done": 0}
 
     async def one(cit: Citation) -> SourceCopy:
         try:
             async with limiter.sem:
-                if state["out_of_credits"]:
+                if limiter.out_of_credits():
                     copy = SourceCopy(cit.url, cit.title, "", False, OUT_OF_CREDITS)
                 else:
-                    copy = await _scrape_one(client, api_key, cit, limiter, state)
+                    copy = await _scrape_one(client, api_key, cit, limiter)
         except Exception as exc:                           # noqa: BLE001
             copy = SourceCopy(cit.url, cit.title, "", False, str(exc)[:200])
         state["done"] += 1
@@ -346,7 +370,6 @@ async def _scrape_one(
     api_key: str,
     cit: Citation,
     limiter: ScrapeLimiter,
-    state: dict,
 ) -> SourceCopy:
     backoff = BASE_BACKOFF_S
     error = "no attempt made"
@@ -354,7 +377,7 @@ async def _scrape_one(
         await limiter.pacer.take()
         # Waiting for a slot can take a minute; the credits may have run out
         # while this request sat in the queue.
-        if state["out_of_credits"]:
+        if limiter.out_of_credits():
             return SourceCopy(cit.url, cit.title, "", False, OUT_OF_CREDITS)
         try:
             resp = await client.post(
@@ -377,7 +400,7 @@ async def _scrape_one(
             continue
 
         if resp.status_code == 402:
-            state["out_of_credits"] = True
+            limiter.note_out_of_credits()
             return SourceCopy(cit.url, cit.title, "", False, OUT_OF_CREDITS)
 
         try:

@@ -752,6 +752,58 @@ def test_health_asks_the_output_directory_itself(client, tmp_path, monkeypatch):
     assert client.get("/health").json()["output_dir_writable"] is True
 
 
+def test_security_headers_on_every_response(client):
+    for url in ("/", "/health", "/jobs"):
+        headers = client.get(url).headers
+        assert headers["x-content-type-options"] == "nosniff", url
+        assert headers["referrer-policy"] == "no-referrer", url
+        csp = headers["content-security-policy"]
+        assert "script-src 'self'" in csp and "frame-ancestors 'none'" in csp
+
+
+def test_security_headers_cover_the_auth_middleware_too(locked_client):
+    """The 401 page and the token redirect are responses like any other."""
+    denied = locked_client.get("/", headers={"Accept": "text/html"})
+    assert denied.status_code == 401
+    assert denied.headers["x-content-type-options"] == "nosniff"
+    assert "script-src 'self'" in denied.headers["content-security-policy"]
+
+    bounced = locked_client.get("/", params={"token": "sekrit"},
+                                headers={"Accept": "text/html"},
+                                follow_redirects=False)
+    assert bounced.status_code == 303
+    assert bounced.headers["referrer-policy"] == "no-referrer"
+
+
+def test_bad_configuration_is_refused_at_startup(monkeypatch):
+    monkeypatch.setenv("MAX_SOURCES", "not a number")
+    with pytest.raises(RuntimeError, match="MAX_SOURCES must be a whole number"):
+        app_module._int_env("MAX_SOURCES", 12, minimum=0)
+    monkeypatch.setenv("FIRECRAWL_CONCURRENCY", "0")
+    with pytest.raises(RuntimeError, match="at least 1"):
+        app_module._int_env("FIRECRAWL_CONCURRENCY", 2, minimum=1)
+    monkeypatch.setenv("MAX_SOURCES", "  ")
+    assert app_module._int_env("MAX_SOURCES", 12, minimum=0) == 12
+
+
+def test_jobs_limit_is_bounded(client):
+    assert client.get("/jobs", params={"limit": 0}).status_code == 422
+    assert client.get("/jobs", params={"limit": 10_000}).status_code == 422
+    assert client.get("/jobs", params={"limit": 5}).status_code == 200
+
+
+def test_credit_state_is_shared_and_expires(monkeypatch):
+    async def run():
+        return pipeline.ScrapeLimiter(rate_limit=0, concurrency=2)
+
+    limiter = asyncio.run(run())
+    assert limiter.out_of_credits() is False
+    limiter.note_out_of_credits()
+    assert limiter.out_of_credits() is True      # answers for later jobs too
+    monkeypatch.setattr(pipeline, "CREDIT_COOLDOWN_S", 0)
+    assert limiter.out_of_credits() is False     # a top-up gets noticed
+
+
 def test_no_cross_origin_access_by_default():
     """A wildcard here would let any page spend the Parallel key."""
     assert app_module.CORS_ORIGINS == []
@@ -785,7 +837,17 @@ def test_token_accepted_via_bearer_and_query(locked_client):
     assert locked_client.get(
         "/jobs", headers={"Authorization": "Bearer sekrit"}).status_code == 200
     resp = locked_client.get("/jobs", params={"token": "sekrit"})
-    assert resp.status_code == 200
+    assert resp.status_code == 200                # an API client gets its answer
+    assert "footnote_token" in resp.headers.get("set-cookie", "")
+
+
+def test_a_browser_is_redirected_off_the_token_url(locked_client):
+    """The cookie carries it from here; the address bar should not."""
+    resp = locked_client.get("/", params={"token": "sekrit"},
+                             headers={"Accept": "text/html"},
+                             follow_redirects=False)
+    assert resp.status_code == 303
+    assert "token" not in resp.headers["location"]
     assert "footnote_token" in resp.headers.get("set-cookie", "")
 
 

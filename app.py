@@ -48,12 +48,13 @@ from urllib.parse import quote
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,
     JSONResponse,
+    RedirectResponse,
     Response,
 )
 from fastapi.staticfiles import StaticFiles
@@ -87,15 +88,33 @@ VAPID_PUBLIC_KEY = os.getenv("VAPID_PUBLIC_KEY", "").strip()
 VAPID_PRIVATE_KEY = os.getenv("VAPID_PRIVATE_KEY", "").strip()
 VAPID_CLAIM_EMAIL = os.getenv("VAPID_CLAIM_EMAIL", "").strip()
 
-DEFAULT_PROCESSOR = os.getenv("DEFAULT_PROCESSOR", "core").strip()
-MAX_SOURCES = int(os.getenv("MAX_SOURCES", "12"))
+def _int_env(name: str, default: int, minimum: int) -> int:
+    """A numeric setting, or a startup failure naming the setting."""
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        raise RuntimeError(f"{name} must be a whole number, not {raw!r}") from None
+    if value < minimum:
+        raise RuntimeError(f"{name} must be at least {minimum}, not {value}")
+    return value
+
+
+DEFAULT_PROCESSOR = os.getenv("DEFAULT_PROCESSOR", "core").strip() or "core"
+if DEFAULT_PROCESSOR not in ALL_PROCESSORS:
+    raise RuntimeError(
+        f"DEFAULT_PROCESSOR is {DEFAULT_PROCESSOR!r}, which is not a processor; "
+        f"one of: {', '.join(ALL_PROCESSORS)}")
+MAX_SOURCES = _int_env("MAX_SOURCES", 12, minimum=0)
 # Firecrawl's free plan allows 10 /scrape requests a minute and 2 concurrent
 # browsers; those are the defaults, so an unconfigured install stays inside
 # them. Raise on a paid plan, or set the rate limit to 0 to stop pacing.
-FIRECRAWL_RATE_LIMIT = int(os.getenv("FIRECRAWL_RATE_LIMIT",
-                                     pipeline.FREE_RATE_LIMIT))
-FIRECRAWL_CONCURRENCY = int(os.getenv("FIRECRAWL_CONCURRENCY",
-                                      pipeline.FREE_CONCURRENCY))
+FIRECRAWL_RATE_LIMIT = _int_env("FIRECRAWL_RATE_LIMIT",
+                                pipeline.FREE_RATE_LIMIT, minimum=0)
+FIRECRAWL_CONCURRENCY = _int_env("FIRECRAWL_CONCURRENCY",
+                                 pipeline.FREE_CONCURRENCY, minimum=1)
 MAX_JOBS_KEPT = 200
 MAX_CITATIONS_KEPT = 100     # per job, so jobs.json stays small
 
@@ -481,8 +500,12 @@ async def lifespan(application: FastAPI):
             application.state.tasks.add(task)
             task.add_done_callback(application.state.tasks.discard)
     yield
-    for task in application.state.tasks:
+    tasks = list(application.state.tasks)
+    for task in tasks:
         task.cancel()
+    # Unwind before the client closes — a task cancelled mid-request would
+    # otherwise wake up holding a closed transport.
+    await asyncio.gather(*tasks, return_exceptions=True)
     await application.state.client.aclose()
 
 
@@ -568,11 +591,46 @@ async def _require_token(request: Request, call_next):
             status_code=401,
         )
 
-    response = await call_next(request)
     if request.query_params.get("token"):
+        # The cookie now carries it, so bounce a browser to a clean URL: a
+        # token in the address bar ends up in history, logs and cache keys.
+        # Only for navigations — an API client sending ?token= gets its
+        # answer, not a redirect it may not follow.
+        if request.method == "GET" and "text/html" in request.headers.get("accept", ""):
+            clean = request.url.remove_query_params("token")
+            response = RedirectResponse(str(clean), status_code=303)
+        else:
+            response = await call_next(request)
         response.set_cookie(
             _TOKEN_COOKIE, FOOTNOTE_TOKEN, max_age=365 * 24 * 3600,
             httponly=True, samesite="strict")
+        return response
+    return await call_next(request)
+
+
+# Declared last so it wraps the token middleware too — the 401 page and
+# the token redirect are responses like any other.
+# Belt and braces behind _Sanitizer: script-src 'self' means an injected
+# inline script has nothing to execute even if the sanitizer were bypassed,
+# and connect-src 'self' means it would have nowhere to send anything. Styles
+# stay inline-capable (the markdown fallback carries a style attribute) and
+# images still load from the archived pages, which the sanitizer already
+# allows over http/https.
+_SECURITY_HEADERS = {
+    "content-security-policy": (
+        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' https: data:; font-src 'self'; connect-src 'self'; "
+        "form-action 'self'; frame-ancestors 'none'; base-uri 'none'"),
+    "x-content-type-options": "nosniff",
+    "referrer-policy": "no-referrer",
+}
+
+
+@app.middleware("http")
+async def _security_headers(request: Request, call_next):
+    response = await call_next(request)
+    for header, value in _SECURITY_HEADERS.items():
+        response.headers.setdefault(header, value)
     return response
 
 
@@ -645,7 +703,7 @@ async def job_status(job_id: str):
 
 
 @app.get("/jobs")
-async def list_jobs(limit: int = 50):
+async def list_jobs(limit: int = Query(50, ge=1, le=MAX_JOBS_KEPT)):
     ordered = sorted(jobs.data.values(),
                      key=lambda j: j.get("created_at", ""), reverse=True)
     return {"jobs": [_job_public(j) for j in ordered[:limit]],

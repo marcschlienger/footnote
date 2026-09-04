@@ -11,6 +11,7 @@ let pushConfigured = false;
 // re-renders the whole list, and an open panel must survive that.
 const openSources = new Set();
 const sourcesCache = new Map();
+const SOURCES_TTL_MS = 60000;   // a copy can be moved or deleted in the notes
 
 // --------------------------------------------------------------------
 // Boot
@@ -35,9 +36,25 @@ const sourcesCache = new Map();
             "fail when it tries to save. See README.", true);
     }
   } catch (e) { /* offline shell — the list will populate when back online */ }
+  selectServerDefault();
   offerPush();
   refreshJobs();
 })();
+
+// The picker offers a curated five, not the server's full processor list —
+// friendly labels are the point. But which of them is preselected should be
+// the server's own DEFAULT_PROCESSOR, not a guess baked into the HTML.
+async function selectServerDefault() {
+  try {
+    const { default: preferred, processors } = await fetchJSON("/processors");
+    const picker = $("processor");
+    if (!processors.includes(preferred)) return;
+    if (![...picker.options].some((o) => o.value === preferred)) {
+      picker.add(new Option(preferred, preferred));
+    }
+    picker.value = preferred;
+  } catch (e) { /* offline, or an older server: the HTML default stands */ }
+}
 
 // --------------------------------------------------------------------
 // Submit
@@ -183,15 +200,19 @@ function sourcesToggle(job) {
 }
 
 async function fillSources(jobId, panel) {
-  let data = sourcesCache.get(jobId);
+  // The cache exists so a poll re-render doesn't refetch; it should not
+  // outlive the thing it describes, since a copy can be moved or deleted in
+  // the notes folder while the page is open.
+  const held = sourcesCache.get(jobId);
+  let data = held && Date.now() - held.at < SOURCES_TTL_MS ? held.data : null;
   if (!data) {
-    panel.textContent = "Loading sources…";
+    if (!held) panel.textContent = "Loading sources…";
     try {
       data = await fetchJSON(`/jobs/${jobId}/sources`);
-      sourcesCache.set(jobId, data);
+      sourcesCache.set(jobId, { data, at: Date.now() });
     } catch (e) {
-      panel.textContent = "Could not list the sources: " + e.message;
-      return;
+      if (!held) { panel.textContent = "Could not list the sources: " + e.message; return; }
+      data = held.data;                 // offline: what we have beats nothing
     }
   }
   panel.textContent = "";

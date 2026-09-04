@@ -78,6 +78,7 @@ async function networkFirst(request, cacheName, markFallback = false) {
     // Only successful responses: an unauthorized page must never be cached
     // as though it were the app.
     if (res.ok) (await caches.open(cacheName)).put(request, res.clone());
+    else if (res.status === 401) await forgetEverything();
     return res;
   } catch (err) {
     const cached = await (await caches.open(cacheName)).match(request);
@@ -93,12 +94,22 @@ async function cacheThenRefresh(event) {
     if (res.ok) {
       await cache.put(event.request, res.clone());
       await trim(cache, DOSSIER_MAX);
+    } else if (res.status === 401) {
+      await forgetEverything();
     }
     return res;
   });
   if (!cached) return fresh;
   event.waitUntil(fresh.catch(() => {}));   // a server-side re-render, next time
   return cached;
+}
+
+// The token was changed or revoked: drop what was read under the old one.
+// Only reachable while online — an offline device keeps whatever it cached
+// until its site data is cleared, which is a property of browser storage, not
+// something a server can revoke.
+async function forgetEverything() {
+  await Promise.all([caches.delete(SHELL_CACHE), caches.delete(DOSSIER_CACHE)]);
 }
 
 // Oldest fetch first — cache.keys() is insertion-ordered.
