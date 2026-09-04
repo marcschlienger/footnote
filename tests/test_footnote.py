@@ -572,7 +572,7 @@ def _finished_job(tmp_path, **extra):
         _sample_result(),
         [SourceCopy("https://a.test/1", "Paper A", "# A body", True),
          SourceCopy("https://b.test/2", "Paper B", "", False, "blocked")])
-    job = {"id": "xyz", "question": "How do solid-state batteries work?",
+    job = {"id": "abcdefabcdef", "question": "How do solid-state batteries work?",
            "processor": "core", "status": "done",
            "created_at": "2026-01-01T00:00:00Z",
            "report_path": str(written.path),
@@ -583,21 +583,21 @@ def _finished_job(tmp_path, **extra):
                {"url": "https://b.test/2", "title": "Paper B",
                 "file": "", "note": "blocked"}]}
     job.update(extra)
-    app_module.jobs.data["xyz"] = job
+    app_module.jobs.data["abcdefabcdef"] = job
     return written
 
 
 def test_report_source_rendered_and_downloadable(client, tmp_path):
     _finished_job(tmp_path)
 
-    page = client.get("/jobs/xyz/sources/01 Paper A.md")
+    page = client.get("/jobs/abcdefabcdef/sources/01 Paper A.md")
     assert page.status_code == 200
     assert "text/html" in page.headers["content-type"]
     assert "<h1>Paper A</h1>" in page.text          # title from the frontmatter
     assert "https://a.test/1" in page.text          # link back to the original
     assert "<h1>A body</h1>" in page.text           # the copy itself, rendered
 
-    raw = client.get("/jobs/xyz/sources/01 Paper A.md", params={"raw": 1})
+    raw = client.get("/jobs/abcdefabcdef/sources/01 Paper A.md", params={"raw": 1})
     assert raw.status_code == 200
     assert "markdown" in raw.headers["content-type"]
     assert "attachment" in raw.headers["content-disposition"]
@@ -606,20 +606,20 @@ def test_report_source_rendered_and_downloadable(client, tmp_path):
 
 def test_report_source_traversal_blocked(client, tmp_path):
     _finished_job(tmp_path)
-    assert client.get("/jobs/xyz/sources/.hidden").status_code == 404
-    assert client.get("/jobs/xyz/sources/%2e%2e%2fr.md").status_code == 404
-    assert client.get("/jobs/xyz/sources/nope.md").status_code == 404
+    assert client.get("/jobs/abcdefabcdef/sources/.hidden").status_code == 404
+    assert client.get("/jobs/abcdefabcdef/sources/%2e%2e%2fr.md").status_code == 404
+    assert client.get("/jobs/abcdefabcdef/sources/nope.md").status_code == 404
 
 
 def test_sources_index_lists_archived_and_missing(client, tmp_path):
     _finished_job(tmp_path)
-    body = client.get("/jobs/xyz/sources").json()
+    body = client.get("/jobs/abcdefabcdef/sources").json()
 
     assert body["cited"] == 2 and body["archived"] == 1
-    assert body["bundle_url"] == "/jobs/xyz/bundle.zip"
+    assert body["bundle_url"] == "/jobs/abcdefabcdef/bundle.zip"
     first, second = body["sources"]
     assert first["title"] == "Paper A" and first["archived"]
-    assert first["read_url"] == "/jobs/xyz/sources/01%20Paper%20A.md"
+    assert first["read_url"] == "/jobs/abcdefabcdef/sources/01%20Paper%20A.md"
     assert first["download_url"].endswith("?raw=1") and first["bytes"] > 0
     assert not second["archived"] and second["note"] == "blocked"
     assert second["url"] == "https://b.test/2"       # still readable at the source
@@ -628,8 +628,8 @@ def test_sources_index_lists_archived_and_missing(client, tmp_path):
 def test_sources_index_falls_back_to_the_files_on_disk(client, tmp_path):
     """Dossiers written before jobs recorded citations still list their copies."""
     written = _finished_job(tmp_path)
-    del app_module.jobs.data["xyz"]["citations"]
-    body = client.get("/jobs/xyz/sources").json()
+    del app_module.jobs.data["abcdefabcdef"]["citations"]
+    body = client.get("/jobs/abcdefabcdef/sources").json()
     assert [s["file"] for s in body["sources"]] == ["01 Paper A.md"]
     assert body["sources"][0]["url"] == "https://a.test/1"   # from frontmatter
     assert written.source_files == {"https://a.test/1": "01 Paper A.md"}
@@ -638,15 +638,15 @@ def test_sources_index_falls_back_to_the_files_on_disk(client, tmp_path):
 def test_sources_index_survives_a_copy_deleted_in_the_notes_folder(client, tmp_path):
     written = _finished_job(tmp_path)
     (written.path.parent / "sources" / "01 Paper A.md").unlink()
-    body = client.get("/jobs/xyz/sources").json()
+    body = client.get("/jobs/abcdefabcdef/sources").json()
     assert body["archived"] == 0
     assert body["sources"][0]["read_url"] == ""      # citation, no local copy
-    assert client.get("/jobs/xyz/sources/01 Paper A.md").status_code == 404
+    assert client.get("/jobs/abcdefabcdef/sources/01 Paper A.md").status_code == 404
 
 
 def test_bundle_zip_holds_report_and_sources(client, tmp_path):
     written = _finished_job(tmp_path)
-    resp = client.get("/jobs/xyz/bundle.zip")
+    resp = client.get("/jobs/abcdefabcdef/bundle.zip")
     assert resp.status_code == 200
     assert resp.headers["content-type"] == "application/zip"
     assert "attachment" in resp.headers["content-disposition"]
@@ -661,9 +661,9 @@ def test_bundle_zip_holds_report_and_sources(client, tmp_path):
 
 def test_report_view_links_to_the_bundle(client, tmp_path):
     _finished_job(tmp_path)
-    page = client.get("/jobs/xyz/report")
+    page = client.get("/jobs/abcdefabcdef/report")
     assert page.status_code == 200
-    assert "/jobs/xyz/bundle.zip" in page.text
+    assert "/jobs/abcdefabcdef/bundle.zip" in page.text
     assert "question:" not in page.text              # frontmatter stripped
     # The report's relative "local copy" link resolves to the source view.
     assert 'href="sources/01 Paper A.md"' in page.text
@@ -675,7 +675,7 @@ def test_report_view_links_to_the_bundle(client, tmp_path):
 
 def test_job_json_hides_server_bookkeeping(client, tmp_path):
     _finished_job(tmp_path)
-    job = client.get("/research/xyz").json()
+    job = client.get("/research/abcdefabcdef").json()
     assert "report_path" not in job and "run_id" not in job
     assert "citations" not in job             # served by /sources on demand
     assert job["report_name"] == "How do solid-state batteries work.md"
@@ -684,8 +684,8 @@ def test_job_json_hides_server_bookkeeping(client, tmp_path):
 def test_no_response_carries_a_server_path(client, tmp_path):
     written = _finished_job(tmp_path)
     folder = str(written.path.parent)
-    for url in ("/health", "/jobs", "/research/xyz", "/jobs/xyz/sources",
-                "/jobs/xyz/report", "/jobs/xyz/sources/01 Paper A.md"):
+    for url in ("/health", "/jobs", "/research/abcdefabcdef", "/jobs/abcdefabcdef/sources",
+                "/jobs/abcdefabcdef/report", "/jobs/abcdefabcdef/sources/01 Paper A.md"):
         assert folder not in client.get(url).text, url
 
 
@@ -727,10 +727,10 @@ def test_rendered_markdown_keeps_relative_source_links():
 
 
 def test_delete_running_job_refused(client):
-    app_module.jobs.data["abc"] = {"id": "abc", "question": "q",
+    app_module.jobs.data["ababababab12"] = {"id": "ababababab12", "question": "q",
                                    "status": "researching",
                                    "created_at": "2026-01-01T00:00:00Z"}
-    assert client.delete("/jobs/abc").status_code == 409
+    assert client.delete("/jobs/ababababab12").status_code == 409
 
 
 def test_index_and_pwa_assets(client):
@@ -893,9 +893,9 @@ def test_a_restart_adopts_the_dossier_and_records_the_real_outcome(
     written = pipeline.write_report(
         tmp_path, "Interrupted question", "core", _sample_result(),
         [SourceCopy("https://a.test/1", "Paper A", "# A body", True)],
-        job_id="res1")
-    app_module.jobs.data["res1"] = {
-        "id": "res1", "question": "Interrupted question", "processor": "core",
+        job_id="eeeeeeeeeee2")
+    app_module.jobs.data["eeeeeeeeeee2"] = {
+        "id": "eeeeeeeeeee2", "question": "Interrupted question", "processor": "core",
         "status": "saving", "progress": "Writing report…",
         "created_at": "2026-01-01T00:00:00Z",
         "run_id": "trun_x", "report_path": str(written.path)}
@@ -911,9 +911,9 @@ def test_a_restart_adopts_the_dossier_and_records_the_real_outcome(
     monkeypatch.setattr(pipeline, "write_report", refuse)
     monkeypatch.setattr(app_module, "OUTPUT_DIR", tmp_path)
 
-    asyncio.run(app_module.run_research("res1"))
+    asyncio.run(app_module.run_research("eeeeeeeeeee2"))
 
-    job = app_module.jobs.data["res1"]
+    job = app_module.jobs.data["eeeeeeeeeee2"]
     assert job["status"] == "done"
     assert len(list(tmp_path.iterdir())) == 1        # no duplicate folder
     # The record has to describe the dossier, not merely claim to be finished.
@@ -996,8 +996,8 @@ def test_a_symlink_out_of_the_dossier_is_not_served(client, tmp_path):
         link.symlink_to(secret)
     except OSError:
         pytest.skip("symlinks unavailable")
-    assert client.get("/jobs/xyz/sources/99 sneaky.md").status_code == 404
-    with zipfile.ZipFile(io.BytesIO(client.get("/jobs/xyz/bundle.zip").content)) as z:
+    assert client.get("/jobs/abcdefabcdef/sources/99 sneaky.md").status_code == 404
+    with zipfile.ZipFile(io.BytesIO(client.get("/jobs/abcdefabcdef/bundle.zip").content)) as z:
         assert not any("sneaky" in n for n in z.namelist())
 
 
@@ -1006,26 +1006,26 @@ def test_an_unusable_job_record_does_not_stay_running(monkeypatch):
     app_module.jobs.data.clear()
     monkeypatch.setattr(app_module.jobs, "save", lambda: None)
     app_module.jobs.data.update({
-        "noq": {"id": "noq", "status": "researching",      # no question
+        "ddddddddddd1": {"id": "ddddddddddd1", "status": "researching",      # no question
                 "created_at": "2026-01-01T00:00:00Z"},
-        "nostatus": {"id": "nostatus", "question": "q", "processor": "core",
+        "ddddddddddd2": {"id": "ddddddddddd2", "question": "q", "processor": "core",
                      "created_at": "2026-01-01T00:00:01Z"},
-        "numeric": {"id": "numeric", "question": "q", "processor": "core",
+        "ddddddddddd3": {"id": "ddddddddddd3", "question": "q", "processor": "core",
                     "status": "done", "created_at": 20260101},
     })
     app_module._normalize_jobs()
 
-    assert app_module.jobs.data["noq"]["status"] == "failed"
-    assert "cannot be resumed" in app_module.jobs.data["noq"]["error"]
-    assert app_module.jobs.data["nostatus"]["status"] == "failed"
-    assert app_module.jobs.data["numeric"]["created_at"] == "20260101"
+    assert app_module.jobs.data["ddddddddddd1"]["status"] == "failed"
+    assert "cannot be resumed" in app_module.jobs.data["ddddddddddd1"]["error"]
+    assert app_module.jobs.data["ddddddddddd2"]["status"] == "failed"
+    assert app_module.jobs.data["ddddddddddd3"]["created_at"] == "20260101"
     app_module._trim_jobs()                       # sorting no longer mixes types
 
     # And the orchestrator refuses such a record directly, not only via load.
-    app_module.jobs.data["raw"] = {"id": "raw", "status": "researching",
+    app_module.jobs.data["ddddddddddd4"] = {"id": "ddddddddddd4", "status": "researching",
                                    "created_at": "2026-01-01T00:00:00Z"}
-    asyncio.run(app_module.run_research("raw"))
-    assert app_module.jobs.data["raw"]["status"] == "failed"
+    asyncio.run(app_module.run_research("ddddddddddd4"))
+    assert app_module.jobs.data["ddddddddddd4"]["status"] == "failed"
     app_module.jobs.data.clear()
 
 
@@ -1034,19 +1034,19 @@ def test_normalization_validates_rather_than_stringifies(monkeypatch):
     app_module.jobs.data.clear()
     monkeypatch.setattr(app_module.jobs, "save", lambda: None)
     app_module.jobs.data.update({
-        "nullq": {"id": "nullq", "question": None, "processor": "core",
+        "aaaaaaaaaaa1": {"id": "aaaaaaaaaaa1", "question": None, "processor": "core",
                   "status": "researching", "created_at": "2026-01-01T00:00:00Z"},
-        "dictproc": {"id": "dictproc", "question": "q", "processor": {},
+        "aaaaaaaaaaa2": {"id": "aaaaaaaaaaa2", "question": "q", "processor": {},
                      "status": "researching", "created_at": "2026-01-01T00:00:01Z"},
-        "nullstatus": {"id": "nullstatus", "question": "q", "processor": "core",
+        "aaaaaaaaaaa3": {"id": "aaaaaaaaaaa3", "question": "q", "processor": "core",
                        "status": None, "created_at": "2026-01-01T00:00:02Z"},
-        "unknownproc": {"id": "unknownproc", "question": "q",
+        "aaaaaaaaaaa4": {"id": "aaaaaaaaaaa4", "question": "q",
                         "processor": "warp9", "status": "researching",
                         "created_at": "2026-01-01T00:00:03Z"},
     })
     app_module._normalize_jobs()
 
-    for job_id in ("nullq", "dictproc", "nullstatus", "unknownproc"):
+    for job_id in ("aaaaaaaaaaa1", "aaaaaaaaaaa2", "aaaaaaaaaaa3", "aaaaaaaaaaa4"):
         job = app_module.jobs.data[job_id]
         assert job["status"] == "failed", job_id
         assert job.get("question") != "None"
@@ -1054,25 +1054,146 @@ def test_normalization_validates_rather_than_stringifies(monkeypatch):
     app_module.jobs.data.clear()
 
 
+def test_an_unroutable_store_key_is_rekeyed(client, monkeypatch):
+    """The key is the public id and goes straight into URLs."""
+    monkeypatch.setattr(app_module.jobs, "save", lambda: None)
+    app_module.jobs.data.clear()
+    app_module.jobs.data["../escape?x=1"] = {
+        "id": "whatever", "question": "a perfectly fine question",
+        "processor": "core", "status": "done",
+        "created_at": "2026-01-01T00:00:00Z"}
+    app_module._normalize_jobs()
+
+    assert "../escape?x=1" not in app_module.jobs.data
+    key, = app_module.jobs.data
+    assert re.fullmatch(r"[0-9a-f]{12}", key)
+    assert app_module.jobs.data[key]["id"] == key       # history survives
+    assert client.get(f"/research/{key}").status_code == 200
+    app_module.jobs.data.clear()
+
+
+def test_a_bad_notion_url_is_dropped_on_load(client, monkeypatch):
+    """The PWA assigns it straight to an anchor."""
+    monkeypatch.setattr(app_module.jobs, "save", lambda: None)
+    app_module.jobs.data["aaaaaaaaaaaa"] = {
+        "id": "aaaaaaaaaaaa", "question": "a perfectly fine question",
+        "processor": "core", "status": "done",
+        "created_at": "2026-01-01T00:00:00Z",
+        "notion_url": "javascript:alert(1)"}
+    app_module._normalize_jobs()
+    assert "notion_url" not in app_module.jobs.data["aaaaaaaaaaaa"]
+    app_module.jobs.data.clear()
+
+
+def test_resume_uses_the_same_question_rule_as_submission(client, monkeypatch):
+    """A question submission refuses must not get in through a resume."""
+    monkeypatch.setattr(app_module, "PARALLEL_API_KEY", "k")
+    assert client.post("/research", json={"question": "hi"}).status_code == 422
+    assert not app_module._resumable(
+        {"question": "hi", "processor": "core"})
+    assert not app_module._resumable(
+        {"question": "x" * 5000, "processor": "core"})
+    assert not app_module._resumable({"question": None, "processor": "core"})
+    assert app_module._resumable(
+        {"question": "a perfectly fine question", "processor": "core"})
+
+
+def test_the_deadline_bounds_what_each_request_may_take():
+    """Both timeouts are cut to the remaining budget, not left at 150 s.
+
+    MockTransport runs the handler without honouring timeouts, so this pins
+    the values Footnote passes — enforcing them is httpx's job, and it can
+    only enforce what it is given.
+    """
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.extensions.get("timeout", {}),
+                     int(request.url.params["timeout"])))
+        return httpx.Response(408)
+
+    async def run():
+        async with httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)) as client:
+            with pytest.raises(PipelineError, match="giving up"):
+                await pipeline.fetch_task_result(client, "k", "trun_x", 3)
+
+    asyncio.run(run())
+    assert seen, "no request was made"
+    for timeouts, poll_seconds in seen:
+        assert timeouts["read"] <= 3, timeouts        # not the 150 s default
+        assert timeouts["connect"] <= 3, timeouts
+        assert poll_seconds <= 3                      # nor a 120 s long poll
+    assert seen[-1][0]["read"] < seen[0][0]["read"]   # shrinks as time is spent
+
+
+def test_a_create_response_must_name_a_run():
+    """Not retried: the POST may have created a run we would then orphan."""
+    async def create(body):
+        async with httpx.AsyncClient(transport=httpx.MockTransport(
+                lambda r: httpx.Response(200, json=body))) as client:
+            return await pipeline.start_task_run(client, "k", "q", "core")
+
+    for body in (["not", "an", "object"], {"run_id": {"nested": 1}},
+                 {"run_id": ""}, {}):
+        with pytest.raises(PipelineError, match="run_id"):
+            asyncio.run(create(body))
+    assert asyncio.run(create({"run_id": " trun_x "})) == "trun_x"
+
+
+def test_an_authority_is_not_a_hostname():
+    for url in ("https://:443/x", "https://user@/x", "https://a.test:99999/x"):
+        assert not pipeline.is_http_url(url), url
+    assert pipeline.is_http_url("https://a.test:8443/x")
+
+
+def test_success_must_be_the_boolean(monkeypatch):
+    monkeypatch.setattr(pipeline, "BASE_BACKOFF_S", 0.01)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"success": "false",
+                                         "data": {"markdown": "x",
+                                                  "metadata": {}}})
+
+    copy, = _run_scrape(handler, 1)
+    assert not copy.ok                       # "false" is a truthy string
+
+
+def test_a_citations_field_that_is_not_a_list(client, tmp_path):
+    _finished_job(tmp_path)
+    app_module.jobs.data["abcdefabcdef"]["citations"] = 5
+    body = client.get("/jobs/abcdefabcdef/sources").json()
+    assert body["archived"] == 1             # described by the files on disk
+    assert [s["file"] for s in body["sources"]] == ["01 Paper A.md"]
+
+
+def test_report_availability_is_reported_separately(client, tmp_path):
+    written = _finished_job(tmp_path)
+    assert client.get("/jobs").json()["jobs"][0]["report_available"] is True
+    written.path.unlink()                    # moved or deleted in the notes app
+    assert client.get("/jobs").json()["jobs"][0]["report_available"] is False
+    assert client.get("/jobs").json()["jobs"][0]["status"] == "done"
+
+
 def test_a_stored_id_is_reconciled_with_its_key(client, monkeypatch):
     """The API resolves by key; links are built from the stored id."""
     monkeypatch.setattr(app_module.jobs, "save", lambda: None)
-    app_module.jobs.data["realkey"] = {
+    app_module.jobs.data["bbbbbbbbbbb1"] = {
         "id": "../elsewhere", "question": "q", "processor": "core",
         "status": "done", "created_at": "2026-01-01T00:00:00Z"}
     app_module._normalize_jobs()
-    assert app_module.jobs.data["realkey"]["id"] == "realkey"
-    assert client.get("/jobs").json()["jobs"][0]["id"] == "realkey"
+    assert app_module.jobs.data["bbbbbbbbbbb1"]["id"] == "bbbbbbbbbbb1"
+    assert client.get("/jobs").json()["jobs"][0]["id"] == "bbbbbbbbbbb1"
 
 
 def test_a_malformed_citation_does_not_break_the_index(client, tmp_path):
     written = _finished_job(tmp_path)
-    app_module.jobs.data["xyz"]["citations"] = [
+    app_module.jobs.data["abcdefabcdef"]["citations"] = [
         "not a dict", None,
         {"url": "https://a.test/1", "title": "Paper A", "file": "01 Paper A.md"},
         {"url": None, "title": 5, "file": ["nope"]},
     ]
-    body = client.get("/jobs/xyz/sources").json()
+    body = client.get("/jobs/abcdefabcdef/sources").json()
     assert body["archived"] == 1
     assert [s["file"] for s in body["sources"] if s["file"]] == ["01 Paper A.md"]
 
@@ -1137,25 +1258,25 @@ def test_only_a_real_notion_url_is_stored(client, tmp_path, monkeypatch):
     monkeypatch.setattr(pipeline, "fetch_task_result",
                         lambda *a, **kw: _immediately(_sample_result()))
     written = pipeline.write_report(tmp_path, "Notion url question", "core",
-                                    _sample_result(), [], job_id="nu1")
-    app_module.jobs.data["nu1"] = {
-        "id": "nu1", "question": "Notion url question", "processor": "core",
+                                    _sample_result(), [], job_id="eeeeeeeeeee3")
+    app_module.jobs.data["eeeeeeeeeee3"] = {
+        "id": "eeeeeeeeeee3", "question": "Notion url question", "processor": "core",
         "status": "saving", "created_at": "2026-01-01T00:00:00Z",
         "run_id": "trun_x", "report_path": str(written.path)}
-    asyncio.run(app_module.run_research("nu1"))
-    assert app_module.jobs.data["nu1"].get("notion_url", "") == ""
+    asyncio.run(app_module.run_research("eeeeeeeeeee3"))
+    assert app_module.jobs.data["eeeeeeeeeee3"].get("notion_url", "") == ""
 
 
 def test_a_repaired_history_still_serves(client, monkeypatch):
     monkeypatch.setattr(app_module.jobs, "save", lambda: None)
-    app_module.jobs.data["broken"] = {"id": "broken", "question": "q",
+    app_module.jobs.data["cccccccccccc"] = {"id": "cccccccccccc", "question": "q",
                                       "created_at": "2026-01-01T00:00:00Z"}
     app_module._normalize_jobs()
     listing = client.get("/jobs")
     assert listing.status_code == 200
     assert listing.json()["active"] == 0
     assert client.get("/health").status_code == 200
-    assert client.delete("/jobs/broken").status_code == 200
+    assert client.delete("/jobs/cccccccccccc").status_code == 200
 
 
 def test_recovery_refuses_a_report_it_could_not_serve(client, tmp_path,
@@ -1310,9 +1431,9 @@ def test_post_processing_stops_when_the_job_is_deleted(client, tmp_path,
                         lambda *a, **kw: _immediately(_sample_result()))
 
     written = pipeline.write_report(tmp_path, "Deleted question", "core",
-                                    _sample_result(), [], job_id="del1")
-    app_module.jobs.data["del1"] = {
-        "id": "del1", "question": "Deleted question", "processor": "core",
+                                    _sample_result(), [], job_id="eeeeeeeeeee1")
+    app_module.jobs.data["eeeeeeeeeee1"] = {
+        "id": "eeeeeeeeeee1", "question": "Deleted question", "processor": "core",
         "status": "saving", "created_at": "2026-01-01T00:00:00Z",
         "run_id": "trun_x", "report_path": str(written.path)}
 
@@ -1324,7 +1445,7 @@ def test_post_processing_stops_when_the_job_is_deleted(client, tmp_path,
             app_module.jobs.data.pop(job_id, None)   # the user hit "remove"
 
     monkeypatch.setattr(app_module, "_update_job", delete_once_done)
-    asyncio.run(app_module.run_research("del1"))
+    asyncio.run(app_module.run_research("eeeeeeeeeee1"))
     assert called == {"notion": 0, "push": 0}
 
 
@@ -1347,11 +1468,11 @@ def test_a_symlinked_report_is_not_served(client, tmp_path):
         link.symlink_to(secret)                 # outside OUTPUT_DIR
     except OSError:
         pytest.skip("symlinks unavailable")
-    app_module.jobs.data["sym"] = {
-        "id": "sym", "question": "q", "status": "done",
+    app_module.jobs.data["fffffffffff1"] = {
+        "id": "fffffffffff1", "question": "q", "status": "done",
         "created_at": "2026-01-01T00:00:00Z", "report_path": str(link)}
-    for url in ("/jobs/sym/report", "/jobs/sym/report.md",
-                "/jobs/sym/bundle.zip", "/jobs/sym/sources"):
+    for url in ("/jobs/fffffffffff1/report", "/jobs/fffffffffff1/report.md",
+                "/jobs/fffffffffff1/bundle.zip", "/jobs/fffffffffff1/sources"):
         resp = client.get(url)
         assert resp.status_code == 404, url
         assert "PRIVATE KEY" not in resp.text, url
@@ -1370,7 +1491,7 @@ def test_the_source_index_lists_only_files_it_would_serve(client, tmp_path):
     except OSError:
         pytest.skip("symlinks unavailable")
 
-    body = client.get("/jobs/xyz/sources").json()
+    body = client.get("/jobs/abcdefabcdef/sources").json()
     listed = [s["file"] for s in body["sources"] if s["file"]]
     assert listed == ["01 Paper A.md"]
     assert all(s["bytes"] >= 0 for s in body["sources"])
@@ -1605,6 +1726,19 @@ def test_the_worker_awaits_its_cache_writes():
         assert "await" in line, line
 
 
+def test_the_pwa_replaces_a_subscription_made_with_an_old_key():
+    app_js = (Path(__file__).resolve().parent.parent
+              / "static" / "app.js").read_text()
+    assert "sameKey(" in app_js and "unsubscribe()" in app_js
+    assert "applicationServerKey" in app_js
+
+
+def test_the_pwa_hides_links_to_a_report_that_is_gone():
+    app_js = (Path(__file__).resolve().parent.parent
+              / "static" / "app.js").read_text()
+    assert "report_available === false" in app_js
+
+
 def test_the_page_can_tell_the_worker_to_forget_a_job():
     sw = (Path(__file__).resolve().parent.parent
           / "static" / "service-worker.js").read_text()
@@ -1629,14 +1763,14 @@ def test_the_worker_caches_pages_but_not_the_index_or_downloads():
     """Written pages are immutable; the sources index describes a live folder."""
     dossier, index = _sw_pattern("isDossier"), _sw_pattern("isSourceIndex")
 
-    for path in ("/jobs/abc/report", "/jobs/abc/sources/01 a.md"):
+    for path in ("/jobs/ababababab12/report", "/jobs/ababababab12/sources/01 a.md"):
         assert dossier.search(path), path          # cache-first
         assert not index.search(path), path
 
-    assert index.search("/jobs/abc/sources")       # network-first
-    assert not dossier.search("/jobs/abc/sources")
+    assert index.search("/jobs/ababababab12/sources")       # network-first
+    assert not dossier.search("/jobs/ababababab12/sources")
 
-    for path in ("/jobs/abc/report.md", "/jobs/abc/bundle.zip", "/jobs", "/health"):
+    for path in ("/jobs/ababababab12/report.md", "/jobs/ababababab12/bundle.zip", "/jobs", "/health"):
         assert not dossier.search(path), path      # never cached
         assert not index.search(path), path
 
@@ -1659,9 +1793,9 @@ def test_token_required(locked_client):
         "/research", json={"question": "A perfectly fine question"}
     ).status_code == 401
     # Source material is behind the token too — it is the research itself.
-    assert locked_client.get("/jobs/xyz/sources").status_code == 401
-    assert locked_client.get("/jobs/xyz/sources/01 a.md").status_code == 401
-    assert locked_client.get("/jobs/xyz/bundle.zip").status_code == 401
+    assert locked_client.get("/jobs/abcdefabcdef/sources").status_code == 401
+    assert locked_client.get("/jobs/abcdefabcdef/sources/01 a.md").status_code == 401
+    assert locked_client.get("/jobs/abcdefabcdef/bundle.zip").status_code == 401
 
 
 def test_token_accepted_via_bearer_and_query(locked_client):

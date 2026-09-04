@@ -128,7 +128,9 @@ finishes.
 
 `status` walks `queued → researching → archiving → saving → done` (or
 `failed`, with `error` set). Once `done`, the response also carries
-`report_name` (the dossier's file name), `sources_cited`,
+`report_name` (the dossier's file name), `report_available` (whether that
+file is still where it was filed — the folder is yours to reorganise, and a
+link to a dossier you moved is worse than none), `sources_cited`,
 `sources_archived`, and `finished_at`.
 
 Where the dossier sits on the server is deliberately not in the response.

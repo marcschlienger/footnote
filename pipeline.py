@@ -91,8 +91,9 @@ def is_http_url(url: str) -> bool:
     if match is None or match.group(1).lower() not in ("http", "https"):
         return False
     try:
-        return bool(urlsplit(text).netloc)
-    except ValueError:
+        parsed = urlsplit(text)
+        return bool(parsed.hostname) and parsed.port is not False
+    except ValueError:      # an invalid port raises when it is read
         return False
 
 
@@ -196,10 +197,17 @@ async def start_task_run(
         raise PipelineError(
             f"Parallel refused the task ({resp.status_code}): {_err_detail(resp)}"
         )
-    run_id = resp.json().get("run_id", "")
-    if not run_id:
-        raise PipelineError("Parallel returned no run_id")
-    return run_id
+    try:
+        body = resp.json()
+    except ValueError:
+        body = None
+    run_id = _text((body or {}).get("run_id")) if isinstance(body, dict) else ""
+    if not run_id.strip():
+        # Not retried: the POST may well have created a run, and asking again
+        # would pay for a second one while the first goes unrecorded.
+        raise PipelineError(
+            "Parallel accepted the task but returned no usable run_id")
+    return run_id.strip()
 
 
 async def fetch_task_result(
@@ -212,8 +220,12 @@ async def fetch_task_result(
     time, not a tight loop.
     """
     started = time.monotonic()
+
+    def left() -> float:
+        return deadline_s - (time.monotonic() - started)
+
     while True:
-        remaining = deadline_s - (time.monotonic() - started)
+        remaining = left()
         if remaining <= 0:
             raise PipelineError(
                 f"Research run {run_id} still not finished after "
@@ -223,16 +235,18 @@ async def fetch_task_result(
             resp = await client.get(
                 f"{PARALLEL_BASE}/tasks/runs/{run_id}/result",
                 headers={"x-api-key": api_key},
-                # Never poll for longer than the deadline allows; the
-                # endpoint's own minimum is 10 s, so a shorter remainder just
-                # means this is the last attempt.
-                params={"timeout": int(min(120, max(10, remaining)))},
-                # (the deadline check at the top of the loop ends it)
-                timeout=httpx.Timeout(150.0, connect=15.0),
+                # Ask the provider to hold the connection for at most what is
+                # left; its own minimum is 10 s, which is why the client
+                # timeout below is the one that really enforces the bound.
+                params={"timeout": int(min(120, max(1, remaining)))},
+                timeout=httpx.Timeout(min(150.0, remaining),
+                                      connect=min(15.0, remaining)),
             )
         except httpx.TransportError:
-            # A transient blip; the run is server-side and keeps going.
-            await asyncio.sleep(min(10, max(remaining, 0)))
+            # A transient blip, or our own timeout firing. The run is
+            # server-side and keeps going; the loop decides whether there is
+            # time left to ask again.
+            await asyncio.sleep(min(10, max(left(), 0)))
             continue
         if resp.status_code == 408:   # still running
             continue
@@ -242,7 +256,7 @@ async def fetch_task_result(
             # wait has to fit inside what is left of the deadline, or the
             # bound the caller was given is not a bound.
             await asyncio.sleep(min(_retry_after(resp, RESULT_RETRY_S),
-                                    max(remaining, 0)))
+                                    max(left(), 0)))
             continue
         if resp.status_code != 200:
             raise PipelineError(
@@ -255,7 +269,7 @@ async def fetch_task_result(
             payload = None
         if not isinstance(payload, dict):
             # A broken hop, not an answer.
-            await asyncio.sleep(min(RESULT_RETRY_S, max(remaining, 0)))
+            await asyncio.sleep(min(RESULT_RETRY_S, max(left(), 0)))
             continue
         return _parse_task_result(payload, run_id)
 
@@ -543,7 +557,9 @@ async def _scrape_one(
             # the same retry path rather than an AttributeError from the first
             # .get() or a misleading "empty extraction".
             data, malformed = {}, True
-        if resp.status_code == 200 and data.get("success", False):
+        # `is True`: the string "false" is truthy, and this field decides
+        # whether a page counts as archived.
+        if resp.status_code == 200 and data.get("success") is True:
             page = data.get("data") or {}
             md = _text(page.get("markdown"))
             metadata = page.get("metadata")

@@ -197,6 +197,25 @@ _JOB_DISPLAY_FIELDS = ("progress", "error", "notion_url", "finished_at",
 _JOB_SEMANTIC_FIELDS = ("question", "processor", "status", "run_id",
                         "report_path")
 _TERMINAL_STATUSES = ("done", "failed")
+QUESTION_MIN, QUESTION_MAX = 8, 4000
+# Store keys become public job ids and go straight into URLs.
+_JOB_ID = re.compile(r"^[0-9a-f]{12}$")
+
+
+def _question_problem(question) -> str:
+    """Why this question cannot be researched, or "" if it can.
+
+    One rule for both doors: a question that submission would refuse must not
+    get in through a resume either, where it would spend the same quota.
+    """
+    if not isinstance(question, str):
+        return "question must be text"
+    text = question.strip()
+    if len(text) < QUESTION_MIN:
+        return "question is too short"
+    if len(text) > QUESTION_MAX:
+        return f"question is too long ({QUESTION_MAX} chars max)"
+    return ""
 
 
 def _normalize_jobs() -> None:
@@ -209,6 +228,17 @@ def _normalize_jobs() -> None:
     corrupt record made to look runnable.
     """
     changed = False
+    for job_id in [k for k in jobs.data if not _JOB_ID.match(str(k))]:
+        # The key is the public id and goes into URLs. A hand-edited file can
+        # hold anything; rekey rather than drop, so the history survives and
+        # every record stays addressable.
+        record = jobs.data.pop(job_id)
+        fresh = uuid.uuid4().hex[:12]
+        record["id"] = fresh
+        jobs.data[fresh] = record
+        print(f"job history: rekeyed an unusable job id to {fresh}", flush=True)
+        changed = True
+
     for job_id, job in list(jobs.data.items()):
         if job.get("id") != job_id:
             # The API resolves by key; the PWA and the source index build
@@ -232,6 +262,10 @@ def _normalize_jobs() -> None:
                        error="Incomplete job record; cannot be resumed",
                        progress="Failed: incomplete job record")
             changed = True
+        if job.get("notion_url") and not pipeline.is_http_url(job["notion_url"]):
+            # The PWA assigns this straight to an anchor's href.
+            del job["notion_url"]
+            changed = True
     if changed:
         jobs.save()
         print("job history repaired on load", flush=True)
@@ -244,8 +278,8 @@ def _resumable(job: dict) -> bool:
     verbatim, and an unknown one is refused at submission but was never
     re-checked on the way back in.
     """
-    return bool(job.get("question", "").strip()
-                and job.get("processor") in ALL_PROCESSORS)
+    return (not _question_problem(job.get("question"))
+            and job.get("processor") in ALL_PROCESSORS)
 
 
 def _valid_subscription(sub) -> bool:
@@ -834,10 +868,9 @@ class ResearchRequest(BaseModel):
     @classmethod
     def _non_empty(cls, v: str) -> str:
         v = v.strip()
-        if len(v) < 8:
-            raise ValueError("question is too short")
-        if len(v) > 4000:
-            raise ValueError("question is too long (4000 chars max)")
+        problem = _question_problem(v)
+        if problem:
+            raise ValueError(problem)
         return v
 
 
@@ -879,6 +912,10 @@ def _job_public(job: dict) -> dict:
     public = {k: v for k, v in job.items() if k not in _PRIVATE_JOB_FIELDS}
     if job.get("report_path"):
         public["report_name"] = Path(job["report_path"]).name
+        # Completion and availability are different facts: the dossier lives
+        # in a folder people reorganise, and a link to a file that is gone is
+        # worse than no link. Costs one stat per job on the page being shown.
+        public["report_available"] = _servable_report(job["report_path"]) is not None
     return public
 
 
@@ -1006,10 +1043,11 @@ def _source_entries(job: dict, folder: Path) -> list:
              if f.is_file() and _inside(f, folder)}
     # Records come off a JSON file that can be edited or truncated; one bad
     # entry should cost that entry, not the whole index.
+    stored = job.get("citations")
     listed = [(_str(cit.get("title")), _str(cit.get("url")),
                _str(cit.get("file")) if _str(cit.get("file")) in files else "",
                _str(cit.get("note")))
-              for cit in job.get("citations") or []
+              for cit in (stored if isinstance(stored, list) else [])
               if isinstance(cit, dict)]
     known = {name for _, _, name, _ in listed}
     for name, path in files.items():

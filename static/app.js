@@ -147,10 +147,18 @@ function renderJob(job) {
   } else if (job.status === "done") {
     const links = document.createElement("span");
     links.className = "links";
-    links.appendChild(link(`/jobs/${job.id}/report`, "Report"));
-    links.appendChild(link(`/jobs/${job.id}/report.md`, ".md"));
-    links.appendChild(sourcesToggle(job));
-    links.appendChild(link(`/jobs/${job.id}/bundle.zip`, "Everything (.zip)"));
+    if (job.report_available === false) {
+      // The dossier moved or was deleted in the notes folder. Say so instead
+      // of offering links that answer 404.
+      const gone = text("span", "report not where it was filed");
+      gone.style.color = "var(--rule-red)";
+      links.appendChild(gone);
+    } else {
+      links.appendChild(link(`/jobs/${job.id}/report`, "Report"));
+      links.appendChild(link(`/jobs/${job.id}/report.md`, ".md"));
+      links.appendChild(sourcesToggle(job));
+      links.appendChild(link(`/jobs/${job.id}/bundle.zip`, "Everything (.zip)"));
+    }
     if (job.notion_url) links.appendChild(link(job.notion_url, "Notion"));
     if (job.progress) {
       const note = text("span", job.progress.replace(/^Done — /, ""));
@@ -300,12 +308,20 @@ async function offerPush() {
 
 async function subscribePush() {
   const reg = await navigator.serviceWorker.ready;
+  const { publicKey } = await fetchJSON("/vapid-public-key");
+  const wanted = b64ToUint8(publicKey);
   let sub = await reg.pushManager.getSubscription();
+  // A subscription is bound to the key it was made with. If the server's key
+  // has been rotated, reusing it leaves a subscription the server can never
+  // push to and nothing ever replaces.
+  if (sub && !sameKey(sub.options?.applicationServerKey, wanted)) {
+    await sub.unsubscribe().catch(() => {});
+    sub = null;
+  }
   if (!sub) {
-    const { publicKey } = await fetchJSON("/vapid-public-key");
     sub = await reg.pushManager.subscribe({
       userVisibleOnly: true,
-      applicationServerKey: b64ToUint8(publicKey),
+      applicationServerKey: wanted,
     });
   }
   await fetchJSON("/subscribe", {
@@ -313,6 +329,13 @@ async function subscribePush() {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(sub.toJSON()),
   });
+}
+
+function sameKey(existing, wanted) {
+  if (!existing) return false;               // unknown: assume it is stale
+  const have = new Uint8Array(existing);
+  return have.length === wanted.length &&
+         have.every((byte, i) => byte === wanted[i]);
 }
 
 function b64ToUint8(base64) {

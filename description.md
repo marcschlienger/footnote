@@ -136,6 +136,11 @@ connectivity.
 
 ---
 
+The deadline is enforced on the calls, not only between them: the HTTP
+client's own timeout and the long-poll window Parallel is asked for are both
+cut to what remains, and every retry sleep is measured from *after* the
+request rather than before it. A bound the caller passes is a bound.
+
 ### Nothing arrives trusted
 
 Both providers' payloads cross a network as someone else's JSON, and the
@@ -315,6 +320,11 @@ point:
   so paths with spaces survive strict Markdown parsers; they resolve both in
   a notes app and in Footnote's own report view (which serves
   `/jobs/{id}/sources/{file}` for exactly this reason).
+- **A run id is checked before it is stored.** A create response that is not
+  an object, or whose `run_id` is not a non-empty string, fails the job
+  rather than being interpolated into later URLs — and it is not retried,
+  because the POST may well have created a run that a second attempt would
+  pay for again while the first goes unrecorded.
 - **Only web links are written as links.** A citation URL whose scheme is not
   http, https or mailto is listed as text in a code span instead: the dossier
   is a portable Markdown file, and the next app to open it may follow a link
@@ -498,10 +508,16 @@ optionally hardened one notch.
   than silently treated as empty, so the history can be looked at instead of
   being overwritten by the next save. A single damaged record is dropped with
   a note instead of costing the rest of the history, and what survives is
-  normalized on load: fields that must be strings are coerced so sorting
-  cannot mix types, and an *active* record with no question is failed rather
-  than left to a task that dies on it while the record says "researching" for
-  ever.
+  normalized on load. Two kinds of field, two treatments: what is only
+  rendered or sorted by is coerced to text; what the app *acts on* is
+  validated, because `null` stringified into `"None"` is a corrupt record
+  made to look runnable. An active record whose question or processor would
+  not pass submission is failed rather than resumed, by the same rule
+  submission applies — a question refused at the front door must not get in
+  through a resume and spend the same quota. Store keys are the public job
+  ids and go straight into URLs, so a key that is not one is rekeyed (the
+  record is kept; only its address changes), and a `notion_url` that is not a
+  web link is dropped, since the PWA assigns it to an anchor.
 - **Response headers back the sanitizer up.** Every response carries a CSP
   (`script-src 'self'`, `connect-src 'self'`, `frame-ancestors 'none'`,
   `base-uri 'none'`), `X-Content-Type-Options: nosniff` and
