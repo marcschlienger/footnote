@@ -65,9 +65,27 @@ fi
 # An existing env file is authoritative: a customized instance keeps its own
 # directories, and repairing the ones computed from this invocation's
 # arguments would tighten permissions on the wrong paths.
+# systemd's EnvironmentFile allows quoting, and sed strips only the literal
+# prefix — OUTPUT_DIR="/srv/My Notes" would otherwise come back with its
+# quotes attached and have install(1) create a relative directory of that
+# name. Sourcing the file as root is not an option, so: strip one layer of
+# matching quotes and accept the result only if it is an absolute path.
+read_env_path() {
+  local raw
+  raw="$(sed -n "s/^$1=//p" "$ENV_FILE" | tail -1)"
+  case "$raw" in
+    \"*\") raw="${raw#\"}"; raw="${raw%\"}" ;;
+    \'*\') raw="${raw#\'}"; raw="${raw%\'}" ;;
+  esac
+  case "$raw" in
+    /*) printf '%s' "$raw" ;;
+    *)  printf '' ;;
+  esac
+}
+
 if [ -f "$ENV_FILE" ]; then
-  EXISTING_OUT="$(sed -n 's/^OUTPUT_DIR=//p' "$ENV_FILE" | tail -1)"
-  EXISTING_DATA="$(sed -n 's/^DATA_DIR=//p' "$ENV_FILE" | tail -1)"
+  EXISTING_OUT="$(read_env_path OUTPUT_DIR)"
+  EXISTING_DATA="$(read_env_path DATA_DIR)"
   [ -n "$EXISTING_OUT" ] && OUT="$EXISTING_OUT"
   [ -n "$EXISTING_DATA" ] && DATA="$EXISTING_DATA"
 fi

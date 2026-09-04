@@ -85,6 +85,11 @@ SAFE_SCHEMES = frozenset({"http", "https", "mailto"})
 _SCHEME = re.compile(r"^([a-zA-Z][a-zA-Z0-9+.-]*):")
 
 
+def valid_run_id(run_id) -> bool:
+    """The same shape a freshly returned run id has to satisfy."""
+    return isinstance(run_id, str) and bool(_RUN_ID.match(run_id))
+
+
 def is_http_url(url: str) -> bool:
     """Fetchable over the web — a stricter test than is_safe_url's link policy.
 
@@ -109,16 +114,20 @@ def is_http_url(url: str) -> bool:
     if not host:
         return False
     try:
-        host.encode("idna")             # rejects surrogates and empty labels
+        # Compare the ASCII form: the regex below is an ASCII rule, and
+        # "bücher.example" is a perfectly good host whose punycode passes it.
+        ascii_host = host.encode("idna").decode("ascii")
     except (UnicodeError, ValueError):
-        return False
+        ascii_host = host if host.isascii() else None
+        if ascii_host is None:
+            return False
     try:
         ipaddress.ip_address(host)      # a literal address is a fine host
         return True
     except ValueError:
         pass
     # A bare "." or "_" is syntactically an authority and addresses nothing.
-    return bool(_HOSTNAME.match(host))
+    return bool(_HOSTNAME.match(ascii_host))
 
 
 def _as_list(value) -> list:
@@ -183,12 +192,43 @@ def clean_text(value, fallback: str = "") -> str:
     a success; a lone surrogate does the same on the next save.
     """
     if isinstance(value, str):
-        # Providers relay text off the open web, which can carry unpaired
-        # surrogates; they would poison the job store on the next save.
-        return _LONE_SURROGATE.sub("\ufffd", value)
+        # Providers relay text off the open web: unpaired surrogates would
+        # poison the job store, and NUL or ESC would sit in a Markdown file
+        # as raw bytes and make it look binary to notes and indexing tools.
+        return _CONTROL.sub("", _LONE_SURROGATE.sub("\ufffd", value))
     if value is None or isinstance(value, (dict, list, tuple, set)):
         return fallback
     return str(value)
+
+
+def is_push_endpoint(url: str) -> bool:
+    """A push endpoint we are willing to have the server POST to.
+
+    Stricter than is_http_url on purpose: this address is supplied by a
+    client and then requested by the server, which is a server-side request
+    forgery primitive if it can be aimed inwards. HTTPS only (push services
+    are), no embedded credentials, and no address inside the machine or its
+    network. Names are resolved by the push library, not here, so a name that
+    resolves inward is not caught — the loopback and private *literals* are,
+    which is what an attacker reaches for first.
+    """
+    if not is_http_url(url):
+        return False
+    parsed = urlsplit(url)
+    if parsed.scheme.lower() != "https":
+        return False
+    if parsed.username or parsed.password:
+        return False
+    host = (parsed.hostname or "").lower()
+    if host in ("localhost",) or host.endswith(".localhost"):
+        return False
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return True                     # a name; the library resolves it
+    return not (address.is_private or address.is_loopback or address.is_reserved
+                or address.is_link_local or address.is_multicast
+                or address.is_unspecified)
 
 
 def scrapable(citations: list, max_sources: int) -> list:
@@ -724,7 +764,8 @@ def _claim_dir(base: Path, name: str, with_sources: bool) -> Path:
     raise PipelineError(f"could not find a free folder name for {name!r}")
 
 
-_CONTROL = re.compile(r"[\x00-\x1f\x7f]+")
+# Everything C0 except the three that carry meaning in a document.
+_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]+")
 
 
 def _one_line(text: str) -> str:
@@ -800,9 +841,9 @@ def write_report(
         body = (
             f'---\nsource: "{_yaml_escape(src.url)}"\n'
             f'title: "{_yaml_escape(src.title)}"\n'
-            f"retrieved: {date_str()}\n---\n\n{src.markdown.strip()}\n"
+            f"retrieved: {date_str()}\n---\n\n{clean_text(src.markdown).strip()}\n"
         )
-        (folder / "sources" / fname).write_text(scrub_surrogates(body),
+        (folder / "sources" / fname).write_text(clean_text(body),
                                                 encoding="utf-8")
         saved[src.url] = fname
 
@@ -818,7 +859,7 @@ def write_report(
     if job_id:
         lines.append(f"job: {job_id}")     # so a restart can find its own work
     lines += ["app: Footnote", "---", ""]
-    lines += [f"# {_one_line(question)}", "", result.content, ""]
+    lines += [f"# {_one_line(question)}", "", clean_text(result.content), ""]
 
     if result.citations:
         lines += ["## Sources", ""]
@@ -849,7 +890,7 @@ def write_report(
         lines += ["## Method note", "", _md_quote(result.reasoning), ""]
 
     report = folder / f"{slug}.md"
-    report.write_text(scrub_surrogates("\n".join(lines)), encoding="utf-8")
+    report.write_text(clean_text("\n".join(lines)), encoding="utf-8")
     return WrittenReport(path=report, source_files=saved)
 
 

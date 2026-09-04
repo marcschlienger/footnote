@@ -78,6 +78,11 @@ except ModuleNotFoundError:      # optional — app works without push
     webpush = None
     WebPushException = Exception
 
+try:                             # ships with pywebpush; validates public keys
+    from cryptography.hazmat.primitives.asymmetric import ec as _ec
+except ModuleNotFoundError:
+    _ec = None
+
 def _load_env() -> None:
     """Read .env if it is there and readable — and start either way.
 
@@ -88,7 +93,7 @@ def _load_env() -> None:
     """
     try:
         load_dotenv()
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
         print(f"could not read .env ({exc}); continuing with the environment",
               flush=True)
 
@@ -137,6 +142,9 @@ FIRECRAWL_CONCURRENCY = _int_env("FIRECRAWL_CONCURRENCY",
 MAX_JOBS_KEPT = 200
 MAX_CITATIONS_KEPT = 100     # per job, so jobs.json stays small
 PUSH_CONCURRENCY = 4         # devices notified at once
+PUSH_TIMEOUT_S = 15          # per device; the library's default is no limit
+MAX_SUBSCRIPTIONS = 50       # devices kept; a personal server has a handful
+MAX_ENDPOINT_CHARS = 2000
 
 # Optional API token, same contract as Margin's: unset → open server for
 # private-network use; set → everything but /health and the PWA shell assets
@@ -166,6 +174,7 @@ class JsonStore:
     def __init__(self, path: Path):
         self.path = path
         self.data: dict = {}
+        self.repaired: set = set()      # records cleaning had to change
         if not path.exists():
             return
         try:
@@ -177,8 +186,15 @@ class JsonStore:
             # what survives is cleaned here rather than field by field: an
             # escaped surrogate in the file comes back as a surrogate, and
             # would break the next response carrying it.
-            self.data = pipeline.clean_json(
-                {k: v for k, v in loaded.items() if isinstance(v, dict)})
+            records = {k: v for k, v in loaded.items() if isinstance(v, dict)}
+            self.data = pipeline.clean_json(records)
+            # Cleaning makes a record storable; it does not make it *valid*.
+            # Eight surrogates become eight replacement characters, which is
+            # a long enough question to pass every later check and be sent to
+            # Parallel again. Remember which records were altered so semantic
+            # validation can refuse them.
+            self.repaired = {key for key, value in records.items()
+                             if self.data.get(key) != value}
             dropped = len(loaded) - len(self.data)
             if dropped:
                 print(f"{path.name}: ignored {dropped} malformed record"
@@ -206,9 +222,12 @@ class JsonStore:
         # file writable but reloaded it as a surrogate, so the problem came
         # back on the next read. Cleaning here makes the file structurally
         # unable to hold something a later load could choke on.
+        # The cleaned structure becomes the store, not just the bytes: the
+        # invariant is about what is held in memory, and a copy that only the
+        # file gets is an invariant nobody can rely on.
+        self.data = pipeline.clean_json(self.data)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(pipeline.clean_json(self.data), fh,
-                      ensure_ascii=False, indent=1)
+            json.dump(self.data, fh, ensure_ascii=False, indent=1)
         os.replace(tmp, self.path)
 
 
@@ -294,7 +313,21 @@ def _normalize_jobs() -> None:
         if job.get("status") not in ACTIVE_STATUSES + _TERMINAL_STATUSES:
             job["status"] = "failed"
             changed = True
-        if job["status"] in ACTIVE_STATUSES and not _resumable(job):
+        if job_id in jobs.repaired and job["status"] in ACTIVE_STATUSES:
+            # It was not storable as written, so what is here now is a repair,
+            # not the question that was asked. Not something to spend on.
+            job.update(status="failed", finished_at=_now(),
+                       error="Job record was damaged; not resumed",
+                       progress="Failed: damaged job record")
+            changed = True
+        elif job.get("run_id") and not pipeline.valid_run_id(job["run_id"]):
+            # The run may exist and be paid for, but it cannot be fetched and
+            # starting over would pay for a second one.
+            job.update(status="failed", finished_at=_now(),
+                       error="Stored run id is unusable; not resumed",
+                       progress="Failed: unusable run id")
+            changed = True
+        elif job["status"] in ACTIVE_STATUSES and not _resumable(job):
             job.update(status="failed", finished_at=_now(),
                        error="Incomplete job record; cannot be resumed",
                        progress="Failed: incomplete job record")
@@ -326,9 +359,13 @@ _BASE64URL = re.compile(r"^[A-Za-z0-9_-]+={0,2}$")
 
 def _valid_subscription(sub) -> bool:
     """What _push_one needs to exist, and to be usable, before it tries."""
-    if not (isinstance(sub, dict)
-            and pipeline.is_http_url(sub.get("endpoint", ""))
-            and isinstance(sub.get("keys"), dict)):
+    if not isinstance(sub, dict):
+        return False
+    endpoint = sub.get("endpoint")
+    if (not isinstance(endpoint, str) or len(endpoint) > MAX_ENDPOINT_CHARS
+            or not pipeline.is_push_endpoint(endpoint)):
+        return False
+    if not isinstance(sub.get("keys"), dict):
         return False
     for name, size in _KEY_BYTES.items():
         value = sub["keys"].get(name)
@@ -341,9 +378,25 @@ def _valid_subscription(sub) -> bool:
             return False
         if len(decoded) != size:
             return False        # would fail on every notification, for ever
-        if name == "p256dh" and decoded[0] != 0x04:
-            return False        # an uncompressed P-256 point starts with 0x04
+        if name == "p256dh" and not _is_p256_point(decoded):
+            return False        # right length, right prefix, not on the curve
     return True
+
+
+def _is_p256_point(raw: bytes) -> bool:
+    """Whether these 65 bytes are actually a public key.
+
+    Length and the 0x04 prefix are necessary and not sufficient: a value that
+    is neither is accepted by every check we could make cheaply and then
+    rejected by the push library on every notification, for ever.
+    """
+    if _ec is None:                     # cryptography absent: keep the cheap test
+        return raw[:1] == b"\x04"
+    try:
+        _ec.EllipticCurvePublicKey.from_encoded_point(_ec.SECP256R1(), raw)
+        return True
+    except (ValueError, TypeError):
+        return False
 
 
 def _drop_unusable_subscriptions() -> None:
@@ -408,6 +461,9 @@ def _push_one(sub: dict, payload: dict) -> bool:
             data=json.dumps(payload),
             vapid_private_key=VAPID_PRIVATE_KEY,
             vapid_claims={"sub": f"mailto:{VAPID_CLAIM_EMAIL}"},
+            # Without this the library waits forever, and one unreachable
+            # device holds a slot against every other device's notification.
+            timeout=PUSH_TIMEOUT_S,
         )
         return True
     except WebPushException as exc:
@@ -942,7 +998,11 @@ async def _validation_error(request: Request, exc: RequestValidationError):
     out. ensure_ascii escapes it instead, and the body is written directly so
     nothing re-encodes it.
     """
-    body = json.dumps({"detail": exc.errors()}, ensure_ascii=True, default=str)
+    # Without the echoed input: it is unbounded, attacker-supplied, and the
+    # message already says which field was refused and why.
+    detail = [{k: v for k, v in error.items() if k not in ("input", "ctx")}
+              for error in exc.errors()]
+    body = json.dumps({"detail": detail}, ensure_ascii=True, default=str)
     return Response(body, media_type="application/json", status_code=422)
 
 
@@ -1253,6 +1313,10 @@ async def subscribe(req: SubscribeRequest):
         raise HTTPException(
             422, "a subscription needs an http(s) endpoint and string "
                  "p256dh and auth keys")   # mailto: is a link, not an endpoint
+    if (len(subs.data) >= MAX_SUBSCRIPTIONS
+            and uuid.uuid5(uuid.NAMESPACE_URL, req.endpoint).hex not in subs.data):
+        raise HTTPException(409, f"too many devices registered "
+                                 f"({MAX_SUBSCRIPTIONS} maximum)")
     key = uuid.uuid5(uuid.NAMESPACE_URL, req.endpoint).hex
     # Only the two fields push needs: a subscription is stored indefinitely,
     # and there is no reason to keep whatever else a client attached.

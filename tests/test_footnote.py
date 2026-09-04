@@ -749,8 +749,18 @@ def test_index_and_pwa_assets(client):
 # ---------------------------------------------------------------------------
 
 def _push_keys():
-    """Keys of the sizes the Push API actually hands over."""
-    return {"p256dh": base64.urlsafe_b64encode(b"\x04" + b"k" * 64).decode().rstrip("="),
+    """A real subscription's keys: an actual P-256 point and 16 random bytes.
+
+    Fabricated bytes of the right length are no longer enough — they are not
+    on the curve, and the push library would reject them on every send.
+    """
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    point = ec.generate_private_key(ec.SECP256R1()).public_key().public_bytes(
+        serialization.Encoding.X962,
+        serialization.PublicFormat.UncompressedPoint)
+    return {"p256dh": base64.urlsafe_b64encode(point).decode().rstrip("="),
             "auth": base64.urlsafe_b64encode(b"a" * 16).decode().rstrip("=")}
 
 
@@ -1060,6 +1070,132 @@ def test_normalization_validates_rather_than_stringifies(monkeypatch):
     app_module.jobs.data.clear()
 
 
+def test_a_repaired_record_is_not_a_valid_one(tmp_path, monkeypatch):
+    """Cleaning makes a record storable; it does not make it worth spending on."""
+    path = tmp_path / "jobs.json"
+    path.write_text(json.dumps({"abcdefabcdef": {
+        "id": "abcdefabcdef", "question": "\ud800" * 8, "processor": "core",
+        "status": "researching", "created_at": "2026-01-01T00:00:00Z",
+        "run_id": ""}}, ensure_ascii=True))
+    store = app_module.JsonStore(path)
+    assert store.repaired == {"abcdefabcdef"}
+
+    app_module.jobs.data.clear()
+    app_module.jobs.data.update(store.data)
+    monkeypatch.setattr(app_module.jobs, "repaired", store.repaired)
+    monkeypatch.setattr(app_module.jobs, "save", lambda: None)
+    app_module._normalize_jobs()
+    job = app_module.jobs.data["abcdefabcdef"]
+    assert job["status"] == "failed"          # not resubmitted to Parallel
+    assert "damaged" in job["error"]
+    app_module.jobs.data.clear()
+
+
+def test_an_unusable_stored_run_id_is_not_started_over(monkeypatch):
+    """The run may exist and be paid for; starting over would buy another."""
+    app_module.jobs.data.clear()
+    monkeypatch.setattr(app_module.jobs, "save", lambda: None)
+    app_module.jobs.data["abcdefabcdef"] = {
+        "id": "abcdefabcdef", "question": "a perfectly fine question",
+        "processor": "core", "status": "researching",
+        "created_at": "2026-01-01T00:00:00Z", "run_id": "not a run id"}
+    app_module._normalize_jobs()
+    assert app_module.jobs.data["abcdefabcdef"]["status"] == "failed"
+    assert pipeline.valid_run_id("trun_abc.123") and not pipeline.valid_run_id("a b")
+    app_module.jobs.data.clear()
+
+
+def test_a_push_endpoint_cannot_be_aimed_inwards():
+    """The server POSTs to this address; a client chooses it."""
+    for url in ("http://push.test/x",                  # not TLS
+                "http://127.0.0.1:8010/internal",      # this machine
+                "https://169.254.169.254/latest",      # cloud metadata
+                "https://10.0.0.5/x", "https://[::1]/x",
+                "https://user:pw@push.test/x",         # credentials
+                "https://localhost/x"):
+        assert not pipeline.is_push_endpoint(url), url
+        assert not app_module._valid_subscription(
+            {"endpoint": url, "keys": _push_keys()}), url
+    for url in ("https://push.test/x", "https://fcm.googleapis.com/fcm/send/abc",
+                "https://bücher.example/push"):
+        assert pipeline.is_push_endpoint(url), url
+
+
+def test_push_calls_are_bounded(client, monkeypatch):
+    """One unreachable device must not hold the others' notification."""
+    assert app_module.PUSH_TIMEOUT_S > 0
+    seen = {}
+
+    def record(**kwargs):
+        seen.update(kwargs)
+
+    monkeypatch.setattr(app_module, "webpush", record)
+    monkeypatch.setattr(app_module, "VAPID_PRIVATE_KEY", "priv")
+    monkeypatch.setattr(app_module, "VAPID_PUBLIC_KEY", "pub")
+    monkeypatch.setattr(app_module, "VAPID_CLAIM_EMAIL", "me@example.test")
+    app_module.subs.data["dev"] = {"endpoint": "https://push.test/x",
+                                   "keys": _push_keys()}
+    asyncio.run(app_module.notify_all("t", "b"))
+    assert seen["timeout"] == app_module.PUSH_TIMEOUT_S
+    app_module.subs.data.clear()
+
+
+def test_the_number_of_devices_is_bounded(client, monkeypatch):
+    monkeypatch.setattr(app_module, "VAPID_PUBLIC_KEY", "pub")
+    monkeypatch.setattr(app_module, "VAPID_PRIVATE_KEY", "priv")
+    monkeypatch.setattr(app_module, "VAPID_CLAIM_EMAIL", "me@example.test")
+    monkeypatch.setattr(app_module, "MAX_SUBSCRIPTIONS", 2)
+    monkeypatch.setattr(app_module.subs, "save", lambda: None)
+    app_module.subs.data.clear()
+    for n in range(2):
+        assert client.post("/subscribe", json={
+            "endpoint": f"https://push.test/{n}", "keys": _push_keys()
+        }).status_code == 200
+    assert client.post("/subscribe", json={
+        "endpoint": "https://push.test/3", "keys": _push_keys()}).status_code == 409
+    # An existing device re-registering is not a new one.
+    assert client.post("/subscribe", json={
+        "endpoint": "https://push.test/0", "keys": _push_keys()}).status_code == 200
+    assert client.post("/subscribe", json={
+        "endpoint": "x" * 3000, "keys": _push_keys()}).status_code == 422
+    app_module.subs.data.clear()
+
+
+def test_control_characters_do_not_reach_a_dossier(tmp_path):
+    """A Markdown file with NUL in it looks binary to everything downstream."""
+    result = ResearchResult("Body with \x00 NUL and \x1b ESC\nand a newline",
+                            [Citation("https://a.test/1", "T\x00itle")], "", "")
+    written = pipeline.write_report(
+        tmp_path, "Control question here", "core", result,
+        [SourceCopy("https://a.test/1", "T\x00", "body\x00here", True)])
+    for path in [written.path, *(written.path.parent / "sources").glob("*.md")]:
+        raw = path.read_bytes()
+        assert b"\x00" not in raw and bytes([27]) not in raw, path.name
+        assert b"and a newline" in written.path.read_bytes()   # \n survives
+
+
+def test_a_unicode_domain_is_not_rejected():
+    assert pipeline.is_http_url("https://bücher.example/")
+    assert pipeline.is_http_url("https://xn--bcher-kva.example/")
+    assert not pipeline.is_http_url("https://-bad.example/")
+
+
+def test_a_validation_error_does_not_echo_the_request(client, monkeypatch):
+    monkeypatch.setattr(app_module, "PARALLEL_API_KEY", "k")
+    huge = "x" * 20000
+    resp = client.post("/research", json={"question": huge})
+    assert resp.status_code == 422
+    assert huge not in resp.text
+    assert len(resp.content) < 1000          # not proportional to the request
+
+
+def test_the_env_parser_handles_systemd_quoting():
+    add = (Path(__file__).resolve().parent.parent
+           / "deploy" / "add-instance.sh").read_text()
+    assert "read_env_path" in add
+    assert '/*) printf' in add               # only absolute paths are accepted
+
+
 def test_provider_error_text_is_scrubbed_too(monkeypatch, tmp_path):
     """An error string reaches the dossier and the store, like any other."""
     monkeypatch.setattr(pipeline, "BASE_BACKOFF_S", 0.01)
@@ -1119,20 +1255,20 @@ def test_a_mailto_citation_stays_linked_in_the_index(client, tmp_path):
     assert sources[1]["url"] == ""           # would resolve against us
 
 
-def test_push_keys_must_look_like_keys():
+def test_push_keys_must_be_keys_not_just_bytes():
     def encoded(raw):
         return base64.urlsafe_b64encode(raw).decode().rstrip("=")
 
-    auth = encoded(b"a" * 16)
+    real = _push_keys()
     assert app_module._valid_subscription(
-        {"endpoint": "https://push.test/x",
-         "keys": {"p256dh": encoded(b"\x04" + b"k" * 64), "auth": auth}})
-    for p256dh in (encoded(b"\x00" * 65),          # not a point at all
-                   encoded(b"\x02" + b"k" * 64),   # compressed, not what is sent
-                   encoded(b"\x04" + b"k" * 64) + "!!"):
+        {"endpoint": "https://push.test/x", "keys": real})
+    for p256dh in (encoded(b"\x00" * 65),            # not a point at all
+                   encoded(b"\x02" + b"k" * 64),     # compressed, not what is sent
+                   encoded(b"\x04" + b"\xff" * 64),  # right shape, off the curve
+                   real["p256dh"] + "!!"):           # trailing rubbish
         assert not app_module._valid_subscription(
             {"endpoint": "https://push.test/x",
-             "keys": {"p256dh": p256dh, "auth": auth}})
+             "keys": {"p256dh": p256dh, "auth": real["auth"]}}), p256dh[:12]
 
 
 def test_only_the_two_push_keys_are_stored(client, monkeypatch):

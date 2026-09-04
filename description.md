@@ -159,12 +159,14 @@ are enumerated, and each has one rule.
 | Parallel: create-run, result, error bodies | `clean_text` on every scalar, `_as_list` on every collection; a wrong-shaped body is retried, not crashed on |
 | Firecrawl: markdown, title, **error** | same; the error path matters as much as the success path, since both reach the dossier |
 | Notion: response | checked as an object, URL through `clean_text` and `is_http_url` before it is stored |
-| HTTP request bodies | validated by type and content (`_question_problem`, `_valid_subscription`); a 422 is rendered with `ensure_ascii`, because the default handler echoes the input that could not be encoded |
+| HTTP request bodies | validated by type and content (`_question_problem`, `_valid_subscription`); a 422 is rendered with `ensure_ascii` and **without** the echoed input, which is unbounded and attacker-supplied |
+| Push endpoints | a policy of their own (`is_push_endpoint`), because the server requests this address on a client's say-so: HTTPS, no credentials, and no loopback, private, link-local or reserved literal. A *name* that resolves inward is not caught here — the library resolves it — which is the residual risk |
 | Query and path parameters | `limit` is a bounded int; a source name is matched against the files on disk; the token is compared as **bytes**, since `compare_digest` raises `TypeError` on a non-ASCII string |
-| `jobs.json`, `subscriptions.json` | `clean_json` on load *and* on save; not valid UTF-8, not JSON, or not an object of records → quarantined under a fresh name |
-| Dossier files (report, sources) | read with `errors="replace"`; frontmatter values through `clean_text` |
+| `jobs.json`, `subscriptions.json` | `clean_json` on load *and* on save; not valid UTF-8, not JSON, or not an object of records → quarantined under a fresh name. **Cleaning is recorded, not just done**: a record it had to change is not a valid record, and an active one is failed rather than resumed — eight surrogates become eight replacement characters, which would otherwise pass every later check and be sent to Parallel again |
+| Dossier files (report, sources) | read with `errors="replace"`; frontmatter values through `clean_text`. Written through it too: `clean_text` drops C0 controls apart from tab, newline and return, so a provider's NUL cannot make a Markdown file look binary to a notes app |
 | Filenames written | `slug_for` budgets UTF-8 **bytes**, and every file is written through `scrub_surrogates` |
 | Environment | integers validated with a minimum, `DEFAULT_PROCESSOR` against the real list, both at startup |
+| systemd env files (deploy) | quoting handled and only absolute paths accepted, rather than sourcing a root-owned file or stripping a literal prefix |
 
 Two helpers carry all of it. `clean_text` is the ingress rule: not a string
 becomes the fallback or its `str()`, and anything UTF-8 cannot represent is
@@ -522,6 +524,12 @@ optionally hardened one notch.
   on a reachable instance and spend the Parallel key, which with
   `FOOTNOTE_TOKEN` unset is the default install. `FOOTNOTE_CORS_ORIGINS`
   names origins explicitly when a browser client of your own needs one.
+- Push endpoints are subject to `is_push_endpoint`, not the general link
+  policy: a subscription names an address the *server* then POSTs to, so
+  accepting `http://127.0.0.1:8010/internal` made blind server-side request
+  forgery a feature of registering a device. Calls carry a timeout, keys are
+  verified as actual P-256 points rather than 65 bytes beginning 0x04, and
+  both the number of devices and the endpoint length are bounded.
 - Push is isolated from job outcome: `notify_all` swallows everything, since
   it is called from inside `run_research`'s `try` and a malformed
   subscription would otherwise rewrite a finished job as failed. Devices are
