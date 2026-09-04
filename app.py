@@ -146,10 +146,16 @@ subs = JsonStore(DATA_DIR / "subscriptions.json")
 
 
 def _trim_jobs() -> None:
-    if len(jobs.data) <= MAX_JOBS_KEPT:
-        return
+    """Evict the oldest finished jobs until the store is back under the cap.
+
+    Walks the whole history rather than only the oldest `excess` entries: a
+    running job among the oldest is skipped, and the next finished one has to
+    take its place or the cap is not a cap.
+    """
     by_age = sorted(jobs.data.items(), key=lambda kv: kv[1].get("created_at", ""))
-    for job_id, job in by_age[: len(jobs.data) - MAX_JOBS_KEPT]:
+    for job_id, job in by_age:
+        if len(jobs.data) <= MAX_JOBS_KEPT:
+            return
         if job.get("status") not in ACTIVE_STATUSES:
             del jobs.data[job_id]
 
@@ -179,10 +185,29 @@ def _push_one(sub: dict, payload: dict) -> bool:
     except WebPushException as exc:
         code = getattr(getattr(exc, "response", None), "status_code", 0)
         return code not in (404, 410)   # gone → forget this device
+    except Exception as exc:            # noqa: BLE001
+        # /subscribe accepts whatever keys a browser sent, so a malformed
+        # subscription surfaces here rather than as a WebPushException. Keep
+        # it: the device is not provably gone, and a notification is never
+        # worth failing over.
+        print(f"push to {sub.get('endpoint', '?')[:60]} failed: {exc}", flush=True)
+        return True
 
 
 async def notify_all(title: str, body: str, url: str = "/") -> None:
-    """Send a notification to every registered device (best-effort)."""
+    """Send a notification to every registered device.
+
+    Best-effort to the last: this is called from inside run_research's try,
+    so anything escaping here would rewrite a finished job as failed. Nothing
+    escapes.
+    """
+    try:
+        await _notify_all(title, body, url)
+    except Exception as exc:            # noqa: BLE001
+        print(f"notification failed: {exc}", flush=True)
+
+
+async def _notify_all(title: str, body: str, url: str) -> None:
     if webpush is None or not (VAPID_PRIVATE_KEY and VAPID_PUBLIC_KEY):
         return
     payload = {"title": title, "body": body, "url": url,
@@ -234,9 +259,7 @@ async def run_research(job_id: str) -> None:
 
             sources = await pipeline.scrape_sources(
                 client, FIRECRAWL_API_KEY, result.citations, MAX_SOURCES,
-                concurrency=FIRECRAWL_CONCURRENCY,
-                rate_limit=FIRECRAWL_RATE_LIMIT,
-                on_progress=archived_so_far)
+                app.state.limiter, on_progress=archived_so_far)
 
         # 3. Write the dossier into the synced folder
         _update_job(job_id, status="saving", progress="Writing report…")
@@ -308,6 +331,19 @@ def _scrub(text) -> str:
                         (str(Path.home()), "~")):
         out = out.replace(path, label)
     return out
+
+
+def _output_dir_writable() -> bool:
+    """Whether a dossier folder could be created, asked of the right directory.
+
+    Once OUTPUT_DIR exists it is the only directory that matters — a writable
+    parent says nothing about a read-only folder inside it. Before it exists,
+    the nearest ancestor that does is what mkdir will have to write into.
+    """
+    target = OUTPUT_DIR
+    while not target.exists() and target.parent != target:
+        target = target.parent
+    return os.access(target, os.W_OK | os.X_OK)
 
 
 def _now() -> str:
@@ -432,6 +468,10 @@ def _attachment(filename: str) -> dict:
 async def lifespan(application: FastAPI):
     application.state.client = httpx.AsyncClient(
         timeout=httpx.Timeout(60.0, connect=15.0), follow_redirects=True)
+    # One limiter for the whole process: Firecrawl counts requests per key,
+    # and a restart can resume several jobs at once.
+    application.state.limiter = pipeline.ScrapeLimiter(
+        rate_limit=FIRECRAWL_RATE_LIMIT, concurrency=FIRECRAWL_CONCURRENCY)
     # Jobs interrupted by a restart: the Parallel run survives server-side,
     # so re-attach by run_id; jobs that never got a run_id start over.
     application.state.tasks = set()
@@ -448,12 +488,21 @@ async def lifespan(application: FastAPI):
 
 app = FastAPI(title="Footnote", version="1.0.0", lifespan=lifespan)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# The PWA is served from this origin, and the Shortcut and curl are not
+# browsers, so nothing Footnote ships needs CORS. A wildcard here would let
+# any page you happen to be visiting start research on a reachable instance
+# and spend your Parallel credits — and with FOOTNOTE_TOKEN unset, that is
+# the default install. Opt in explicitly if you write a browser client of
+# your own: FOOTNOTE_CORS_ORIGINS=https://one.example,https://two.example
+CORS_ORIGINS = [o.strip() for o in os.getenv("FOOTNOTE_CORS_ORIGINS", "").split(",")
+                if o.strip()]
+if CORS_ORIGINS:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=CORS_ORIGINS,
+        allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type"],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -788,8 +837,7 @@ async def health():
         "app": "Footnote",
         # Where the dossiers are filed is the server's business — clients get
         # told whether the folder works, not where it is.
-        "output_dir_writable": os.access(OUTPUT_DIR.parent, os.W_OK)
-                               or os.access(OUTPUT_DIR, os.W_OK),
+        "output_dir_writable": _output_dir_writable(),
         "parallel_configured": bool(PARALLEL_API_KEY),
         "firecrawl_configured": bool(FIRECRAWL_API_KEY),
         "notion_configured": bool(NOTION_API_KEY and NOTION_DATABASE_ID),

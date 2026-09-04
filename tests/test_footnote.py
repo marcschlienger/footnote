@@ -136,7 +136,7 @@ def test_scrape_sources_mixed_success():
             return await pipeline.scrape_sources(
                 client, "k",
                 [Citation("https://ok.test/a"), Citation("https://bad.test/b")],
-                max_sources=10)
+                max_sources=10, limiter=pipeline.ScrapeLimiter(rate_limit=0))
 
     ok, bad = asyncio.run(run())
     assert ok.ok and ok.title == "Good page" and ok.markdown == "# Hi"
@@ -157,7 +157,7 @@ def test_scrape_sources_respects_cap():
                 transport=httpx.MockTransport(handler)) as client:
             return await pipeline.scrape_sources(
                 client, "k", [Citation(f"https://s.test/{i}") for i in range(9)],
-                max_sources=3)
+                max_sources=3, limiter=pipeline.ScrapeLimiter(rate_limit=0))
 
     assert len(asyncio.run(run())) == 3 and len(seen) == 3
 
@@ -172,13 +172,16 @@ def _ok_scrape(_request):
                                               "metadata": {"title": "T"}}})
 
 
-def _run_scrape(handler, count, **kw):
+def _run_scrape(handler, count, concurrency=2, rate_limit=0, **kw):
     async def run():
+        # The limiter binds a semaphore to the loop, so build it inside one.
+        limiter = pipeline.ScrapeLimiter(rate_limit=rate_limit,
+                                         concurrency=concurrency)
         async with httpx.AsyncClient(
                 transport=httpx.MockTransport(handler)) as client:
             return await pipeline.scrape_sources(
                 client, "k", [Citation(f"https://s.test/{i}") for i in range(count)],
-                max_sources=count, **kw)
+                max_sources=count, limiter=limiter, **kw)
 
     return asyncio.run(run())
 
@@ -303,6 +306,53 @@ def test_scrape_reports_progress_as_copies_land():
     assert seen == [(1, 3), (2, 3), (3, 3)]
 
 
+def test_a_non_json_error_body_cannot_fail_the_job(monkeypatch):
+    """An HTML 502 from a proxy is a failed source, never an exception."""
+    monkeypatch.setattr(pipeline, "BASE_BACKOFF_S", 0.01)   # 502 is retryable
+    copies = _run_scrape(
+        lambda r: httpx.Response(502, text="<html>bad gateway</html>"), 1)
+    assert len(copies) == 1 and not copies[0].ok
+    assert "502" in copies[0].error
+
+
+def test_one_limiter_holds_every_job_on_the_key():
+    """Firecrawl counts per key, so two jobs must share one budget."""
+    live = {"now": 0, "peak": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        live["now"] += 1
+        live["peak"] = max(live["peak"], live["now"])
+        await asyncio.sleep(0.02)
+        live["now"] -= 1
+        return _ok_scrape(request)
+
+    async def run():
+        limiter = pipeline.ScrapeLimiter(rate_limit=0, concurrency=2)
+        cits = [Citation(f"https://s.test/{i}") for i in range(6)]
+        async with httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)) as client:
+            await asyncio.gather(
+                pipeline.scrape_sources(client, "k", cits, 6, limiter),
+                pipeline.scrape_sources(client, "k", cits, 6, limiter))
+
+    asyncio.run(run())
+    assert live["peak"] == 2       # not 4, which is what a per-job limiter gave
+
+
+def test_exhausted_credits_spend_at_most_the_requests_in_flight():
+    """Concurrent workers can both be mid-request when the first 402 lands."""
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        await asyncio.sleep(0.02)          # a real server is not instant
+        return httpx.Response(402, json={"success": False, "error": "no credits"})
+
+    copies = _run_scrape(handler, 8, concurrency=2)
+    assert all(c.error == pipeline.OUT_OF_CREDITS for c in copies)
+    assert calls["n"] <= 2                 # bounded by concurrency, not by 8
+
+
 def test_free_plan_defaults_match_the_published_limits():
     assert pipeline.FREE_RATE_LIMIT == 10 and pipeline.FREE_CONCURRENCY == 2
     assert app_module.FIRECRAWL_RATE_LIMIT == 10
@@ -350,6 +400,52 @@ def test_write_report_unique_folder(tmp_path):
     r2 = pipeline.write_report(tmp_path, "Same question here", "core",
                                _sample_result(), []).path
     assert r1.parent != r2.parent and r2.parent.name.endswith("(2)")
+
+
+def test_source_files_are_numbered_by_citation_not_by_success(tmp_path):
+    """Citation 1 failing must not make citation 2 into "01"."""
+    result = ResearchResult(
+        content="b",
+        citations=[Citation("https://a.test/1", "First"),
+                   Citation("https://b.test/2", "Second")],
+        confidence="", reasoning="")
+    written = pipeline.write_report(
+        tmp_path, "Numbering question", "core", result,
+        [SourceCopy("https://a.test/1", "First", "", False, "blocked"),
+         SourceCopy("https://b.test/2", "Second", "# ok", True)])
+
+    assert written.source_files == {"https://b.test/2": "02 Second.md"}
+    assert "[local copy](<sources/02 Second.md>)" in written.path.read_text()
+
+
+def test_dossier_folders_are_claimed_not_guessed(tmp_path):
+    """Same question twice must never hand two writers the same folder."""
+    made = [pipeline._claim_dir(tmp_path, "same name", False) for _ in range(3)]
+    assert len({d for d in made}) == 3 and all(d.is_dir() for d in made)
+    assert [d.name for d in made] == ["same name", "same name (2)",
+                                      "same name (3)"]
+
+
+def test_a_multiline_question_still_yields_valid_frontmatter(tmp_path):
+    written = pipeline.write_report(
+        tmp_path, "Line one\nLine two: is it valid?", "core",
+        _sample_result(), [])
+    meta, body = pipeline.split_front_matter(written.path.read_text())
+    assert meta["question"] == "Line one Line two: is it valid?"
+    assert meta["processor"] == "core"          # later keys survived intact
+    assert body.startswith("# Line one Line two")
+
+
+def test_markdown_metacharacters_in_a_title_do_not_break_the_link(tmp_path):
+    result = ResearchResult(
+        content="b",
+        citations=[Citation("https://a.test/x(1)", "A [bracketed] title"),
+                   Citation("https://b.test/two words", "Spaced")],
+        confidence="", reasoning="")
+    text = pipeline.write_report(
+        tmp_path, "Metachar question", "core", result, []).path.read_text()
+    assert r"1. [A \[bracketed\] title](<https://a.test/x(1)>)" in text
+    assert "2. [Spaced](<https://b.test/two words>)" in text
 
 
 # ---------------------------------------------------------------------------
@@ -609,6 +705,57 @@ def test_index_and_pwa_assets(client):
     sw = client.get("/service-worker.js")
     assert sw.status_code == 200
     assert "javascript" in sw.headers["content-type"]
+
+
+# ---------------------------------------------------------------------------
+# Failure modes that must not touch a finished job
+# ---------------------------------------------------------------------------
+
+def test_a_broken_subscription_cannot_fail_a_finished_job(monkeypatch):
+    """Push is best-effort; notify_all is called from inside run_research."""
+    def explode(**kwargs):
+        raise ValueError("malformed subscription keys")
+
+    monkeypatch.setattr(app_module, "webpush", explode)
+    monkeypatch.setattr(app_module, "VAPID_PRIVATE_KEY", "priv")
+    monkeypatch.setattr(app_module, "VAPID_PUBLIC_KEY", "pub")
+    app_module.subs.data["dev"] = {"endpoint": "https://push.test/x", "keys": {}}
+    try:
+        asyncio.run(app_module.notify_all("title", "body"))   # must not raise
+        assert "dev" in app_module.subs.data     # not provably gone, so kept
+    finally:
+        app_module.subs.data.clear()
+
+
+def test_history_cap_holds_when_the_oldest_jobs_are_running(client):
+    for i in range(app_module.MAX_JOBS_KEPT + 5):
+        app_module.jobs.data[f"j{i:04d}"] = {
+            "id": f"j{i:04d}", "question": "q",
+            "status": "researching" if i < 5 else "done",
+            "created_at": f"2026-01-01T00:{i:02d}:00Z"}
+    app_module._trim_jobs()
+    assert len(app_module.jobs.data) == app_module.MAX_JOBS_KEPT
+    assert all(f"j{i:04d}" in app_module.jobs.data for i in range(5))  # kept
+
+
+def test_health_asks_the_output_directory_itself(client, tmp_path, monkeypatch):
+    locked = tmp_path / "readonly"
+    locked.mkdir()
+    locked.chmod(0o500)                     # exists, writable parent, not writable
+    monkeypatch.setattr(app_module, "OUTPUT_DIR", locked)
+    try:
+        assert client.get("/health").json()["output_dir_writable"] is False
+    finally:
+        locked.chmod(0o700)
+
+    monkeypatch.setattr(app_module, "OUTPUT_DIR", tmp_path / "not" / "made" / "yet")
+    assert client.get("/health").json()["output_dir_writable"] is True
+
+
+def test_no_cross_origin_access_by_default():
+    """A wildcard here would let any page spend the Parallel key."""
+    assert app_module.CORS_ORIGINS == []
+    assert not [m for m in app_module.app.user_middleware if "CORS" in str(m)]
 
 
 # ---------------------------------------------------------------------------

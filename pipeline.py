@@ -234,6 +234,25 @@ MAX_BACKOFF_S = 120.0
 OUT_OF_CREDITS = "Firecrawl credits exhausted (HTTP 402)"
 
 
+class ScrapeLimiter:
+    """One API key's budget, shared by every job that spends it.
+
+    Firecrawl counts requests per key, so a limiter built per job is no limit
+    at all: two jobs archiving at once would double both the request rate and
+    the browsers in flight. The app builds exactly one of these and hands it
+    to every scrape.
+
+    Built inside the running loop — asyncio.Semaphore binds to the loop it is
+    created on for Python < 3.10.
+    """
+
+    def __init__(self, rate_limit: int = FREE_RATE_LIMIT,
+                 concurrency: int = FREE_CONCURRENCY):
+        self.pacer = _Pacer(rate_limit)
+        self.sem = asyncio.Semaphore(max(1, concurrency))
+        self.concurrency = max(1, concurrency)
+
+
 class _Pacer:
     """Holds request starts inside a fixed per-minute budget.
 
@@ -283,32 +302,37 @@ async def scrape_sources(
     api_key: str,
     citations: list[Citation],
     max_sources: int,
-    concurrency: int = FREE_CONCURRENCY,
-    rate_limit: int = FREE_RATE_LIMIT,
+    limiter: ScrapeLimiter,
     on_progress=None,
 ) -> list[SourceCopy]:
     """Fetch local Markdown copies of the cited pages (best-effort).
 
-    Paced and retried to survive a free-plan key: requests are kept inside
-    `rate_limit` per minute and `concurrency` in flight, a rate-limited or
-    transient failure is retried honouring Retry-After, and the first 402
-    stops the batch — once the credits are gone every further request would
-    fail identically, and the dossier says so once instead of N times.
+    Paced and retried to survive a free-plan key: `limiter` holds the whole
+    key inside its request rate and browser count, a rate-limited or transient
+    failure is retried honouring Retry-After, and the first 402 stops the
+    batch — once the credits are gone every further request would fail
+    identically, and the dossier says so once instead of N times. Requests
+    already in flight when that 402 lands still complete, so up to
+    `limiter.concurrency` are spent, not one.
+
+    Archiving is best-effort and can never fail the job: every path out of
+    here is a SourceCopy, including the ones that had no business happening.
 
     `on_progress(done, total)` is called as copies land; archiving is slow
     enough under pacing to be worth reporting.
     """
     todo = citations[:max_sources]
-    sem = asyncio.Semaphore(max(1, concurrency))
-    pacer = _Pacer(rate_limit)
     state = {"out_of_credits": False, "done": 0}
 
     async def one(cit: Citation) -> SourceCopy:
-        async with sem:
-            if state["out_of_credits"]:
-                copy = SourceCopy(cit.url, cit.title, "", False, OUT_OF_CREDITS)
-            else:
-                copy = await _scrape_one(client, api_key, cit, pacer, state)
+        try:
+            async with limiter.sem:
+                if state["out_of_credits"]:
+                    copy = SourceCopy(cit.url, cit.title, "", False, OUT_OF_CREDITS)
+                else:
+                    copy = await _scrape_one(client, api_key, cit, limiter, state)
+        except Exception as exc:                           # noqa: BLE001
+            copy = SourceCopy(cit.url, cit.title, "", False, str(exc)[:200])
         state["done"] += 1
         if on_progress:
             on_progress(state["done"], len(todo))
@@ -321,13 +345,17 @@ async def _scrape_one(
     client: httpx.AsyncClient,
     api_key: str,
     cit: Citation,
-    pacer: _Pacer,
+    limiter: ScrapeLimiter,
     state: dict,
 ) -> SourceCopy:
     backoff = BASE_BACKOFF_S
     error = "no attempt made"
     for attempt in range(1, MAX_ATTEMPTS + 1):
-        await pacer.take()
+        await limiter.pacer.take()
+        # Waiting for a slot can take a minute; the credits may have run out
+        # while this request sat in the queue.
+        if state["out_of_credits"]:
+            return SourceCopy(cit.url, cit.title, "", False, OUT_OF_CREDITS)
         try:
             resp = await client.post(
                 f"{FIRECRAWL_BASE}/scrape",
@@ -352,7 +380,10 @@ async def _scrape_one(
             state["out_of_credits"] = True
             return SourceCopy(cit.url, cit.title, "", False, OUT_OF_CREDITS)
 
-        data = resp.json() if resp.content else {}
+        try:
+            data = resp.json() if resp.content else {}
+        except ValueError:      # an HTML 502 from a proxy, say — not our JSON
+            data = {}
         if resp.status_code == 200 and data.get("success", False):
             page = data.get("data") or {}
             md = page.get("markdown") or ""
@@ -387,13 +418,42 @@ def slug_for(question: str, max_len: int = 64) -> str:
     return text.strip(" .") or "research"
 
 
-def _unique_dir(base: Path, name: str) -> Path:
-    candidate = base / name
-    n = 2
-    while candidate.exists():
-        candidate = base / f"{name} ({n})"
-        n += 1
-    return candidate
+def _claim_dir(base: Path, name: str, with_sources: bool) -> Path:
+    """Create the dossier folder, taking the first name nobody else holds.
+
+    mkdir is the claim: testing existence first and creating after leaves a
+    window where two jobs finishing the same question pick the same name, and
+    the loser's paid research dies on FileExistsError.
+    """
+    for n in range(1, 1000):
+        candidate = base / (name if n == 1 else f"{name} ({n})")
+        try:
+            candidate.mkdir(parents=True)
+        except FileExistsError:
+            continue
+        if with_sources:
+            (candidate / "sources").mkdir()
+        return candidate
+    raise PipelineError(f"could not find a free folder name for {name!r}")
+
+
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]+")
+
+
+def _one_line(text: str) -> str:
+    """Collapse anything that would break a single-line field."""
+    return " ".join(str(text).split())
+
+
+def _md_label(text: str) -> str:
+    """Link text: brackets and backslashes would end the label early."""
+    return re.sub(r"([\\\[\]])", r"\\\1", _one_line(text))
+
+
+def _md_url(url: str) -> str:
+    """Link destination, in the angle-bracket form when it needs one."""
+    cleaned = _CONTROL.sub("", str(url)).replace("<", "").replace(">", "")
+    return f"<{cleaned}>" if any(c in cleaned for c in " ()") else cleaned
 
 
 def write_report(
@@ -414,13 +474,16 @@ def write_report(
             └── …
     """
     slug = slug_for(question)
-    folder = _unique_dir(output_dir, f"{date_str()} {slug}")
-    (folder / "sources").mkdir(parents=True) if sources else folder.mkdir(parents=True)
+    folder = _claim_dir(output_dir, f"{date_str()} {slug}", bool(sources))
 
+    # Number copies by their citation, not by how many scrapes happened to
+    # succeed: "01" must be the first cited source, so the evidence in the
+    # folder and the numbered list in the report refer to the same thing.
+    numbers = {cit.url: i for i, cit in enumerate(result.citations, start=1)}
     saved: dict = {}                      # source URL → file name in sources/
-    for i, src in enumerate((s for s in sources if s.ok), start=1):
+    for fallback, src in enumerate((s for s in sources if s.ok), start=1):
         stitle = slug_for(src.title or src.url, 60)
-        fname = f"{i:02d} {stitle}.md"
+        fname = f"{numbers.get(src.url, fallback):02d} {stitle}.md"
         body = (
             f"---\nsource: {src.url}\ntitle: \"{_yaml_escape(src.title)}\"\n"
             f"retrieved: {date_str()}\n---\n\n{src.markdown.strip()}\n"
@@ -437,13 +500,13 @@ def write_report(
     if result.confidence:
         lines.append(f"confidence: {result.confidence}")
     lines += [f"sources: {len(result.citations)}", "app: Footnote", "---", ""]
-    lines += [f"# {question}", "", result.content, ""]
+    lines += [f"# {_one_line(question)}", "", result.content, ""]
 
     if result.citations:
         lines += ["## Sources", ""]
         for i, cit in enumerate(result.citations, start=1):
             label = cit.title or cit.url
-            entry = f"{i}. [{label}]({cit.url})"
+            entry = f"{i}. [{_md_label(label)}]({_md_url(cit.url)})"
             if cit.url in saved:
                 entry += f" — [local copy](<sources/{saved[cit.url]}>)"
             lines.append(entry)
@@ -455,7 +518,7 @@ def write_report(
     failed = [s for s in sources if not s.ok]
     if failed:
         lines += ["## Sources that could not be archived", ""]
-        lines += [f"- {s.url} — {s.error}" for s in failed]
+        lines += [f"- {_md_url(s.url)} — {_one_line(s.error)}" for s in failed]
         lines.append("")
 
     if result.reasoning:
@@ -495,7 +558,12 @@ def date_str() -> str:
 
 
 def _yaml_escape(text: str) -> str:
-    return text.replace("\\", "\\\\").replace('"', '\\"')
+    """Escape for a double-quoted YAML scalar, which is one line by definition.
+
+    A question typed into a textarea can contain newlines; left in, they end
+    the scalar and turn the rest of the question into bogus YAML keys.
+    """
+    return (_one_line(text).replace("\\", "\\\\").replace('"', '\\"'))
 
 
 # ---------------------------------------------------------------------------

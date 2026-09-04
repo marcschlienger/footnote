@@ -280,6 +280,9 @@ deprivation and in vegetarians; effects in rested omnivores are weak.**
 
 Details worth knowing:
 
+- **Archived copies carry their citation's number** — `02 …md` is the second
+  cited source whether or not the first one could be archived, so the folder
+  and the report's numbered list never disagree.
 - **Source order is basis order** — numbering follows the citation basis
   Parallel returned, deduplicated, so `[1]`-style markers in the body line
   up with the list.
@@ -308,6 +311,7 @@ Details worth knowing:
 | Sources archived per dossier | `MAX_SOURCES` | `12` |
 | Firecrawl requests per minute | `FIRECRAWL_RATE_LIMIT` (`0` disables pacing) | `10` — the free plan's limit |
 | Firecrawl requests in flight | `FIRECRAWL_CONCURRENCY` | `2` — the free plan's limit |
+| Cross-origin browser clients | `FOOTNOTE_CORS_ORIGINS` (comma-separated) | none — the PWA is same-origin |
 | API token | `FOOTNOTE_TOKEN` | unset — no authentication |
 | Push keys | `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `VAPID_CLAIM_EMAIL` | unset — push disabled |
 | Notion mirror | `NOTION_API_KEY`, `NOTION_DATABASE_ID` | unset — mirror disabled |
@@ -503,9 +507,11 @@ Tailscale, WireGuard) and/or use the per-instance `FOOTNOTE_TOKEN`.
   than a few seconds, and the job's progress counts the copies as they land.
   Rate-limited and transient failures are retried, honouring `Retry-After`;
   a bot wall or paywall is recorded as final without a retry. If credits run
-  out the batch stops on the first `402` instead of spending the rest of the
-  job on requests that cannot succeed, and the dossier and the job summary
-  both say so. On a paid plan, raise `FIRECRAWL_RATE_LIMIT` and
+  out, the batch stops on the first `402` instead of spending the rest of the
+  job on requests that cannot succeed (the two already in flight still
+  finish), and the dossier and the job summary both say so. The budget is
+  shared by the whole server, not per job, because Firecrawl counts requests
+  per key. On a paid plan, raise `FIRECRAWL_RATE_LIMIT` and
   `FIRECRAWL_CONCURRENCY`.
 - Authentication is optional and coarse — one shared token per instance, no
   rate limiting. Keep the server on a private network regardless.

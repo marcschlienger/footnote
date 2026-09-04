@@ -178,12 +178,22 @@ limit of 0 turns pacing off). `_Pacer` admits a request only once the oldest
 start in the 60-second window has aged out, holding its lock across the
 sleep so waiters take turns instead of waking together and bursting.
 
+The budget belongs to **the API key, not the job**: the app builds one
+`ScrapeLimiter` in `lifespan` and every scrape shares it. A limiter per job
+would be no limiter at all — two jobs archiving at once would double both
+numbers, and a restart resumes every unfinished job simultaneously.
+
+Archiving cannot fail a dossier, and that is enforced rather than intended:
+every path out of `scrape_sources` produces a `SourceCopy`, including a
+response body that is not JSON at all (an HTML 502 from a proxy) and any
+exception a worker manages to raise.
+
 Failures are then sorted by whether asking again could help:
 
 | response | what Footnote does |
 |---|---|
 | 408, 429, 500, 502, 503, 504 | retry, up to `MAX_ATTEMPTS`, honouring `Retry-After` when the server sends it and otherwise backing off exponentially with jitter (capped at `MAX_BACKOFF_S`) |
-| 402 | stop the batch. Credits are gone and pay-as-you-go is unavailable on the free plan, so every further request would fail identically; the remaining sources are marked with the same reason and the job summary says so once |
+| 402 | stop the batch. Credits are gone and pay-as-you-go is unavailable on the free plan, so every further request would fail identically; the remaining sources are marked with the same reason and the job summary says so once. Requests already in flight when it lands still finish, so up to `concurrency` are spent — not one |
 | anything else (403 bot wall, paywall, empty extraction) | final — record the reason and move on |
 
 Under the free-plan defaults a 12-source dossier archives in about a minute
@@ -219,17 +229,27 @@ point:
   no hyphen-mangling — the filename should read like the question, because
   in Obsidian the filename *is* the title.
 - **Folders** are `YYYY-MM-DD slug`; existing names get ` (2)`, ` (3)` …
-  Nothing is ever overwritten.
+  Nothing is ever overwritten. The name is claimed with `mkdir` rather than
+  chosen after an existence check, so two jobs finishing the same question at
+  the same moment get two folders instead of one `FileExistsError` on top of
+  research already paid for.
 - **Source copies** are written first, so the report can link them:
   `sources/NN title-slug.md`, each with `source:`/`title:`/`retrieved:`
-  frontmatter. Only successful scrapes get files; the numbering in filenames
-  matches the citation numbering for the sources that have copies. The
+  frontmatter. Only successful scrapes get files, but the number in each name
+  is the source's **citation** number, not its position among the successes —
+  if citation 1 is paywalled and citation 2 archives, the file is `02 …`, so
+  the folder and the report's numbered list always mean the same thing. The
   returned `WrittenReport` carries the URL → file-name mapping, so the
   caller records which citation got which copy without re-deriving names.
 - **Relative links** use the `[text](<path with spaces>)` angle-bracket form
   so paths with spaces survive strict Markdown parsers; they resolve both in
   a notes app and in Footnote's own report view (which serves
   `/jobs/{id}/sources/{file}` for exactly this reason).
+- **Escaping** assumes hostile text, because most of it came off the web: a
+  frontmatter value is collapsed to one line before quoting (a question typed
+  into a textarea can contain newlines, which would otherwise end the scalar
+  and turn the rest into bogus keys), link labels have their brackets
+  escaped, and a URL with spaces or parentheses takes the angle-bracket form.
 - **Frontmatter** is quoted/escaped YAML (`question`, `date`, `processor`,
   optional `confidence`, `sources`, `app: Footnote`) — enough for Obsidian
   Dataview queries like "all high-confidence dossiers this month".
@@ -347,6 +367,15 @@ optionally hardened one notch.
   cannot run script on the origin that holds the session cookie.
 - Server filesystem paths stay server-side (see *What the client is not
   told*) — not secrecy so much as keeping the API's vocabulary to job ids.
+- **No cross-origin access by default.** The PWA is same-origin and the
+  Shortcut and curl are not browsers, so nothing Footnote ships needs CORS —
+  and a wildcard would let any page you happen to be visiting start research
+  on a reachable instance and spend the Parallel key, which with
+  `FOOTNOTE_TOKEN` unset is the default install. `FOOTNOTE_CORS_ORIGINS`
+  names origins explicitly when a browser client of your own needs one.
+- Push is isolated from job outcome: `notify_all` swallows everything, since
+  it is called from inside `run_research`'s `try` and a malformed
+  subscription would otherwise rewrite a finished job as failed.
 - API keys live in `.env` / systemd env files, never in the repo; the
   frontend never sees them.
 - What the token does *not* provide: per-user separation (that's the
