@@ -503,6 +503,12 @@ Behavior notes:
   and source pages carry `static/document.js`, which upgrades their own
   download links to the same behaviour and leaves them ordinary links when
   scripting is unavailable.
+- **Three panels, three independent switches.** "read here", ".md" and
+  "Sources" open and close separately — the first two use distinct classes so
+  neither answers for the other — and all three are remembered by what they
+  show, so a poll rebuilding the list closes none of them and refetches
+  nothing. The file panel was the odd one out until it was noticed: readers
+  and the source list survived a poll and it did not.
 - **Panels open where the control is.** The source list sits directly under
   the links that open it; file and reader panels append below it, and
   whatever was just opened is scrolled into view if it is not. Otherwise a

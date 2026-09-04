@@ -943,6 +943,24 @@ def test_opening_one_panel_does_not_hide_another_control(client, tmp_path):
     assert app_js.count("reveal(panel)") >= 2      # sources and file panels
 
 
+def test_the_three_panels_are_independent_and_outlive_a_poll():
+    """read here, .md and Sources toggle separately, and none of them closes
+    because the five-second poll rebuilt the list."""
+    app_js = (Path(__file__).resolve().parent.parent
+              / "static" / "app.js").read_text()
+    # Distinct classes, so one panel's presence never answers for another.
+    assert '.src-body' in app_js and '.file-view' in app_js
+    # Each kind is remembered across a re-render.
+    for remembered in ("openSources", "openReaders", "openFiles"):
+        assert f"{remembered}.has(" in app_js, remembered
+        assert f"{remembered}.delete(" in app_js, remembered
+    # Reopened without scrolling, since the reader did not ask this time.
+    assert app_js.count("queueMicrotask(() => open(true))") >= 2
+    # Removing a job forgets all of its panels, not only its readers.
+    forget = app_js[app_js.index("function forgetReaders("):]
+    assert "openFiles" in forget[:forget.index("\n}")]
+
+
 def test_the_pwa_can_read_in_place():
     app_js = (Path(__file__).resolve().parent.parent
               / "static" / "app.js").read_text()

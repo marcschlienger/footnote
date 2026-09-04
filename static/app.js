@@ -15,6 +15,9 @@ const sourcesCache = new Map();
 // list, and something you are part-way through reading should not vanish
 // because a timer fired.
 const openReaders = new Set();
+const openFiles = new Set();
+// One cache for both, keyed by URL — a rendered fragment and a raw file are
+// fetched from different URLs, so they cannot collide.
 const readerCache = new Map();
 // An archived page can be a few hundred kB of HTML, and a long session can
 // open a lot of them. Keep the most recent handful.
@@ -314,13 +317,22 @@ function renderSource(src) {
 // Read a dossier or an archived copy without leaving the page. The links
 // beside these still open the standalone views — those are what a push
 // notification and the report's "local copy" links point at.
+function remember(url, body) {
+  readerCache.set(url, body);
+  while (readerCache.size > READER_CACHE_MAX) {
+    readerCache.delete(readerCache.keys().next().value);
+  }
+}
+
 function readHere(src, li) {
   return readInline(src.read_url + "?embed=1", li, "read here", "close");
 }
 
 function forgetReaders(jobId) {
   const prefix = `/jobs/${jobId}/`;
-  for (const url of [...openReaders]) if (url.startsWith(prefix)) openReaders.delete(url);
+  for (const set of [openReaders, openFiles]) {
+    for (const url of [...set]) if (url.startsWith(prefix)) set.delete(url);
+  }
   for (const url of [...readerCache.keys()]) if (url.startsWith(prefix)) readerCache.delete(url);
 }
 
@@ -351,10 +363,7 @@ function readInline(url, host, openLabel, _closeLabel, after) {
       const res = await fetch(url);
       if (!res.ok) throw new Error(res.statusText);
       const html = await res.text();
-      readerCache.set(url, html);
-      while (readerCache.size > READER_CACHE_MAX) {
-        readerCache.delete(readerCache.keys().next().value);
-      }
+      remember(url, html);
       // Sanitised server-side, by the same allowlist the standalone page uses.
       panel.innerHTML = html;
     } catch (e) {
@@ -481,13 +490,8 @@ function fileButton(href, label, filename, host, after) {
   button.className = "linkish";
   button.textContent = label;
   button.setAttribute("aria-expanded", "false");
-  button.onclick = () => {
-    const showing = host.querySelector(":scope > .file-view");
-    if (showing) {
-      showing.remove();
-      button.setAttribute("aria-expanded", "false");
-      return;
-    }
+  const open = (auto) => {
+    openFiles.add(href);
     // The label stays put: two toggles both saying "close" tells you nothing
     // about which panel you are closing.
     button.setAttribute("aria-expanded", "true");
@@ -497,20 +501,42 @@ function fileButton(href, label, filename, host, after) {
     // After the row it belongs to, and after anything already open, so that
     // opening one panel never pushes another control off the screen.
     host.insertBefore(panel, (after && after.nextSibling) || null);
-    reveal(panel);
+    if (!auto) reveal(panel);
     showFile(panel, href, filename).catch((e) => {
       panel.textContent = "Could not read that file: " + e.message;
+      openFiles.delete(href);
+      button.setAttribute("aria-expanded", "false");
     });
   };
+  button.onclick = () => {
+    const showing = host.querySelector(":scope > .file-view");
+    if (showing) {
+      showing.remove();
+      openFiles.delete(href);
+      button.setAttribute("aria-expanded", "false");
+      return;
+    }
+    open(false);
+  };
+  // Remembered like the readers are: polling rebuilds the list every five
+  // seconds while a job runs, and a file you are part-way through reading
+  // should not close because a timer fired.
+  if (openFiles.has(href)) queueMicrotask(() => open(true));
   return button;
 }
 
 async function showFile(panel, href, filename) {
-  const res = await fetch(href);
-  if (!res.ok) throw new Error(res.statusText || `HTTP ${res.status}`);
-  const name = filename ||
-    nameFromDisposition(res.headers.get("content-disposition")) || "download";
-  const body = await res.text();
+  let name = filename;
+  let body = readerCache.get(href);
+  if (body === undefined) {
+    const res = await fetch(href);
+    if (!res.ok) throw new Error(res.statusText || `HTTP ${res.status}`);
+    name = name ||
+      nameFromDisposition(res.headers.get("content-disposition")) || "download";
+    body = await res.text();
+    remember(href, body);
+  }
+  name = name || "download";
 
   panel.textContent = "";
   const actions = document.createElement("div");
