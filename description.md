@@ -163,8 +163,8 @@ behind it is finished and paid for, so a 429 or a bad gateway *in front of*
 the result is not a reason to throw it away: those are retried inside the
 existing deadline instead of failing the job.
 
-One class deserves naming because it bites twice: text that survives JSON
-*decoding* but cannot be JSON *encoded*. A client can send `"\ud800"`, and
+One class deserves naming because it keeps coming back: text that survives
+JSON *decoding* but cannot be JSON *encoded*. A client can send `"\ud800"`, and
 Python will hold the unpaired surrogate happily — until `json.dump` refuses
 it, at which point the job store cannot be written again and every later job
 is lost. So questions carrying one are refused at the door, provider text has
@@ -172,6 +172,18 @@ them replaced, `JsonStore.save` falls back to escaping rather than failing,
 and the 422 that reports the refusal is serialized with `ensure_ascii` —
 because the default handler echoes the offending input, which is the very
 thing that could not be encoded.
+
+The ingress points are wider than the obvious ones, and each was found only
+after the previous fix: a provider's **error** text lands in the dossier and
+the job store exactly like a title does; `save()`'s escaping fallback means a
+value that got in once comes *back* as a surrogate on the next load, so
+stored records are scrubbed on the way in (nested citation fields included)
+and on every update; a state file that is not valid UTF-8 at all is
+quarantined like malformed JSON rather than raising `UnicodeDecodeError`
+before the app exists; and `_one_line` scrubs as a last resort, since every
+value written to a file passes through it. A hostname is checked the same
+way — `https://\ud800` parsed as a valid authority and then failed inside
+`uuid5` when a subscription was registered.
 
 Filenames have their own version of the same lesson: `slug_for` budgets in
 UTF-8 *bytes*, not characters, because ext4 limits a path component to 255
@@ -344,8 +356,11 @@ point:
   rather than being interpolated into later URLs — and it is not retried,
   because the POST may well have created a run that a second attempt would
   pay for again while the first goes unrecorded.
-- **Only web links are written as links.** A citation URL whose scheme is not
-  http, https or mailto is listed as text in a code span instead: the dossier
+- **Only web links are written as links**, and the source index applies the
+  same rule as the report writer (`is_safe_url(relative_ok=False)`): absolute
+  http, https and mailto, never a relative-looking string that would resolve
+  against Footnote's own origin. A citation URL outside that set is listed as
+  text in a code span instead: the dossier
   is a portable Markdown file, and the next app to open it may follow a link
   without asking. The span is fenced with a backtick run longer than any
   inside it, so a URL containing backticks cannot close it and continue in

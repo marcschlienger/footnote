@@ -62,6 +62,16 @@ fi
 if getent group "$SHARED_GROUP" >/dev/null; then
   usermod -a -G "$SHARED_GROUP" "$USER_NAME"
 fi
+# An existing env file is authoritative: a customized instance keeps its own
+# directories, and repairing the ones computed from this invocation's
+# arguments would tighten permissions on the wrong paths.
+if [ -f "$ENV_FILE" ]; then
+  EXISTING_OUT="$(sed -n 's/^OUTPUT_DIR=//p' "$ENV_FILE" | tail -1)"
+  EXISTING_DATA="$(sed -n 's/^DATA_DIR=//p' "$ENV_FILE" | tail -1)"
+  [ -n "$EXISTING_OUT" ] && OUT="$EXISTING_OUT"
+  [ -n "$EXISTING_DATA" ] && DATA="$EXISTING_DATA"
+fi
+
 echo "==> Creating output directory $OUT and data directory $DATA"
 # 0700: a dossier is research someone paid for, and the host's default umask
 # is not a decision this script should inherit.

@@ -173,6 +173,8 @@ class JsonStore:
             if not isinstance(loaded, dict):
                 raise json.JSONDecodeError(
                     f"expected an object, found {type(loaded).__name__}", "", 0)
+            # Escaped-in surrogates come back as surrogates; scrub them before
+            # anything tries to serialize this record to a client.
             # One damaged record must not cost the rest of the history.
             self.data = {k: v for k, v in loaded.items() if isinstance(v, dict)}
             dropped = len(loaded) - len(self.data)
@@ -181,7 +183,7 @@ class JsonStore:
                       f"{'s' * (dropped != 1)}", flush=True)
         except OSError as exc:
             print(f"could not read {path.name}: {exc}", flush=True)
-        except json.JSONDecodeError as exc:
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             # Starting empty would silently drop the history; the file is kept
             # under a new name so it can be looked at, since the next save
             # would otherwise overwrite the evidence.
@@ -227,6 +229,8 @@ _TERMINAL_STATUSES = ("done", "failed")
 QUESTION_MIN, QUESTION_MAX = 8, 4000
 # Store keys become public job ids and go straight into URLs.
 _JOB_ID = re.compile(r"^[0-9a-f]{12}$")
+# Tab and newline are fine in a typed question; NUL and friends are not.
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 
 def _question_problem(question) -> str:
@@ -245,6 +249,10 @@ def _question_problem(question) -> str:
     if pipeline.has_lone_surrogate(text):
         # It survives JSON decoding and then cannot be written back out.
         return "question contains unpaired surrogate characters"
+    if _CONTROL_CHARS.search(text):
+        # Encodable, but they would end up as raw bytes in the dossier's
+        # Markdown and YAML.
+        return "question contains control characters"
     return ""
 
 
@@ -279,6 +287,11 @@ def _normalize_jobs() -> None:
             if field in job and not isinstance(job[field], str):
                 job[field] = str(job[field])
                 changed = True
+        if _scrub_job_text(job):
+            # A surrogate that reached the file — escaped there by save()'s
+            # fallback — comes back as a surrogate and would break every
+            # response carrying this job.
+            changed = True
         for field in _JOB_SEMANTIC_FIELDS:
             if field in job and not isinstance(job[field], str):
                 del job[field]                    # absent beats nonsense
@@ -301,6 +314,31 @@ def _normalize_jobs() -> None:
         print("job history repaired on load", flush=True)
 
 
+# Everything on a job that is ever sent to a client or written to a file.
+_JOB_SCRUBBED = ("question", "progress", "error", "report_name", "notion_url",
+                 "processor", "status", "created_at", "finished_at")
+_CITATION_SCRUBBED = ("url", "title", "file", "note")
+
+
+def _scrub_job_text(job: dict) -> bool:
+    """Replace unencodable text on a stored record; True if anything changed."""
+    changed = False
+    for field in _JOB_SCRUBBED:
+        value = job.get(field)
+        if isinstance(value, str) and pipeline.has_lone_surrogate(value):
+            job[field] = pipeline.scrub_surrogates(value)
+            changed = True
+    for citation in job.get("citations") or []:
+        if not isinstance(citation, dict):
+            continue
+        for field in _CITATION_SCRUBBED:
+            value = citation.get(field)
+            if isinstance(value, str) and pipeline.has_lone_surrogate(value):
+                citation[field] = pipeline.scrub_surrogates(value)
+                changed = True
+    return changed
+
+
 def _resumable(job: dict) -> bool:
     """Whether run_research could actually run this record.
 
@@ -314,6 +352,7 @@ def _resumable(job: dict) -> bool:
 
 # Web Push key sizes: an uncompressed P-256 point, and the auth secret.
 _KEY_BYTES = {"p256dh": 65, "auth": 16}
+_BASE64URL = re.compile(r"^[A-Za-z0-9_-]+={0,2}$")
 
 
 def _valid_subscription(sub) -> bool:
@@ -324,8 +363,8 @@ def _valid_subscription(sub) -> bool:
         return False
     for name, size in _KEY_BYTES.items():
         value = sub["keys"].get(name)
-        if not isinstance(value, str):
-            return False
+        if not isinstance(value, str) or not _BASE64URL.match(value):
+            return False        # the decoder ignores trailing rubbish
         try:
             # base64url without padding, as the Push API hands it over.
             decoded = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
@@ -333,6 +372,8 @@ def _valid_subscription(sub) -> bool:
             return False
         if len(decoded) != size:
             return False        # would fail on every notification, for ever
+        if name == "p256dh" and decoded[0] != 0x04:
+            return False        # an uncompressed P-256 point starts with 0x04
     return True
 
 
@@ -375,6 +416,7 @@ def _update_job(job_id: str, **fields) -> None:
     if job is None:
         return
     job.update(fields)
+    _scrub_job_text(job)        # provider text arrives through here too
     jobs.save()
 
 
@@ -1122,9 +1164,11 @@ def _source_entries(job: dict, folder: Path) -> list:
     return [
         {"n": n,
          "title": title or url or name,
-         # is_http_url, not the general link policy: a relative-looking
-         # citation would resolve against Footnote's own origin in the PWA.
-         "url": url if pipeline.is_http_url(url) else "",
+         # The same rule the report writer uses: absolute safe links only.
+         # is_http_url would drop mailto:, which is a legitimate citation;
+         # allowing relative URLs would let "not-a-url" resolve against
+         # Footnote's own origin in the PWA.
+         "url": url if pipeline.is_safe_url(url, relative_ok=False) else "",
          "file": name,
          "archived": bool(name),
          "read_url": base + quote(name) if name else "",
@@ -1214,7 +1258,10 @@ async def subscribe(req: SubscribeRequest):
             422, "a subscription needs an http(s) endpoint and string "
                  "p256dh and auth keys")   # mailto: is a link, not an endpoint
     key = uuid.uuid5(uuid.NAMESPACE_URL, req.endpoint).hex
-    subs.data[key] = {"endpoint": req.endpoint, "keys": req.keys}
+    # Only the two fields push needs: a subscription is stored indefinitely,
+    # and there is no reason to keep whatever else a client attached.
+    subs.data[key] = {"endpoint": req.endpoint,
+                      "keys": {name: req.keys[name] for name in _KEY_BYTES}}
     subs.save()
     return {"status": "subscribed", "devices": len(subs.data)}
 

@@ -19,8 +19,12 @@
    Everything else — job status, .md downloads, the bundle zip — goes straight
    to the network. */
 
-const SHELL_CACHE = "footnote-shell-v2";
-const DOSSIER_CACHE = "footnote-dossier-v1";
+// Rotated when a worker could have cached something it should not have: an
+// earlier version keyed entries by the full URL, so a ?token= visit wrote the
+// token into Cache Storage. Activation deletes every cache not on the keep
+// list, which is what retires those entries.
+const SHELL_CACHE = "footnote-shell-v3";
+const DOSSIER_CACHE = "footnote-dossier-v2";
 const DOSSIER_MAX = 60;          // entries; archived source pages are the bulk
 const SHELL = [
   "/",

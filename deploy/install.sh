@@ -58,6 +58,14 @@ rsync -a --delete \
 [ -f "$APP_DIR/.env" ] || cp "$APP_DIR/.env.example" "$APP_DIR/.env"
 
 echo "==> Creating virtualenv and installing Python dependencies"
+# An existing venv is reused only if its interpreter is new enough. One built
+# under 3.8 would otherwise survive an upgrade run with 3.12, and the
+# installer would report success for a service that fails inside jobs.
+if [ -d "$APP_DIR/.venv" ] && ! "$APP_DIR/.venv/bin/python" -c \
+    'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' 2>/dev/null; then
+  echo "    existing virtualenv is too old or broken; rebuilding it"
+  rm -rf "$APP_DIR/.venv"
+fi
 [ -d "$APP_DIR/.venv" ] || "$PYTHON" -m venv "$APP_DIR/.venv"
 "$APP_DIR/.venv/bin/pip" install --upgrade pip -q
 "$APP_DIR/.venv/bin/pip" install -r "$APP_DIR/requirements.txt" -q

@@ -25,6 +25,7 @@ Verified API contracts (August 2026):
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import random
 import re
 import time
@@ -41,6 +42,12 @@ import httpx
 PARALLEL_BASE = "https://api.parallel.ai/v1"
 # A run id goes into a URL path; keep it to what cannot change its shape.
 _RUN_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+# A DNS name: labels of letters, digits and inner hyphens. IP literals are
+# handled separately, since urlsplit().hostname strips a v6 address's
+# brackets and leaves colons behind.
+_HOSTNAME = re.compile(
+    r"^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?"
+    r"(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*$")
 FIRECRAWL_BASE = "https://api.firecrawl.dev/v2"
 
 # Task API processors, cheap/fast → expensive/deep, with a generous overall
@@ -94,9 +101,23 @@ def is_http_url(url: str) -> bool:
         return False
     try:
         parsed = urlsplit(text)
-        return bool(parsed.hostname) and parsed.port is not False
-    except ValueError:      # an invalid port raises when it is read
+        host = parsed.hostname
+        parsed.port                     # raises for an invalid port
+    except ValueError:
         return False
+    if not host:
+        return False
+    try:
+        host.encode("idna")             # rejects surrogates and empty labels
+    except (UnicodeError, ValueError):
+        return False
+    try:
+        ipaddress.ip_address(host)      # a literal address is a fine host
+        return True
+    except ValueError:
+        pass
+    # A bare "." or "_" is syntactically an authority and addresses nothing.
+    return bool(_HOSTNAME.match(host))
 
 
 def _as_list(value) -> list:
@@ -105,6 +126,11 @@ def _as_list(value) -> list:
 
 
 _LONE_SURROGATE = re.compile("[\ud800-\udfff]")
+
+
+def scrub_surrogates(text: str) -> str:
+    """Replace anything UTF-8 cannot represent, so this string can be stored."""
+    return _LONE_SURROGATE.sub("\ufffd", text) if isinstance(text, str) else ""
 
 
 def has_lone_surrogate(text: str) -> bool:
@@ -352,11 +378,19 @@ def _parse_task_result(data: dict, run_id: str) -> ResearchResult:
 
 
 def _err_detail(resp: httpx.Response) -> str:
+    """A provider's explanation — which is provider text, and gets scrubbed.
+
+    Error strings end up in the job store and in the dossier's "could not be
+    archived" list, so an unpaired surrogate here fails the write just as
+    surely as one in a title.
+    """
     try:
-        err = resp.json().get("error", {})
-        return err.get("message") or resp.text[:200]
-    except Exception:
-        return resp.text[:200]
+        body = resp.json()
+        err = body.get("error") if isinstance(body, dict) else None
+        message = err.get("message") if isinstance(err, dict) else None
+        return _text(message) or _text(resp.text)[:200]
+    except Exception:                                      # noqa: BLE001
+        return _text(resp.text)[:200]
 
 
 # ---------------------------------------------------------------------------
@@ -510,7 +544,7 @@ async def scrape_sources(
             else:
                 copy = await _scrape_one(client, api_key, cit, limiter)
         except Exception as exc:                           # noqa: BLE001
-            copy = SourceCopy(cit.url, cit.title, "", False, str(exc)[:200])
+            copy = SourceCopy(cit.url, cit.title, "", False, _text(str(exc))[:200])
         state["done"] += 1
         if on_progress:
             try:
@@ -560,7 +594,7 @@ async def _scrape_one(
                     timeout=httpx.Timeout(90.0, connect=15.0),
                 )
         except Exception as exc:                           # noqa: BLE001
-            error = str(exc)[:200]
+            error = _text(str(exc))[:200]
             if attempt == MAX_ATTEMPTS:
                 break
             await asyncio.sleep(min(backoff * random.uniform(0.5, 1.5),
@@ -601,7 +635,7 @@ async def _scrape_one(
             # answer: say so, and treat it like the other transient faults.
             error = f"HTTP {resp.status_code} with an unreadable body"
         else:
-            error = str(data.get("error") or f"HTTP {resp.status_code}")[:200]
+            error = _text(data.get("error"))[:200] or f"HTTP {resp.status_code}"
         retryable = malformed or resp.status_code in RETRYABLE_STATUS
         if not retryable or attempt == MAX_ATTEMPTS:
             break
@@ -663,8 +697,12 @@ _CONTROL = re.compile(r"[\x00-\x1f\x7f]+")
 
 
 def _one_line(text: str) -> str:
-    """Collapse anything that would break a single-line field."""
-    return " ".join(str(text).split())
+    """Collapse anything that would break a single-line field — or the write.
+
+    Surrogates are scrubbed here as well as at the provider boundary: this is
+    the last thing every value passes through before it reaches a file.
+    """
+    return " ".join(scrub_surrogates(str(text)).split())
 
 
 def _md_label(text: str) -> str:
@@ -733,7 +771,8 @@ def write_report(
             f'title: "{_yaml_escape(src.title)}"\n'
             f"retrieved: {date_str()}\n---\n\n{src.markdown.strip()}\n"
         )
-        (folder / "sources" / fname).write_text(body, encoding="utf-8")
+        (folder / "sources" / fname).write_text(scrub_surrogates(body),
+                                                encoding="utf-8")
         saved[src.url] = fname
 
     lines = [
@@ -779,7 +818,7 @@ def write_report(
         lines += ["## Method note", "", _md_quote(result.reasoning), ""]
 
     report = folder / f"{slug}.md"
-    report.write_text("\n".join(lines), encoding="utf-8")
+    report.write_text(scrub_surrogates("\n".join(lines)), encoding="utf-8")
     return WrittenReport(path=report, source_files=saved)
 
 

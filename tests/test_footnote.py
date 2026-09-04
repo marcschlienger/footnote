@@ -1060,6 +1060,121 @@ def test_normalization_validates_rather_than_stringifies(monkeypatch):
     app_module.jobs.data.clear()
 
 
+def test_provider_error_text_is_scrubbed_too(monkeypatch, tmp_path):
+    """An error string reaches the dossier and the store, like any other."""
+    monkeypatch.setattr(pipeline, "BASE_BACKOFF_S", 0.01)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        # Escaped in the bytes, which is how a real server sends one.
+        return httpx.Response(
+            403, content=br'{"success": false, "error": "blocked \ud800"}',
+            headers={"content-type": "application/json"})
+
+    copy, = _run_scrape(handler, 1)
+    assert not copy.ok
+    assert not pipeline.has_lone_surrogate(copy.error)
+    written = pipeline.write_report(          # would raise before
+        tmp_path, "Error surrogate question", "core",
+        ResearchResult("b", [Citation("https://s.test/0")], "", ""), [copy])
+    assert written.path.exists()
+
+
+def test_a_surrogate_that_reached_the_file_is_scrubbed_on_load(tmp_path, client):
+    """save() escapes it, so loading recreates it — /jobs must survive that."""
+    store = app_module.JsonStore(tmp_path / "jobs.json")
+    store.data["ffffffffffff"] = {
+        "id": "ffffffffffff", "question": "a perfectly fine question",
+        "processor": "core", "status": "failed",
+        "created_at": "2026-01-01T00:00:00Z", "error": "boom \ud800",
+        "citations": [{"url": "https://a.test/1", "title": "bad \ud800"}]}
+    store.save()
+
+    app_module.jobs.data.clear()
+    app_module.jobs.data.update(app_module.JsonStore(tmp_path / "jobs.json").data)
+    app_module._normalize_jobs()
+    job = app_module.jobs.data["ffffffffffff"]
+    assert not pipeline.has_lone_surrogate(job["error"])
+    assert not pipeline.has_lone_surrogate(job["citations"][0]["title"])
+    assert client.get("/jobs").status_code == 200
+    app_module.jobs.data.clear()
+
+
+def test_a_state_file_that_is_not_utf8_is_quarantined(tmp_path):
+    path = tmp_path / "jobs.json"
+    path.write_bytes(b'{"a": "\xff"}')
+    store = app_module.JsonStore(path)       # must not raise
+    assert store.data == {}
+    assert list(tmp_path.glob("jobs.corrupt-*.json"))
+
+
+def test_a_mailto_citation_stays_linked_in_the_index(client, tmp_path):
+    """The report links it; the index must agree."""
+    _finished_job(tmp_path)
+    app_module.jobs.data["abcdefabcdef"]["citations"] = [
+        {"url": "mailto:x@example.test", "title": "Mail", "file": "", "note": ""},
+        {"url": "not-a-url", "title": "Bare", "file": "", "note": ""},
+    ]
+    sources = client.get("/jobs/abcdefabcdef/sources").json()["sources"]
+    assert sources[0]["url"] == "mailto:x@example.test"
+    assert sources[1]["url"] == ""           # would resolve against us
+
+
+def test_push_keys_must_look_like_keys():
+    def encoded(raw):
+        return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+    auth = encoded(b"a" * 16)
+    assert app_module._valid_subscription(
+        {"endpoint": "https://push.test/x",
+         "keys": {"p256dh": encoded(b"\x04" + b"k" * 64), "auth": auth}})
+    for p256dh in (encoded(b"\x00" * 65),          # not a point at all
+                   encoded(b"\x02" + b"k" * 64),   # compressed, not what is sent
+                   encoded(b"\x04" + b"k" * 64) + "!!"):
+        assert not app_module._valid_subscription(
+            {"endpoint": "https://push.test/x",
+             "keys": {"p256dh": p256dh, "auth": auth}})
+
+
+def test_only_the_two_push_keys_are_stored(client, monkeypatch):
+    monkeypatch.setattr(app_module, "VAPID_PUBLIC_KEY", "pub")
+    monkeypatch.setattr(app_module, "VAPID_PRIVATE_KEY", "priv")
+    monkeypatch.setattr(app_module, "VAPID_CLAIM_EMAIL", "me@example.test")
+    keys = dict(_push_keys(), junk="x" * 5000)
+    assert client.post("/subscribe", json={"endpoint": "https://push.test/x",
+                                           "keys": keys}).status_code == 200
+    stored, = app_module.subs.data.values()
+    assert set(stored["keys"]) == {"p256dh", "auth"}
+    app_module.subs.data.clear()
+
+
+def test_a_hostname_has_to_be_usable():
+    for url in ("https://\ud800", "https://.", "https://_/", "https://-bad.test/x"):
+        assert not pipeline.is_http_url(url), url
+    for url in ("https://a.test/x", "https://[::1]/x", "https://127.0.0.1:8010/x",
+                "https://xn--bcher-kva.test/x"):
+        assert pipeline.is_http_url(url), url
+
+
+def test_control_characters_are_not_a_question():
+    assert app_module._question_problem("a question\x00with NUL")
+    assert not app_module._question_problem("a question\nwith a newline")
+
+
+def test_the_worker_retires_caches_that_may_hold_a_token():
+    source = (Path(__file__).resolve().parent.parent
+              / "static" / "service-worker.js").read_text()
+    assert "footnote-shell-v3" in source and "footnote-dossier-v2" in source
+
+
+def test_the_installer_rebuilds_a_venv_that_is_too_old():
+    install = (Path(__file__).resolve().parent.parent
+               / "deploy" / "install.sh").read_text()
+    assert '.venv/bin/python' in install and "rm -rf" in install
+    add = (Path(__file__).resolve().parent.parent
+           / "deploy" / "add-instance.sh").read_text()
+    assert "EXISTING_OUT" in add        # repair the paths the instance uses
+
+
 def test_a_lone_surrogate_cannot_reach_the_store(client, monkeypatch):
     """It survives JSON decoding and then cannot be written back out."""
     monkeypatch.setattr(app_module, "PARALLEL_API_KEY", "k")
