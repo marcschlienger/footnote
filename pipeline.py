@@ -92,6 +92,14 @@ class SourceCopy:
     error: str = ""
 
 
+@dataclass
+class WrittenReport:
+    """What write_report put on disk."""
+
+    path: Path                    # the report .md itself
+    source_files: dict            # cited URL → file name inside sources/
+
+
 # ---------------------------------------------------------------------------
 # Parallel Task API
 # ---------------------------------------------------------------------------
@@ -281,8 +289,8 @@ def write_report(
     processor: str,
     result: ResearchResult,
     sources: list[SourceCopy],
-) -> Path:
-    """Write the report folder; returns the path of the report .md file.
+) -> WrittenReport:
+    """Write the report folder; returns the report path and its source files.
 
     Layout (one folder per research question, friendly to Obsidian/Nextcloud):
 
@@ -296,7 +304,7 @@ def write_report(
     folder = _unique_dir(output_dir, f"{date_str()} {slug}")
     (folder / "sources").mkdir(parents=True) if sources else folder.mkdir(parents=True)
 
-    saved: list[tuple[SourceCopy, str]] = []   # (source, relative link)
+    saved: dict = {}                      # source URL → file name in sources/
     for i, src in enumerate((s for s in sources if s.ok), start=1):
         stitle = slug_for(src.title or src.url, 60)
         fname = f"{i:02d} {stitle}.md"
@@ -305,7 +313,7 @@ def write_report(
             f"retrieved: {date_str()}\n---\n\n{src.markdown.strip()}\n"
         )
         (folder / "sources" / fname).write_text(body, encoding="utf-8")
-        saved.append((src, f"sources/{fname}"))
+        saved[src.url] = fname
 
     lines = [
         "---",
@@ -320,12 +328,11 @@ def write_report(
 
     if result.citations:
         lines += ["## Sources", ""]
-        local = {src.url: rel for src, rel in saved}
         for i, cit in enumerate(result.citations, start=1):
             label = cit.title or cit.url
             entry = f"{i}. [{label}]({cit.url})"
-            if cit.url in local:
-                entry += f" — [local copy](<{local[cit.url]}>)"
+            if cit.url in saved:
+                entry += f" — [local copy](<sources/{saved[cit.url]}>)"
             lines.append(entry)
             if cit.excerpts:
                 first = " ".join(cit.excerpts[0].split())
@@ -343,7 +350,31 @@ def write_report(
 
     report = folder / f"{slug}.md"
     report.write_text("\n".join(lines), encoding="utf-8")
-    return report
+    return WrittenReport(path=report, source_files=saved)
+
+
+def split_front_matter(text: str) -> tuple:
+    """Split a Footnote-written file into (metadata, body).
+
+    Understands only the flat `key: value` block write_report emits — it is a
+    reader for our own files, not a YAML parser. Text without a frontmatter
+    block comes back unchanged with empty metadata.
+    """
+    if not text.startswith("---"):
+        return {}, text
+    end = text.find("\n---", 3)
+    if end == -1:
+        return {}, text
+    meta: dict = {}
+    for line in text[3:end].splitlines():
+        key, sep, value = line.partition(":")
+        if not sep:
+            continue
+        value = value.strip()
+        if len(value) > 1 and value[0] == value[-1] == '"':
+            value = value[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+        meta[key.strip()] = value
+    return meta, text[end + 4:].lstrip("\n")
 
 
 def date_str() -> str:

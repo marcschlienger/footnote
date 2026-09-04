@@ -9,6 +9,9 @@ GET  /research/{id}                     job status (poll target)
 GET  /jobs                              recent jobs for the UI
 GET  /jobs/{id}/report                  rendered report (HTML)
 GET  /jobs/{id}/report.md               raw Markdown download
+GET  /jobs/{id}/sources                 the job's source material (JSON)
+GET  /jobs/{id}/sources/{file}          one archived source (HTML, ?raw=1 → .md)
+GET  /jobs/{id}/bundle.zip              report + every archived source (zip)
 DELETE /jobs/{id}                       remove a job from history
 POST /subscribe                         register a Web Push subscription
 GET  /vapid-public-key                  key for push subscription
@@ -26,16 +29,22 @@ Output directory: --output-dir flag > OUTPUT_DIR env var > platform default.
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import os
+import re
 import secrets
 import sys
 import tempfile
 import traceback
 import uuid
+import zipfile
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from html import escape
+from html.parser import HTMLParser
 from pathlib import Path
+from urllib.parse import quote
 
 import httpx
 from dotenv import load_dotenv
@@ -45,7 +54,7 @@ from fastapi.responses import (
     FileResponse,
     HTMLResponse,
     JSONResponse,
-    PlainTextResponse,
+    Response,
 )
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, field_validator
@@ -81,6 +90,7 @@ VAPID_CLAIM_EMAIL = os.getenv("VAPID_CLAIM_EMAIL", "").strip()
 DEFAULT_PROCESSOR = os.getenv("DEFAULT_PROCESSOR", "core").strip()
 MAX_SOURCES = int(os.getenv("MAX_SOURCES", "12"))
 MAX_JOBS_KEPT = 200
+MAX_CITATIONS_KEPT = 100     # per job, so jobs.json stays small
 
 # Optional API token, same contract as Margin's: unset → open server for
 # private-network use; set → everything but /health and the PWA shell assets
@@ -216,7 +226,7 @@ async def run_research(job_id: str) -> None:
 
         # 3. Write the dossier into the synced folder
         _update_job(job_id, status="saving", progress="Writing report…")
-        report_path = await asyncio.to_thread(
+        written = await asyncio.to_thread(
             pipeline.write_report, OUTPUT_DIR, question, processor,
             result, sources)
 
@@ -233,21 +243,53 @@ async def run_research(job_id: str) -> None:
         summary = (f"{len(result.citations)} sources cited"
                    + (f", {archived} archived" if archived else ""))
         _update_job(job_id, status="done", progress=f"Done — {summary}",
-                    report_path=str(report_path), notion_url=notion_url,
+                    report_path=str(written.path), notion_url=notion_url,
                     finished_at=_now(), sources_cited=len(result.citations),
-                    sources_archived=archived)
+                    sources_archived=archived,
+                    citations=_citation_records(result, sources, written))
         await notify_all("Research complete",
                          f"“{_ellipsize(question)}” — {summary}",
                          url=f"/jobs/{job_id}/report")
     except PipelineError as exc:
-        _update_job(job_id, status="failed", error=str(exc),
-                    progress=f"Failed: {exc}", finished_at=_now())
-        await notify_all("Research failed", f"“{_ellipsize(question)}”: {exc}")
+        reason = _scrub(exc)
+        _update_job(job_id, status="failed", error=reason,
+                    progress=f"Failed: {reason}", finished_at=_now())
+        await notify_all("Research failed", f"“{_ellipsize(question)}”: {reason}")
     except Exception as exc:                                   # noqa: BLE001
         traceback.print_exc()
-        _update_job(job_id, status="failed", error=f"Unexpected error: {exc}",
-                    progress=f"Failed: {exc}", finished_at=_now())
-        await notify_all("Research failed", f"“{_ellipsize(question)}”: {exc}")
+        reason = _scrub(exc)
+        _update_job(job_id, status="failed", error=f"Unexpected error: {reason}",
+                    progress=f"Failed: {reason}", finished_at=_now())
+        await notify_all("Research failed", f"“{_ellipsize(question)}”: {reason}")
+
+
+def _citation_records(result, sources: list, written) -> list:
+    """The job's source apparatus, as the /sources endpoint serves it.
+
+    Kept on the job rather than re-derived from the report text: it is the
+    only place that knows which citations *failed* to archive and why.
+    """
+    errors = {src.url: src.error for src in sources if not src.ok}
+    return [
+        {"url": cit.url, "title": cit.title,
+         "file": written.source_files.get(cit.url, ""),
+         "note": errors.get(cit.url, "")}
+        for cit in result.citations[:MAX_CITATIONS_KEPT]
+    ]
+
+
+def _scrub(text) -> str:
+    """Keep server filesystem paths out of anything a client can see.
+
+    The dossier folder is the server's business; a client gets told what went
+    wrong, not where the server keeps its files.
+    """
+    out = str(text)
+    for path, label in ((str(OUTPUT_DIR), "the output folder"),
+                        (str(DATA_DIR), "the data folder"),
+                        (str(Path.home()), "~")):
+        out = out.replace(path, label)
+    return out
 
 
 def _now() -> str:
@@ -256,6 +298,112 @@ def _now() -> str:
 
 def _ellipsize(text: str, n: int = 60) -> str:
     return text if len(text) <= n else text[: n - 1] + "…"
+
+
+# ---------------------------------------------------------------------------
+# Markdown → HTML for the report and source views
+#
+# Everything rendered here started life on the open web — a scraped page, or a
+# report written from scraped pages — and python-markdown passes raw HTML
+# straight through. So the rendered HTML is rebuilt from an allowlist rather
+# than filtered: unknown tags become text, unknown attributes are dropped, and
+# only http/https/mailto (or relative) URLs survive in href/src.
+# ---------------------------------------------------------------------------
+
+_ALLOWED_TAGS = frozenset("""
+    p br hr em strong i b u s del ins mark sub sup small
+    h1 h2 h3 h4 h5 h6 blockquote pre code kbd
+    ul ol li dl dt dd a img figure figcaption span div
+    table thead tbody tfoot tr th td caption
+""".split())
+_VOID_TAGS = frozenset({"br", "hr", "img"})
+_DROP_WITH_CONTENT = frozenset({"script", "style", "iframe", "object", "embed"})
+_ALLOWED_ATTRS = {
+    "a": frozenset({"href", "title"}),
+    "img": frozenset({"src", "alt", "title"}),
+    "th": frozenset({"align"}),
+    "td": frozenset({"align"}),
+    "code": frozenset({"class"}),      # language-* from fenced code blocks
+    "pre": frozenset({"class"}),
+}
+_SAFE_SCHEMES = frozenset({"http", "https", "mailto"})
+_SCHEME = re.compile(r"^([a-zA-Z][a-zA-Z0-9+.-]*):")
+
+
+def _safe_url(url: str) -> bool:
+    """True for relative URLs and for the schemes a document may link to."""
+    if not url:
+        return False
+    # Browsers ignore control characters inside a scheme ("java\tscript:").
+    bare = re.sub(r"[\x00-\x20]", "", url)
+    match = _SCHEME.match(bare)
+    return match is None or match.group(1).lower() in _SAFE_SCHEMES
+
+
+class _Sanitizer(HTMLParser):
+    """Re-emit only allowlisted markup; everything else becomes text."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.out: list = []
+        self._muted = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in _DROP_WITH_CONTENT:
+            self._muted += 1
+            return
+        if self._muted or tag not in _ALLOWED_TAGS:
+            return
+        allowed = _ALLOWED_ATTRS.get(tag, frozenset())
+        parts = [tag]
+        for name, value in attrs:
+            value = value or ""
+            if name not in allowed:
+                continue
+            if name in ("href", "src") and not _safe_url(value):
+                continue
+            parts.append(f'{name}="{escape(value, quote=True)}"')
+        self.out.append("<" + " ".join(parts) + ">")
+
+    def handle_endtag(self, tag):
+        if tag in _DROP_WITH_CONTENT:
+            self._muted = max(0, self._muted - 1)
+            return
+        if not self._muted and tag in _ALLOWED_TAGS and tag not in _VOID_TAGS:
+            self.out.append(f"</{tag}>")
+
+    def handle_data(self, data):
+        if not self._muted:
+            self.out.append(escape(data, quote=False))
+
+
+def _render_markdown(text: str) -> str:
+    if _markdown is None:              # optional dependency; show it plain
+        return f"<pre style='white-space:pre-wrap'>{escape(text)}</pre>"
+    parser = _Sanitizer()
+    parser.feed(_markdown.markdown(text, extensions=["tables", "fenced_code"]))
+    parser.close()
+    return "".join(parser.out)
+
+
+def _page(title: str, nav: str, body: str) -> HTMLResponse:
+    """The shared paper-styled document shell (report and source views)."""
+    return HTMLResponse(f"""<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{escape(title)} — Footnote</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/style.css"></head>
+<body class="report"><main class="report-body">
+<p class="page-nav">{nav}</p>
+{body}</main></body></html>""")
+
+
+def _attachment(filename: str) -> dict:
+    """Content-Disposition for a download, RFC 5987 when the name needs it."""
+    quoted = quote(filename)
+    if quoted == filename:
+        return {"content-disposition": f'attachment; filename="{filename}"'}
+    return {"content-disposition": f"attachment; filename*=utf-8''{quoted}"}
 
 
 # ---------------------------------------------------------------------------
@@ -408,8 +556,17 @@ async def start_research(req: ResearchRequest):
             "message": f"Research started on the {processor} processor"}
 
 
+# Server-side bookkeeping the client has no use for: the Parallel run id, the
+# dossier's path on disk (clients address it by job id), and the citation list
+# (served on demand by /jobs/{id}/sources — it would bloat every poll).
+_PRIVATE_JOB_FIELDS = ("run_id", "report_path", "citations")
+
+
 def _job_public(job: dict) -> dict:
-    return {k: v for k, v in job.items() if k != "run_id"}
+    public = {k: v for k, v in job.items() if k not in _PRIVATE_JOB_FIELDS}
+    if job.get("report_path"):
+        public["report_name"] = Path(job["report_path"]).name
+    return public
 
 
 @app.get("/research/{job_id}")
@@ -459,39 +616,129 @@ async def report_markdown(job_id: str):
 @app.get("/jobs/{job_id}/report")
 async def report_html(job_id: str):
     path = _report_file(job_id)
-    text = path.read_text(encoding="utf-8")
-    if text.startswith("---"):          # strip YAML front matter for display
-        end = text.find("\n---", 3)
-        if end != -1:
-            text = text[end + 4:]
-    if _markdown is not None:
-        body = _markdown.markdown(text, extensions=["tables", "fenced_code"])
-    else:
-        from html import escape
-        body = f"<pre style='white-space:pre-wrap'>{escape(text)}</pre>"
-    page = f"""<!doctype html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{path.stem} — Footnote</title>
-<link rel="icon" href="/favicon.svg" type="image/svg+xml">
-<link rel="stylesheet" href="/static/style.css"></head>
-<body class="report"><main class="report-body">
-<p><a href="/">← Footnote</a> &nbsp;·&nbsp;
-<a href="/jobs/{job_id}/report.md" download>Download .md</a></p>
-{body}</main></body></html>"""
-    return HTMLResponse(page)
+    _, text = pipeline.split_front_matter(path.read_text(encoding="utf-8"))
+    nav = (f'<a href="/">← Footnote</a> &nbsp;·&nbsp; '
+           f'<a href="/jobs/{job_id}/report.md" download>Download .md</a>'
+           f' &nbsp;·&nbsp; '
+           f'<a href="/jobs/{job_id}/bundle.zip">Download everything (.zip)</a>')
+    return _page(path.stem, nav, _render_markdown(text))
 
 
-@app.get("/jobs/{job_id}/sources/{name}")
-async def report_source(job_id: str, name: str):
-    # Makes the report's relative "local copy" links work in the web view
-    # too, not only in the notes folder.
-    if "/" in name or name.startswith("."):
+def _source_file(job_id: str, name: str) -> Path:
+    """Resolve an archived source copy by file name only — never by path."""
+    if "/" in name or "\\" in name or name.startswith("."):
         raise HTTPException(404, "Not found")
     path = _report_file(job_id).parent / "sources" / name
     if not path.is_file():
         raise HTTPException(404, "No such source copy")
-    return PlainTextResponse(path.read_text(encoding="utf-8"),
-                             media_type="text/plain; charset=utf-8")
+    return path
+
+
+def _head(path: Path, limit: int = 1024) -> str:
+    with path.open(encoding="utf-8", errors="replace") as fh:
+        return fh.read(limit)
+
+
+def _source_entries(job: dict, folder: Path) -> list:
+    """Every source behind a dossier: what was cited, what was archived.
+
+    The citation list recorded on the job is the spine (it carries the ones
+    that could *not* be archived, and why); the files actually present in
+    `sources/` decide what is readable, so a copy deleted in the notes folder
+    degrades to a plain citation instead of a broken link. Dossiers written
+    before jobs kept a citation list are described by their files alone.
+    """
+    files = {f.name: f for f in sorted((folder / "sources").glob("*.md"))}
+    listed = [(cit.get("title", ""), cit.get("url", ""),
+               cit.get("file", "") if cit.get("file") in files else "",
+               cit.get("note", ""))
+              for cit in job.get("citations") or []]
+    known = {name for _, _, name, _ in listed}
+    for name, path in files.items():
+        if name not in known:
+            meta, _ = pipeline.split_front_matter(_head(path))
+            listed.append((meta.get("title", ""), meta.get("source", ""),
+                           name, ""))
+
+    base = f"/jobs/{job['id']}/sources/"
+    return [
+        {"n": n,
+         "title": title or url or name,
+         "url": url if _safe_url(url) else "",
+         "file": name,
+         "archived": bool(name),
+         "read_url": base + quote(name) if name else "",
+         "download_url": f"{base}{quote(name)}?raw=1" if name else "",
+         "bytes": files[name].stat().st_size if name else 0,
+         "note": note}
+        for n, (title, url, name, note) in enumerate(listed, start=1)
+    ]
+
+
+@app.get("/jobs/{job_id}/sources")
+async def list_sources(job_id: str):
+    """The dossier's source apparatus, for reading and downloading in the app."""
+    report = _report_file(job_id)
+    job = jobs.data[job_id]
+    entries = _source_entries(job, report.parent)
+    return {
+        "job_id": job_id,
+        "question": job.get("question", ""),
+        "report_name": report.name,
+        "report_url": f"/jobs/{job_id}/report",
+        "markdown_url": f"/jobs/{job_id}/report.md",
+        "bundle_url": f"/jobs/{job_id}/bundle.zip",
+        # `sources` is the list; `cited` is what the dossier cited, which is
+        # larger when a question drew more citations than MAX_CITATIONS_KEPT.
+        "cited": job.get("sources_cited", len(entries)),
+        "archived": sum(1 for e in entries if e["archived"]),
+        "sources": entries,
+    }
+
+
+@app.get("/jobs/{job_id}/sources/{name}")
+async def report_source(job_id: str, name: str, raw: int = 0):
+    """One archived source: rendered for reading, `?raw=1` for the file.
+
+    The rendered form is also what the report's relative "local copy" links
+    resolve to in the web view, exactly as they do in a notes app.
+    """
+    path = _source_file(job_id, name)
+    if raw:
+        return FileResponse(path, media_type="text/markdown", filename=path.name)
+    meta, text = pipeline.split_front_matter(path.read_text(encoding="utf-8"))
+    origin = meta.get("source", "")
+    nav = [f'<a href="/jobs/{job_id}/report">← Report</a>']
+    if _safe_url(origin):
+        nav.append(f'<a href="{escape(origin, quote=True)}" target="_blank" '
+                   f'rel="noopener noreferrer">Original page ↗</a>')
+    nav.append('<a href="?raw=1" download>Download .md</a>')
+    title = meta.get("title") or path.stem
+    heading = (f'<h1>{escape(title)}</h1>'
+               f'<p class="source-note">Archived copy'
+               + (f", retrieved {escape(meta['retrieved'])}"
+                  if meta.get("retrieved") else "") + '</p>')
+    return _page(title, " &nbsp;·&nbsp; ".join(nav),
+                 heading + _render_markdown(text))
+
+
+def _zip_bundle(report: Path) -> bytes:
+    """The report and its archived sources, laid out as they are on disk."""
+    folder = report.parent
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.write(report, f"{folder.name}/{report.name}")
+        for path in sorted((folder / "sources").glob("*.md")):
+            archive.write(path, f"{folder.name}/sources/{path.name}")
+    return buf.getvalue()
+
+
+@app.get("/jobs/{job_id}/bundle.zip")
+async def bundle_zip(job_id: str):
+    report = _report_file(job_id)
+    data = await asyncio.to_thread(_zip_bundle, report)
+    return Response(data, media_type="application/zip",
+                    headers=_attachment(f"{report.parent.name}.zip"))
 
 
 @app.post("/subscribe")
@@ -521,7 +768,8 @@ async def health():
     return {
         "status": "ok",
         "app": "Footnote",
-        "output_dir": str(OUTPUT_DIR),
+        # Where the dossiers are filed is the server's business — clients get
+        # told whether the folder works, not where it is.
         "output_dir_writable": os.access(OUTPUT_DIR.parent, os.W_OK)
                                or os.access(OUTPUT_DIR, os.W_OK),
         "parallel_configured": bool(PARALLEL_API_KEY),

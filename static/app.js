@@ -7,6 +7,10 @@ const $ = (id) => document.getElementById(id);
 const ACTIVE = new Set(["queued", "researching", "archiving", "saving"]);
 let pollTimer = null;
 let pushConfigured = false;
+// Which source panels the reader has open, and what they hold — polling
+// re-renders the whole list, and an open panel must survive that.
+const openSources = new Set();
+const sourcesCache = new Map();
 
 // --------------------------------------------------------------------
 // Boot
@@ -21,11 +25,14 @@ let pushConfigured = false;
     const health = await fetchJSON("/health");
     pushConfigured = health.push_configured;
     $("server-note").textContent =
-      `Saving to ${health.output_dir}` +
+      "Dossiers are filed in the server's notes folder" +
       (health.notion_configured ? " · mirrored to Notion" : "");
     if (!health.parallel_configured) {
       flash("PARALLEL_API_KEY is not configured on the server — research " +
             "jobs will fail. See README.", true);
+    } else if (!health.output_dir_writable) {
+      flash("The server cannot write to its output folder — research will " +
+            "fail when it tries to save. See README.", true);
     }
   } catch (e) { /* offline shell — the list will populate when back online */ }
   offerPush();
@@ -114,6 +121,8 @@ function renderJob(job) {
     links.className = "links";
     links.appendChild(link(`/jobs/${job.id}/report`, "Report"));
     links.appendChild(link(`/jobs/${job.id}/report.md`, ".md"));
+    links.appendChild(sourcesToggle(job));
+    links.appendChild(link(`/jobs/${job.id}/bundle.zip`, "Everything (.zip)"));
     if (job.notion_url) links.appendChild(link(job.notion_url, "Notion"));
     if (job.progress) {
       const note = text("span", job.progress.replace(/^Done — /, ""));
@@ -129,13 +138,96 @@ function renderJob(job) {
     del.textContent = "remove";
     del.onclick = async () => {
       await fetchJSON(`/jobs/${job.id}`, { method: "DELETE" }).catch(() => {});
+      openSources.delete(job.id);
+      sourcesCache.delete(job.id);
       refreshJobs();
     };
     meta.appendChild(del);
   }
 
   li.appendChild(meta);
+  if (job.status === "done") {
+    const panel = document.createElement("div");
+    panel.className = "sources";
+    panel.hidden = !openSources.has(job.id);
+    li.appendChild(panel);
+    if (!panel.hidden) fillSources(job.id, panel);
+  }
   return li;
+}
+
+// --------------------------------------------------------------------
+// Source material: read a local copy, download one, or download the lot
+// --------------------------------------------------------------------
+
+function sourcesToggle(job) {
+  const button = document.createElement("button");
+  button.className = "linkish";
+  const count = job.sources_cited;
+  button.textContent = "Sources" + (count ? ` (${count})` : "");
+  button.onclick = () => {
+    const panel = button.closest(".job").querySelector(".sources");
+    panel.hidden = !panel.hidden;
+    if (panel.hidden) openSources.delete(job.id);
+    else { openSources.add(job.id); fillSources(job.id, panel); }
+  };
+  return button;
+}
+
+async function fillSources(jobId, panel) {
+  let data = sourcesCache.get(jobId);
+  if (!data) {
+    panel.textContent = "Loading sources…";
+    try {
+      data = await fetchJSON(`/jobs/${jobId}/sources`);
+      sourcesCache.set(jobId, data);
+    } catch (e) {
+      panel.textContent = "Could not list the sources: " + e.message;
+      return;
+    }
+  }
+  panel.textContent = "";
+  if (!data.sources.length) {
+    panel.textContent = "No sources recorded for this dossier.";
+    return;
+  }
+  const list = document.createElement("ol");
+  for (const src of data.sources) list.appendChild(renderSource(src));
+  panel.appendChild(list);
+  const foot = document.createElement("p");
+  foot.className = "srcs-foot";
+  foot.appendChild(text("span",
+    `${data.archived} of ${data.cited} archived locally · `));
+  foot.appendChild(link(data.bundle_url, "download report + sources (.zip)"));
+  panel.appendChild(foot);
+}
+
+function renderSource(src) {
+  const li = document.createElement("li");
+  // Archived: read the local copy. Not archived: the live page is all there is.
+  const title = src.archived ? link(src.read_url, src.title)
+              : src.url ? link(src.url, src.title)
+              : text("span", src.title);
+  title.className = "src-title";
+  li.appendChild(title);
+
+  const row = document.createElement("span");
+  row.className = "src-links";
+  if (src.archived) {
+    row.appendChild(link(src.download_url, ".md"));
+    if (src.url) row.appendChild(link(src.url, "original ↗"));
+    row.appendChild(text("span", size(src.bytes)));
+  } else {
+    row.appendChild(text("span",
+      src.note ? `not archived — ${src.note}` : "not archived"));
+  }
+  li.appendChild(row);
+  return li;
+}
+
+function size(bytes) {
+  if (!bytes) return "";
+  return bytes < 1024 ? `${bytes} B` : `${Math.round(bytes / 1024)} KB`;
 }
 
 // --------------------------------------------------------------------
@@ -217,7 +309,10 @@ function link(href, label) {
   const a = document.createElement("a");
   a.href = href;
   a.textContent = label;
-  if (href.startsWith("http")) a.target = "_blank";
+  if (href.startsWith("http")) {         // off-site: new tab, no opener handle
+    a.target = "_blank";
+    a.rel = "noopener noreferrer";
+  }
   return a;
 }
 

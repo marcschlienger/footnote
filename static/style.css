@@ -163,7 +163,13 @@ li.job {
 .badge.done { background: var(--ok); }
 .badge.failed { background: var(--rule-red); }
 .job .progress { flex-basis: 100%; }
-.job .links { flex-basis: 100%; display: flex; gap: .9rem; }
+.job .links {
+  flex-basis: 100%;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: .35rem .9rem;
+}
 .job a { color: var(--pen-blue); text-decoration: none; font-weight: 600; }
 .job a:hover { text-decoration: underline; }
 .job .del {
@@ -171,6 +177,43 @@ li.job {
   font-size: .84rem; padding: 0; cursor: pointer; margin-left: auto;
 }
 .job .del:hover { color: var(--rule-red); }
+.job .linkish {
+  background: none;
+  border: none;
+  padding: 0;
+  font: 600 .84rem var(--sans);
+  color: var(--pen-blue);
+  cursor: pointer;
+}
+.job .linkish:hover { text-decoration: underline; }
+
+/* Source panel inside a job card ------------------------------------- */
+.sources {
+  margin-top: .7rem;
+  padding-top: .65rem;
+  border-top: 1px solid #E2D8BE;
+  font-size: .85rem;
+  color: var(--ink-soft);
+}
+.sources ol { margin: 0; padding-left: 1.5rem; }
+.sources li { margin-bottom: .5rem; }
+.sources li::marker { font-variant-numeric: tabular-nums; }
+.sources .src-title {
+  display: block;
+  font: 600 .93rem/1.35 var(--serif);
+  overflow-wrap: anywhere;
+}
+.sources span.src-title { color: var(--ink); font-weight: 500; }
+.sources .src-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .75rem;
+  margin-top: .1rem;
+  font-size: .8rem;
+}
+.sources .src-links a { font-weight: 600; }
+.srcs-foot { margin: .75rem 0 0; font-size: .8rem; }
+
 .spin {
   display: inline-block; width: .8em; height: .8em;
   border: 2px solid var(--pen-blue); border-top-color: transparent;
@@ -191,6 +234,12 @@ body.report { background: var(--paper); }
   font: 1.02rem/1.65 var(--serif);
 }
 .report-body h1, .report-body h2, .report-body h3 { font-family: var(--serif); }
+.report-body .page-nav { font: .9rem var(--sans); color: var(--ink-soft); }
+.report-body .source-note {
+  margin: .35rem 0 1.5rem;      /* h1 above it carries no bottom margin */
+  font: .85rem var(--sans);
+  color: var(--ink-soft);
+}
 .report-body h1 { font-size: 1.6rem; line-height: 1.25; }
 .report-body h2 {
   font-size: 1.25rem;
@@ -199,6 +248,9 @@ body.report { background: var(--paper); }
   margin-top: 2rem;
 }
 .report-body a { color: var(--pen-blue); }
+/* A link whose URL was rejected as unsafe keeps its text but loses its href —
+   it should not go on looking clickable. */
+.report-body a:not([href]) { color: inherit; }
 .report-body blockquote {
   margin: .6rem 0 .6rem .2rem;
   padding: .1rem 0 .1rem .8rem;

@@ -16,6 +16,11 @@ cited page, so the evidence is still there when links rot. Point
 and research lands in your notes; enable Web Push and your phone buzzes when
 it's done.
 
+The dossier is also readable where you asked for it: the PWA lists every
+source behind a finished report, renders the archived copies in the browser,
+and hands you the whole folder as a zip — useful from a phone that doesn't
+sync the notes folder at all.
+
 It is a single small FastAPI app designed for personal use, in the same shape
 as Margin: run it on a Mac or an Ubuntu server, talk to it from the built-in
 PWA, an iOS Shortcut, or any HTTP client.
@@ -116,13 +121,17 @@ finishes.
   "processor": "core", "status": "researching",
   "progress": "Researching on Parallel (core) — this can take a while…",
   "created_at": "2026-08-04T09:12:44Z",
-  "report_path": "", "notion_url": "", "error": "" }
+  "notion_url": "", "error": "" }
 ```
 
 `status` walks `queued → researching → archiving → saving → done` (or
 `failed`, with `error` set). Once `done`, the response also carries
-`report_path` (absolute path of the dossier on the server),
-`sources_cited`, `sources_archived`, and `finished_at`.
+`report_name` (the dossier's file name), `sources_cited`,
+`sources_archived`, and `finished_at`.
+
+Where the dossier sits on the server is deliberately not in the response.
+Clients address research by job id; the filesystem layout is the server's
+business, and error messages have server paths scrubbed out of them.
 
 ### `GET /jobs` — recent jobs
 
@@ -138,12 +147,54 @@ folder is the record.
 
 ### `GET /jobs/{job_id}/report` — read the dossier
 
-Server-rendered HTML view of the report (paper-styled, with a download
-link) — this is what the push notification opens.
-`GET /jobs/{job_id}/report.md` serves the raw Markdown, and
-`GET /jobs/{job_id}/sources/{file}` serves an archived source copy, so the
-report's relative "local copy" links work in the browser exactly as they do
-in your notes app.
+Server-rendered HTML view of the report (paper-styled) — this is what the
+push notification opens. `GET /jobs/{job_id}/report.md` serves the raw
+Markdown.
+
+Markdown is rendered through an allowlist: the report and the archived
+pages come off the open web, so scripts, event handlers and `javascript:`
+URLs are dropped rather than passed through into a page that holds your
+session cookie.
+
+### `GET /jobs/{job_id}/sources` — the evidence, listed
+
+Every source behind the dossier, whether or not it could be archived:
+
+```json
+{ "job_id": "df31fcbed547", "cited": 9, "archived": 7,
+  "bundle_url": "/jobs/df31fcbed547/bundle.zip",
+  "sources": [
+    { "n": 1, "title": "Creatine and cognitive performance — meta-analysis",
+      "url": "https://…", "file": "01 Creatine and cognitive….md",
+      "archived": true, "bytes": 48210, "note": "",
+      "read_url": "/jobs/df31fcbed547/sources/01%20Creatine%20and%20…",
+      "download_url": "/jobs/df31fcbed547/sources/01%20Creatine%20and%20…?raw=1" },
+    { "n": 2, "title": "Journal of Nutrition", "url": "https://…",
+      "file": "", "archived": false, "bytes": 0, "note": "HTTP 403" } ]}
+```
+
+The archived copies on disk decide what is readable, so a file you moved or
+deleted in your notes folder degrades to a plain citation rather than a
+broken link. `cited` is what the dossier cited; `sources` lists them, and is
+shorter for a question that drew more than 100 citations.
+
+### `GET /jobs/{job_id}/sources/{file}` — read one source
+
+The archived page, rendered in the same paper style, with a link back to the
+report and out to the original. This is also where the report's relative
+"local copy" links land in the browser, exactly as they do in your notes app.
+Add `?raw=1` for the Markdown file itself, frontmatter and all.
+
+### `GET /jobs/{job_id}/bundle.zip` — take the lot
+
+The report and every archived source in one zip, folded exactly as they sit
+in your notes folder:
+
+```
+2026-08-04 what is the current evidence on creatine and cognition/
+├── what is the current evidence on creatine and cognition.md
+└── sources/01 Creatine and cognitive performance — meta-analysis.md
+```
 
 ### `POST /subscribe` — register for push
 
@@ -164,14 +215,16 @@ build their own depth picker.
 
 ```json
 { "status": "ok", "app": "Footnote",
-  "output_dir": "/home/marc/Research/inbox", "output_dir_writable": true,
+  "output_dir_writable": true,
   "parallel_configured": true, "firecrawl_configured": true,
   "notion_configured": false, "push_configured": true,
   "auth_required": true, "active_jobs": 1 }
 ```
 
 Always public (it reports `auth_required` so clients can detect the token
-requirement). The PWA uses it to warn about missing configuration.
+requirement), which is also why it says whether the output folder can be
+written but not where it is. The PWA uses it to warn about missing
+configuration.
 
 ## The dossier
 
@@ -238,7 +291,9 @@ Details worth knowing:
   paywalls) are listed with the reason instead — the dossier records what it
   *couldn't* keep, too.
 - **Everything is plain Markdown with relative links** — the folder is
-  self-contained: sync it, move it, zip it, nothing breaks.
+  self-contained: sync it, move it, zip it, nothing breaks. The same links
+  resolve in the web view, which is why a dossier reads the same in Obsidian
+  and in the browser.
 
 ## Configuration
 
@@ -375,10 +430,10 @@ into that person's own (synced) folder, and has its own port, token, and job
 history. From a checkout on the server:
 
 ```bash
-sudo bash deploy/install.sh                    # shared platform (once)
-sudoedit /opt/footnote/.env                    # shared API keys
-sudo bash deploy/add-instance.sh marc 8010     # one line per person
-sudo bash deploy/add-instance.sh anna 8011
+sudo bash deploy/install.sh                          # shared platform (once)
+sudoedit /opt/footnote/.env                          # shared API keys
+sudo bash deploy/add-instance.sh <user> 8010         # one line per person
+sudo bash deploy/add-instance.sh <other-user> 8011
 ```
 
 `install.sh` sets up the shared parts — code and venv in `/opt/footnote` and
@@ -393,9 +448,9 @@ Both are idempotent. API keys resolve per-person first
 Day-2 operations:
 
 ```bash
-systemctl status footnote@marc
-journalctl -u footnote@marc -f
-sudoedit /etc/footnote/marc.env && sudo systemctl restart footnote@marc
+systemctl status footnote@<user>
+journalctl -u footnote@<user> -f
+sudoedit /etc/footnote/<user>.env && sudo systemctl restart footnote@<user>
 sudo bash deploy/install.sh && sudo systemctl restart 'footnote@*'   # upgrade
 ```
 
@@ -405,9 +460,12 @@ Tailscale, WireGuard) and/or use the per-instance `FOOTNOTE_TOKEN`.
 ## Clients
 
 - **The PWA** — open `http://YOUR-SERVER:8010/`: ask, pick a depth, watch
-  status live, read finished reports. On iPhone/iPad, Safari Share → **Add
-  to Home Screen** installs it as a full-screen app with the Footnote icon
-  (and enables push). With a token set, it prompts once on first launch.
+  status live, read finished reports, and open **Sources** on any finished
+  dossier to read the archived pages in the browser, download one as
+  Markdown, or take the report and every source as a single zip. On
+  iPhone/iPad, Safari Share → **Add to Home Screen** installs it as a
+  full-screen app with the Footnote icon (and enables push). With a token
+  set, it prompts once on first launch.
 - **iOS Shortcut** — "Ask Footnote": dictate a question to Siri or share
   selected text from any app; build instructions in
   [shortcut_setup.md](shortcut_setup.md).
@@ -436,6 +494,9 @@ Tailscale, WireGuard) and/or use the per-instance `FOOTNOTE_TOKEN`.
   the dossier lists them with the reason instead.
 - Authentication is optional and coarse — one shared token per instance, no
   rate limiting. Keep the server on a private network regardless.
+- **The bundle zip is built in memory** and holds the report plus the
+  archived sources — fine at Footnote's scale (Markdown, capped by
+  `MAX_SOURCES`), not a general-purpose folder export.
 - Planned: budget guardrails (per-month task caps), scheduled standing
   questions, and a dossier index over `OUTPUT_DIR` in the PWA.
 
