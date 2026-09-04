@@ -69,6 +69,17 @@ chmod -R a+rX "$APP_DIR"
 groupadd -f "$SHARED_GROUP"
 chgrp "$SHARED_GROUP" "$APP_DIR/.env"
 chmod 640 "$APP_DIR/.env"
+# Instances that already exist were created before the group did, and the
+# upgrade path is this script plus a restart — so put their users in it here
+# rather than leaving a service that cannot read its own keys.
+for env_file in /etc/footnote/*.env; do
+  [ -e "$env_file" ] || continue
+  instance_user="$(basename "$env_file" .env)"
+  if id -u "$instance_user" >/dev/null 2>&1; then
+    usermod -a -G "$SHARED_GROUP" "$instance_user"
+    echo "    $instance_user can read the shared keys"
+  fi
+done
 
 echo "==> Installing systemd template unit footnote@.service"
 mkdir -p /etc/footnote

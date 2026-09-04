@@ -475,6 +475,13 @@ account.
 Both are idempotent. API keys resolve per-person first
 (`/etc/footnote/<user>.env`), then shared (`/opt/footnote/.env`).
 
+Upgrading is `install.sh` plus a restart, and `install.sh` repairs what it
+needs to: existing instance users are added to the `footnote` group so they
+keep reading the shared keys. If a service ever fails to start after an
+upgrade, `journalctl -u footnote@<user>` says why — Footnote will not exit
+over an unreadable `.env`, it says so and runs on whatever the environment
+provides.
+
 Day-2 operations:
 
 ```bash

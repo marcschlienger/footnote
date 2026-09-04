@@ -1154,6 +1154,26 @@ def test_push_keys_must_decode_to_their_real_sizes():
             {"endpoint": "https://push.test/x", "keys": broken})
 
 
+def test_an_unreadable_env_file_does_not_stop_the_server(tmp_path, monkeypatch):
+    """A permissions problem on an optional file is not a reason not to boot."""
+    env = tmp_path / ".env"
+    env.write_text("PARALLEL_API_KEY=x\n")
+    env.chmod(0o000)
+    monkeypatch.chdir(tmp_path)
+    try:
+        app_module._load_env()          # must not raise
+    finally:
+        env.chmod(0o600)
+
+
+def test_the_installer_repairs_the_instances_it_already_has():
+    """The upgrade path is install.sh plus a restart — it has to be enough."""
+    install = (Path(__file__).resolve().parent.parent
+               / "deploy" / "install.sh").read_text()
+    assert "/etc/footnote/*.env" in install
+    assert "usermod -a -G" in install
+
+
 def test_the_installer_refuses_an_unsupported_python():
     install = (Path(__file__).resolve().parent.parent
                / "deploy" / "install.sh").read_text()

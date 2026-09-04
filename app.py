@@ -78,7 +78,22 @@ except ModuleNotFoundError:      # optional — app works without push
     webpush = None
     WebPushException = Exception
 
-load_dotenv()
+def _load_env() -> None:
+    """Read .env if it is there and readable — and start either way.
+
+    A permissions problem on an optional config file is not a reason to
+    refuse to boot: systemd and per-instance env files may carry everything
+    the app needs, and a process that exits 1 at import is far harder to
+    diagnose than a warning and a /health that reports what is missing.
+    """
+    try:
+        load_dotenv()
+    except OSError as exc:
+        print(f"could not read .env ({exc}); continuing with the environment",
+              flush=True)
+
+
+_load_env()
 
 ROOT = Path(__file__).resolve().parent
 STATIC = ROOT / "static"
