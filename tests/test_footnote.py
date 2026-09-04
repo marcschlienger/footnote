@@ -140,7 +140,7 @@ def test_scrape_sources_mixed_success():
             return await pipeline.scrape_sources(
                 client, "k",
                 [Citation("https://ok.test/a"), Citation("https://bad.test/b")],
-                max_sources=10, limiter=pipeline.ScrapeLimiter(rate_limit=0))
+                pipeline.ScrapeLimiter(rate_limit=0))
 
     ok, bad = asyncio.run(run())
     assert ok.ok and ok.title == "Good page" and ok.markdown == "# Hi"
@@ -160,8 +160,10 @@ def test_scrape_sources_respects_cap():
         async with httpx.AsyncClient(
                 transport=httpx.MockTransport(handler)) as client:
             return await pipeline.scrape_sources(
-                client, "k", [Citation(f"https://s.test/{i}") for i in range(9)],
-                max_sources=3, limiter=pipeline.ScrapeLimiter(rate_limit=0))
+                client, "k",
+                pipeline.scrapable([Citation(f"https://s.test/{i}")
+                                    for i in range(9)], 3),
+                pipeline.ScrapeLimiter(rate_limit=0))
 
     assert len(asyncio.run(run())) == 3 and len(seen) == 3
 
@@ -185,7 +187,7 @@ def _run_scrape(handler, count, concurrency=2, rate_limit=0, **kw):
                 transport=httpx.MockTransport(handler)) as client:
             return await pipeline.scrape_sources(
                 client, "k", [Citation(f"https://s.test/{i}") for i in range(count)],
-                max_sources=count, limiter=limiter, **kw)
+                limiter, **kw)
 
     return asyncio.run(run())
 
@@ -358,8 +360,8 @@ def test_one_limiter_holds_every_job_on_the_key():
         async with httpx.AsyncClient(
                 transport=httpx.MockTransport(handler)) as client:
             await asyncio.gather(
-                pipeline.scrape_sources(client, "k", cits, 6, limiter),
-                pipeline.scrape_sources(client, "k", cits, 6, limiter))
+                pipeline.scrape_sources(client, "k", cits, limiter),
+                pipeline.scrape_sources(client, "k", cits, limiter))
 
     asyncio.run(run())
     assert live["peak"] == 2       # not 4, which is what a per-job limiter gave
@@ -1027,6 +1029,123 @@ def test_an_unusable_job_record_does_not_stay_running(monkeypatch):
     app_module.jobs.data.clear()
 
 
+def test_normalization_validates_rather_than_stringifies(monkeypatch):
+    """A null question becoming "None" is not a repair — it is a runnable lie."""
+    app_module.jobs.data.clear()
+    monkeypatch.setattr(app_module.jobs, "save", lambda: None)
+    app_module.jobs.data.update({
+        "nullq": {"id": "nullq", "question": None, "processor": "core",
+                  "status": "researching", "created_at": "2026-01-01T00:00:00Z"},
+        "dictproc": {"id": "dictproc", "question": "q", "processor": {},
+                     "status": "researching", "created_at": "2026-01-01T00:00:01Z"},
+        "nullstatus": {"id": "nullstatus", "question": "q", "processor": "core",
+                       "status": None, "created_at": "2026-01-01T00:00:02Z"},
+        "unknownproc": {"id": "unknownproc", "question": "q",
+                        "processor": "warp9", "status": "researching",
+                        "created_at": "2026-01-01T00:00:03Z"},
+    })
+    app_module._normalize_jobs()
+
+    for job_id in ("nullq", "dictproc", "nullstatus", "unknownproc"):
+        job = app_module.jobs.data[job_id]
+        assert job["status"] == "failed", job_id
+        assert job.get("question") != "None"
+        assert job.get("processor") != "{}"
+    app_module.jobs.data.clear()
+
+
+def test_a_stored_id_is_reconciled_with_its_key(client, monkeypatch):
+    """The API resolves by key; links are built from the stored id."""
+    monkeypatch.setattr(app_module.jobs, "save", lambda: None)
+    app_module.jobs.data["realkey"] = {
+        "id": "../elsewhere", "question": "q", "processor": "core",
+        "status": "done", "created_at": "2026-01-01T00:00:00Z"}
+    app_module._normalize_jobs()
+    assert app_module.jobs.data["realkey"]["id"] == "realkey"
+    assert client.get("/jobs").json()["jobs"][0]["id"] == "realkey"
+
+
+def test_a_malformed_citation_does_not_break_the_index(client, tmp_path):
+    written = _finished_job(tmp_path)
+    app_module.jobs.data["xyz"]["citations"] = [
+        "not a dict", None,
+        {"url": "https://a.test/1", "title": "Paper A", "file": "01 Paper A.md"},
+        {"url": None, "title": 5, "file": ["nope"]},
+    ]
+    body = client.get("/jobs/xyz/sources").json()
+    assert body["archived"] == 1
+    assert [s["file"] for s in body["sources"] if s["file"]] == ["01 Paper A.md"]
+
+
+def test_parallel_containers_that_are_not_containers(tmp_path):
+    """`for x in 5` is a TypeError, and this run was already paid for."""
+    for payload in (
+        {"run": {"status": "completed"},
+         "output": {"content": "x", "basis": 5}},
+        {"run": {"status": "completed"},
+         "output": {"content": "x", "basis": [{"citations": True}]}},
+        {"run": {"status": "completed"},
+         "output": {"content": "x", "basis": [
+             {"citations": [{"url": "https://a.test/1", "excerpts": 3}]}]}},
+    ):
+        result = pipeline._parse_task_result(payload, "trun_x")
+        assert result.content == "x"
+    assert pipeline._parse_task_result(payload, "trun_x").citations[0].excerpts == []
+
+
+def test_a_retry_wait_never_outlives_its_deadline():
+    """A 120-second Retry-After inside a 1-second budget is not a 120s wait."""
+    slept = []
+
+    async def run():
+        async def fake_sleep(seconds):
+            slept.append(seconds)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(429, headers={"Retry-After": "120"})
+
+        real_sleep = asyncio.sleep
+        asyncio.sleep = fake_sleep
+        try:
+            async with httpx.AsyncClient(
+                    transport=httpx.MockTransport(handler)) as client:
+                with pytest.raises(PipelineError, match="giving up"):
+                    await pipeline.fetch_task_result(client, "k", "trun_x", 1)
+        finally:
+            asyncio.sleep = real_sleep
+
+    asyncio.run(run())
+    assert slept, "no wait happened"
+    assert max(slept) <= 1, slept
+
+
+def test_a_url_with_control_characters_is_rejected_not_cleaned():
+    assert not pipeline.is_http_url("https://a.test/\tx")
+    assert not pipeline.is_http_url("http://a.test/\n")
+    assert pipeline.is_http_url("https://a.test/x")
+
+
+def test_only_a_real_notion_url_is_stored(client, tmp_path, monkeypatch):
+    monkeypatch.setattr(app_module, "OUTPUT_DIR", tmp_path)
+    monkeypatch.setattr(app_module, "NOTION_API_KEY", "n")
+    monkeypatch.setattr(app_module, "NOTION_DATABASE_ID", "d")
+
+    async def junk_url(*a, **kw):
+        return "not a url at all"
+
+    monkeypatch.setattr(pipeline, "save_to_notion", junk_url)
+    monkeypatch.setattr(pipeline, "fetch_task_result",
+                        lambda *a, **kw: _immediately(_sample_result()))
+    written = pipeline.write_report(tmp_path, "Notion url question", "core",
+                                    _sample_result(), [], job_id="nu1")
+    app_module.jobs.data["nu1"] = {
+        "id": "nu1", "question": "Notion url question", "processor": "core",
+        "status": "saving", "created_at": "2026-01-01T00:00:00Z",
+        "run_id": "trun_x", "report_path": str(written.path)}
+    asyncio.run(app_module.run_research("nu1"))
+    assert app_module.jobs.data["nu1"].get("notion_url", "") == ""
+
+
 def test_a_repaired_history_still_serves(client, monkeypatch):
     monkeypatch.setattr(app_module.jobs, "save", lambda: None)
     app_module.jobs.data["broken"] = {"id": "broken", "question": "q",
@@ -1167,7 +1286,12 @@ def test_a_push_endpoint_needs_a_host():
 
 def test_post_processing_stops_when_the_job_is_deleted(client, tmp_path,
                                                        monkeypatch):
-    """A notification for a deleted job would open a 404."""
+    """A notification for a deleted job would open a 404.
+
+    This covers deletion *before* either step starts, which is what the code
+    can suppress. A request already in flight is not cancelled — the
+    documentation says so rather than the code pretending otherwise.
+    """
     monkeypatch.setattr(app_module, "OUTPUT_DIR", tmp_path)
     monkeypatch.setattr(app_module, "NOTION_API_KEY", "n")
     monkeypatch.setattr(app_module, "NOTION_DATABASE_ID", "d")
@@ -1202,6 +1326,13 @@ def test_post_processing_stops_when_the_job_is_deleted(client, tmp_path,
     monkeypatch.setattr(app_module, "_update_job", delete_once_done)
     asyncio.run(app_module.run_research("del1"))
     assert called == {"notion": 0, "push": 0}
+
+
+def test_nothing_is_written_back_to_a_deleted_job():
+    """The other half of the race: a late write must not resurrect a record."""
+    app_module.jobs.data.clear()
+    app_module._update_job("gone", notion_url="https://notion.test/p")
+    assert "gone" not in app_module.jobs.data
 
 
 def test_a_symlinked_report_is_not_served(client, tmp_path):
@@ -1389,27 +1520,27 @@ def test_a_multiline_method_note_stays_in_its_block_quote(tmp_path):
     assert note == "> First line.\n>\n> ## Not a heading, surely"
 
 
-def test_only_http_citations_are_sent_to_firecrawl():
-    """mailto: is a fine citation and a pointless scrape."""
+def test_the_prepared_list_is_exactly_what_is_attempted():
+    """One place decides: scrapable() prepares, scrape_sources attempts."""
     seen = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen.append(json.loads(request.content)["url"])
         return _ok_scrape(request)
 
+    citations = [Citation("https://a.test/1"), Citation("mailto:x@example.test"),
+                 Citation("javascript:alert(1)")]
+    todo = pipeline.scrapable(citations, 10)      # mailto: is a pointless scrape
+
     async def run():
         limiter = pipeline.ScrapeLimiter(rate_limit=0, concurrency=2)
         async with httpx.AsyncClient(
                 transport=httpx.MockTransport(handler)) as client:
-            return await pipeline.scrape_sources(
-                client, "k",
-                [Citation("https://a.test/1"), Citation("mailto:x@example.test"),
-                 Citation("javascript:alert(1)")],
-                max_sources=10, limiter=limiter)
+            return await pipeline.scrape_sources(client, "k", todo, limiter)
 
     copies = asyncio.run(run())
     assert seen == ["https://a.test/1"]
-    assert len(copies) == 1
+    assert len(copies) == len(todo) == 1
 
 
 def test_an_unreadable_response_body_is_retried_and_named(monkeypatch):

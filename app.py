@@ -188,8 +188,15 @@ class JsonStore:
 jobs = JsonStore(DATA_DIR / "jobs.json")
 subs = JsonStore(DATA_DIR / "subscriptions.json")
 
-_JOB_TEXT_FIELDS = ("id", "question", "processor", "status", "created_at",
-                    "progress", "error", "report_path", "notion_url")
+# Fields that are only rendered or ordered by: whatever they hold becomes
+# text, which is all sorting needs.
+_JOB_DISPLAY_FIELDS = ("progress", "error", "notion_url", "finished_at",
+                       "created_at")
+# Fields the app acts on. Stringifying these is worse than dropping them —
+# None becomes "None", {} becomes "{}", and both are truthy.
+_JOB_SEMANTIC_FIELDS = ("question", "processor", "status", "run_id",
+                        "report_path")
+_TERMINAL_STATUSES = ("done", "failed")
 
 
 def _normalize_jobs() -> None:
@@ -197,22 +204,30 @@ def _normalize_jobs() -> None:
 
     A record is read by the orchestrator, the poll endpoint, the trimmer and
     the deleter, all of which assumed fields that a hand-edited or truncated
-    file need not have. An active job missing its question cannot be resumed
-    at all — the alternative to failing it here is a task that dies on a
-    KeyError while the record says "researching" for ever.
+    file need not have. Semantic fields are *validated*, never coerced: a
+    question of `null` stringified into "None" is not a repair, it is a
+    corrupt record made to look runnable.
     """
     changed = False
     for job_id, job in list(jobs.data.items()):
-        for field in _JOB_TEXT_FIELDS:
+        if job.get("id") != job_id:
+            # The API resolves by key; the PWA and the source index build
+            # links from the stored id. They have to be the same string.
+            job["id"] = job_id
+            changed = True
+        for field in _JOB_DISPLAY_FIELDS:
             if field in job and not isinstance(job[field], str):
-                job[field] = str(job[field])      # sorting compares strings
+                job[field] = str(job[field])
                 changed = True
-        job.setdefault("id", job_id)
-        if not job.get("status"):
+        for field in _JOB_SEMANTIC_FIELDS:
+            if field in job and not isinstance(job[field], str):
+                del job[field]                    # absent beats nonsense
+                changed = True
+
+        if job.get("status") not in ACTIVE_STATUSES + _TERMINAL_STATUSES:
             job["status"] = "failed"
             changed = True
-        if job["status"] in ACTIVE_STATUSES and not (job.get("question")
-                                                     and job.get("processor")):
+        if job["status"] in ACTIVE_STATUSES and not _resumable(job):
             job.update(status="failed", finished_at=_now(),
                        error="Incomplete job record; cannot be resumed",
                        progress="Failed: incomplete job record")
@@ -220,6 +235,17 @@ def _normalize_jobs() -> None:
     if changed:
         jobs.save()
         print("job history repaired on load", flush=True)
+
+
+def _resumable(job: dict) -> bool:
+    """Whether run_research could actually run this record.
+
+    The processor is checked against the real list: it is sent to Parallel
+    verbatim, and an unknown one is refused at submission but was never
+    re-checked on the way back in.
+    """
+    return bool(job.get("question", "").strip()
+                and job.get("processor") in ALL_PROCESSORS)
 
 
 def _valid_subscription(sub) -> bool:
@@ -350,12 +376,12 @@ async def run_research(job_id: str) -> None:
     # Normalization at load should have caught this; checked again because the
     # cost of being wrong is a task that dies here while the record says
     # "researching" for ever.
-    question, processor = job.get("question"), job.get("processor")
-    if not (question and processor):
+    if not _resumable(job):
         _update_job(job_id, status="failed", finished_at=_now(),
                     error="Incomplete job record; cannot be resumed",
                     progress="Failed: incomplete job record")
         return
+    question, processor = job["question"], job["processor"]
     client: httpx.AsyncClient = app.state.client
     # A dossier already on disk from an interrupted run: the research is paid
     # for and filed, so it is adopted rather than repeated. The same test the
@@ -376,8 +402,10 @@ async def run_research(job_id: str) -> None:
         result = await pipeline.fetch_task_result(
             client, PARALLEL_API_KEY, run_id, deadline)
 
-        # 2. Archive cited sources locally (optional, best-effort)
+        # 2. Archive cited sources locally (optional, best-effort). The list
+        # is prepared once: what is announced is exactly what is attempted.
         sources = []
+        todo = pipeline.scrapable(result.citations, MAX_SOURCES)
         if resumed is not None:
             # The copies are on disk; what did not survive is the record of
             # which citation each belongs to. Read it back off the folder.
@@ -388,8 +416,7 @@ async def run_research(job_id: str) -> None:
             archived = len(written.source_files)
             print(f"[{job_id}] adopting the dossier written before the restart",
                   flush=True)
-        elif FIRECRAWL_API_KEY and MAX_SOURCES > 0 and _to_archive(result):
-            todo = _to_archive(result)
+        elif FIRECRAWL_API_KEY and MAX_SOURCES > 0 and todo:
             n = len(todo)
             _update_job(job_id, status="archiving",
                         progress=f"Archiving {n} cited source{'s' * (n != 1)}…")
@@ -400,7 +427,7 @@ async def run_research(job_id: str) -> None:
                 _update_job(job_id, progress=f"Archiving sources… {done}/{total}")
 
             sources = await pipeline.scrape_sources(
-                client, FIRECRAWL_API_KEY, todo, len(todo),
+                client, FIRECRAWL_API_KEY, todo,
                 app.state.limiter, on_progress=archived_so_far)
 
         # 3. Write the dossier into the synced folder
@@ -440,7 +467,9 @@ async def run_research(job_id: str) -> None:
             try:
                 notion_url = await pipeline.save_to_notion(
                     client, NOTION_API_KEY, NOTION_DATABASE_ID, question, result)
-                _update_job(job_id, notion_url=notion_url)
+                # Only a real link reaches the PWA, which renders it as one.
+                if pipeline.is_http_url(notion_url):
+                    _update_job(job_id, notion_url=notion_url)
             except Exception as exc:                       # noqa: BLE001
                 # Everything, not just PipelineError: a DNS failure or an HTML
                 # body where JSON was promised would otherwise escape and
@@ -462,11 +491,6 @@ async def run_research(job_id: str) -> None:
         _update_job(job_id, status="failed", error=f"Unexpected error: {reason}",
                     progress=f"Failed: {reason}", finished_at=_now())
         await notify_all("Research failed", f"“{_ellipsize(question)}”: {reason}")
-
-
-def _to_archive(result) -> list:
-    """The citations archiving will attempt — the same list it announces."""
-    return pipeline.scrapable(result.citations, MAX_SOURCES)
 
 
 def _citation_records(result, sources: list, written) -> list:
@@ -950,6 +974,10 @@ def _source_file(job_id: str, name: str) -> Path:
     return path
 
 
+def _str(value) -> str:
+    return value if isinstance(value, str) else ""
+
+
 def _size(path: Path) -> int:
     try:
         return path.stat().st_size
@@ -976,10 +1004,13 @@ def _source_entries(job: dict, folder: Path) -> list:
     # whole index down when its size is asked for.
     files = {f.name: f for f in sorted((folder / "sources").glob("*.md"))
              if f.is_file() and _inside(f, folder)}
-    listed = [(cit.get("title", ""), cit.get("url", ""),
-               cit.get("file", "") if cit.get("file") in files else "",
-               cit.get("note", ""))
-              for cit in job.get("citations") or []]
+    # Records come off a JSON file that can be edited or truncated; one bad
+    # entry should cost that entry, not the whole index.
+    listed = [(_str(cit.get("title")), _str(cit.get("url")),
+               _str(cit.get("file")) if _str(cit.get("file")) in files else "",
+               _str(cit.get("note")))
+              for cit in job.get("citations") or []
+              if isinstance(cit, dict)]
     known = {name for _, _, name, _ in listed}
     for name, path in files.items():
         if name not in known:

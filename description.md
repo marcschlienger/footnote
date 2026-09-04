@@ -65,7 +65,12 @@ queued ──► researching ──► archiving ──► saving ──► done
   one store write: status, summary, citation records, counts, `finished_at`.
   That write is the job's durable checkpoint. Everything after it — the
   optional Notion mirror, the push notification — is post-processing that
-  updates `notion_url` at most and cannot leave a job looking unfinished. The
+  updates `notion_url` at most and cannot leave a job looking unfinished.
+  Both are skipped if the job has been deleted by the time they start, and
+  `_update_job` is a no-op for a job that is gone, so nothing is written back
+  to a removed record. Neither is *cancelled* mid-call, though: a request
+  already in flight finishes, so deletion suppresses the steps that have not
+  begun and not the one that has. The
   mirror's failures are logged and never fatal, *any* failure and not only a
   PipelineError, because the dossier is already on disk by then. The flip
   side is worth stating: a crash *after* the checkpoint skips both

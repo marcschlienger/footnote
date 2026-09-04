@@ -82,14 +82,23 @@ def is_http_url(url: str) -> bool:
     address, and such a value would otherwise be stored and retried forever
     as a push endpoint.
     """
-    cleaned = re.sub(r"[\x00-\x20]", "", str(url or ""))
-    match = _SCHEME.match(cleaned)
+    text = str(url or "")
+    # Rejected, not cleaned: callers keep the original string, so validating a
+    # scrubbed version would bless a value nobody else has seen.
+    if text != re.sub(r"[\x00-\x20]", "", text):
+        return False
+    match = _SCHEME.match(text)
     if match is None or match.group(1).lower() not in ("http", "https"):
         return False
     try:
-        return bool(urlsplit(cleaned).netloc)
+        return bool(urlsplit(text).netloc)
     except ValueError:
         return False
+
+
+def _as_list(value) -> list:
+    """A JSON array, or nothing. `for x in 5` is a TypeError, not a shape."""
+    return value if isinstance(value, list) else []
 
 
 def _text(value, fallback: str = "") -> str:
@@ -214,19 +223,26 @@ async def fetch_task_result(
             resp = await client.get(
                 f"{PARALLEL_BASE}/tasks/runs/{run_id}/result",
                 headers={"x-api-key": api_key},
+                # Never poll for longer than the deadline allows; the
+                # endpoint's own minimum is 10 s, so a shorter remainder just
+                # means this is the last attempt.
                 params={"timeout": int(min(120, max(10, remaining)))},
+                # (the deadline check at the top of the loop ends it)
                 timeout=httpx.Timeout(150.0, connect=15.0),
             )
         except httpx.TransportError:
-            await asyncio.sleep(10)   # transient network blip; run is server-side
+            # A transient blip; the run is server-side and keeps going.
+            await asyncio.sleep(min(10, max(remaining, 0)))
             continue
         if resp.status_code == 408:   # still running
             continue
         if resp.status_code in RETRYABLE_STATUS:
             # The run is finished and paid for; a rate limit or a bad gateway
-            # in front of the result is no reason to throw it away. The
-            # deadline above still bounds this.
-            await asyncio.sleep(_retry_after(resp, RESULT_RETRY_S))
+            # in front of the result is no reason to throw it away — but the
+            # wait has to fit inside what is left of the deadline, or the
+            # bound the caller was given is not a bound.
+            await asyncio.sleep(min(_retry_after(resp, RESULT_RETRY_S),
+                                    max(remaining, 0)))
             continue
         if resp.status_code != 200:
             raise PipelineError(
@@ -238,7 +254,8 @@ async def fetch_task_result(
         except ValueError:
             payload = None
         if not isinstance(payload, dict):
-            await asyncio.sleep(RESULT_RETRY_S)   # a broken hop, not an answer
+            # A broken hop, not an answer.
+            await asyncio.sleep(min(RESULT_RETRY_S, max(remaining, 0)))
             continue
         return _parse_task_result(payload, run_id)
 
@@ -265,12 +282,12 @@ def _parse_task_result(data: dict, run_id: str) -> ResearchResult:
     citations: list[Citation] = []
     seen: set[str] = set()
     confidence = reasoning = ""
-    for basis in output.get("basis") or []:
+    for basis in _as_list(output.get("basis")):
         if not isinstance(basis, dict):
             continue
         confidence = confidence or _text(basis.get("confidence"))
         reasoning = reasoning or _text(basis.get("reasoning"))
-        for cit in basis.get("citations") or []:
+        for cit in _as_list(basis.get("citations")):
             if not isinstance(cit, dict):
                 continue
             url = _text(cit.get("url")).strip()
@@ -281,7 +298,7 @@ def _parse_task_result(data: dict, run_id: str) -> ResearchResult:
                 Citation(
                     url=url,
                     title=_text(cit.get("title")).strip(),
-                    excerpts=[_text(e) for e in (cit.get("excerpts") or [])
+                    excerpts=[_text(e) for e in _as_list(cit.get("excerpts"))
                               if _text(e)],
                 )
             )
@@ -418,8 +435,7 @@ def _retry_after(resp: httpx.Response, fallback_s: float) -> float:
 async def scrape_sources(
     client: httpx.AsyncClient,
     api_key: str,
-    citations: list[Citation],
-    max_sources: int,
+    todo: list[Citation],
     limiter: ScrapeLimiter,
     on_progress=None,
 ) -> list[SourceCopy]:
@@ -437,10 +453,13 @@ async def scrape_sources(
     Archiving is best-effort and can never fail the job: every path out of
     here is a SourceCopy, including the ones that had no business happening.
 
+    `todo` is what will be attempted, already prepared with `scrapable()` —
+    one place decides which citations are worth a request, so the count the
+    caller announces is the count that happens.
+
     `on_progress(done, total)` is called as copies land; archiving is slow
     enough under pacing to be worth reporting.
     """
-    todo = scrapable(citations, max_sources)
     state = {"done": 0}
 
     async def one(cit: Citation) -> SourceCopy:
@@ -839,7 +858,7 @@ async def save_to_notion(
     del children[body_limit:]
     if cited:
         children.append(_notion_block("heading_2", "Sources"))
-        for cit in cited[:reserved - 1]:
+        for cit in cited[:max(reserved - 1, 0)]:
             # An unsafe URL would have the whole page rejected; those
             # citations are already listed as text in the dossier itself.
             children.append(_notion_block("paragraph", cit.title or cit.url,
