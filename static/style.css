@@ -220,6 +220,10 @@ li.job {
   display: block;
   font: 600 .93rem/1.35 var(--serif);
   overflow-wrap: anywhere;
+  /* The title is a button now, and a button centres its own text and shrinks
+     to fit. It has to keep sitting exactly where the link it replaced did. */
+  width: 100%;
+  text-align: left;
 }
 .sources span.src-title { color: var(--ink); font-weight: 500; }
 .sources .src-links {
@@ -265,28 +269,50 @@ li.job {
   color: var(--ink);
 }
 
-/* An archived copy read in place, inside the job card. */
+/* A dossier or an archived copy read in place.
+
+   Deliberately not a scroll box: a window of a few lines with its own
+   scrollbar reads worse than the standalone page, especially on a phone,
+   and nested scrolling on a touch screen is its own small misery. The panel
+   grows to fit and the page scrolls, at the same size the page itself uses. */
 .src-body {
-  margin: .5rem 0 .2rem;
-  padding: .6rem .8rem;
-  max-height: 22rem;
-  overflow-y: auto;
+  margin: .6rem 0 .3rem;
+  padding: .8rem .9rem;
   background: var(--paper);
   border: 1px solid #E2D8BE;
   border-left: 3px solid var(--pen-blue);
   border-radius: 8px;
-  font: .92rem/1.55 var(--serif);
+  font: 1.02rem/1.65 var(--serif);
   color: var(--ink);
   overflow-wrap: anywhere;
 }
 .src-body h1, .src-body h2, .src-body h3 {
-  font: 600 1rem/1.3 var(--serif);
-  margin: .9rem 0 .3rem;
+  font: 600 1.15rem/1.3 var(--serif);
+  margin: 1.2rem 0 .4rem;
   border-bottom: 1px solid var(--paper-deep);
-  padding-bottom: .15rem;
+  padding-bottom: .2rem;
 }
 .src-body h1:first-child, .src-body h2:first-child { margin-top: 0; }
-.src-body p { margin: .5rem 0; }
+.src-body p { margin: .6rem 0; }
+
+.src-foot {
+  margin: .8rem 0 0;
+  padding: .5rem 0 0;
+  border-top: 1px solid var(--paper-deep);
+  border-bottom: none;
+}
+
+/* The actions on what you are reading, at the top of what you are reading. */
+.src-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: .3rem .9rem;
+  margin: 0 0 .7rem;
+  padding-bottom: .5rem;
+  border-bottom: 1px solid var(--paper-deep);
+  font: .8rem var(--sans);
+}
 /* Prose links, not the card's navigation links, which .job a styles. */
 .src-body a {
   color: var(--pen-blue);

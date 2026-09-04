@@ -495,43 +495,56 @@ Behavior notes:
 - **Nothing navigates to a file.** A link to a `.md` is a navigation whose
   outcome the browser chooses, and iOS Safari chooses a view-or-download
   sheet with no way back — in a tab as well as installed. Handing it a
-  `blob:` URL instead does not help, because it navigates to that too. So
-  there is no anchor: `.md` is a button that shows the file's text in place,
-  with Copy, Save, and — where the Web Share API exists, which needs a secure
-  context — Share, whose sheet sits over the page. The zip has nothing to
-  show, so it is fetched and handed over the same way. The standalone report
-  and source pages carry `static/document.js`, which upgrades their own
-  download links to the same behaviour and leaves them ordinary links when
-  scripting is unavailable.
-- **Three panels, three independent switches.** "read here", ".md" and
-  "Sources" open and close separately — the first two use distinct classes so
-  neither answers for the other — and all three are remembered by what they
-  show, so a poll rebuilding the list closes none of them and refetches
-  nothing. The file panel was the odd one out until it was noticed: readers
-  and the source list survived a poll and it did not.
+  `blob:` URL instead does not help, because it navigates to that too. So no
+  anchor points at a file: the raw Markdown is fetched and offered as Copy
+  and Save from inside what you are reading, and the zip, which has nothing
+  to show, is fetched and handed over the same way. The standalone report and
+  source pages carry `static/document.js`, which upgrades their own download
+  links to the same behaviour and leaves them ordinary links when scripting
+  is unavailable.
+- **One way in per thing.** A finished job offers `Report` (the standalone
+  page), `Read` (here), `Sources (n)` and `Everything (.zip)`. Reading and
+  the file were once separate controls sitting side by side — "read here" and
+  ".md" — which asked the reader to choose between two spellings of the same
+  document before seeing either. The file is not a third destination; it is
+  something you do with what is open, so Copy text, Save .md and, on a source,
+  `Open as page ↗` live in a row at the top of the panel.
+- **Two panels, two independent switches.** "Read" and "Sources" open and
+  close separately, and both are remembered by what they show, so a poll
+  rebuilding the list closes neither and refetches nothing.
 - **Panels open where the control is.** The source list sits directly under
-  the links that open it; file and reader panels append below it, and
-  whatever was just opened is scrolled into view if it is not. Otherwise a
-  panel opened above the list pushes it a screenful down, and the control
-  that opened it appears to have done nothing — which is exactly what
-  happened when a file panel sat between the links and the sources. Buttons
-  keep their labels and carry `aria-expanded`, because two toggles in a row
-  both renaming themselves "close" say nothing about which panel they close.
-- **Reading in place**: both the dossier and any archived copy can be opened
-  inside the card ("read here"), fetched as a sanitised fragment. Open
-  readers are remembered by URL and their HTML is cached, so a poll — every
-  five seconds while a job is running — cannot make what you are reading
-  disappear or refetch it. The links beside them still open the standalone
-  pages, which is what a push notification and the report's "local copy"
-  links point at.
+  the links that open it; the dossier reader appends below it, a source's
+  reader opens under that source's own row, and whatever was just opened is
+  scrolled into view if it is not. Otherwise a panel opened above the list
+  pushes it a screenful down and the control appears to have done nothing.
+  Buttons keep their labels and carry `aria-expanded`, because two toggles in
+  a row both renaming themselves "close" say nothing about which panel they
+  close.
+- **Reading in place**: both the dossier and any archived copy open inside
+  the card, fetched as a sanitised fragment and set in the page's own serif
+  at reading size — not a scroll box within a scroll box, which is a
+  keyhole on a phone. Open readers are remembered by URL and their HTML is
+  cached, so a poll — every five seconds while a job is running — cannot make
+  what you are reading disappear or refetch it. A trailing Close returns
+  focus to the control that opened it, which by then is well above the fold.
+- **Copying works without HTTPS.** The Clipboard API is a secure-context
+  feature and Footnote is normally reached over plain HTTP on a home network,
+  where `navigator.clipboard` does not exist at all — Copy threw a
+  `TypeError` there rather than copying. The deprecated selection route is
+  the fallback, and the raw file is fetched as soon as a reader opens so that
+  neither Copy nor Save has to spend the tap's user activation on a request.
+  The Web Share API is absent for the same reason, which is why Save writes a
+  file rather than offering a sheet.
 - **Source panels** expand in place on a finished job: the list comes from
   `/jobs/{id}/sources`, cached per job and re-expanded after every poll, so
   a five-second refresh doesn't collapse what you are reading. That cache
   holds for a minute — it exists to stop the poll refetching, not to outlive
   the folder it describes, since a copy can be moved in the notes app while
-  the page is open — and falls back to the stale copy when offline. Each entry
-  links to the rendered copy, its `.md`, and the original page; the ones
-  that could not be archived say why.
+  the page is open — and falls back to the stale copy when offline. An
+  archived entry's title opens the local copy in place; beside it sit the
+  original page and the file's size. An entry that could not be archived says
+  why, and its title is a plain link to the live page, since that is all
+  there is.
 - **The app's own code is never served from a cache without asking.** Static
   files carried only an ETag and a Last-Modified, which leaves a browser free
   to apply heuristic freshness — roughly a tenth of the file's age — and

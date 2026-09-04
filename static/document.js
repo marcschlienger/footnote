@@ -100,7 +100,7 @@ function actions(name, body) {
   const label = document.createElement("span");
   label.textContent = name;
   row.appendChild(label);
-  row.appendChild(button("Copy", () => navigator.clipboard.writeText(body)));
+  row.appendChild(button("Copy", () => copyText(body)));
   const file = () => new File([body], name, { type: "text/markdown" });
   try {
     if (navigator.canShare && navigator.canShare({ files: [file()] })) {
@@ -111,6 +111,26 @@ function actions(name, body) {
   row.appendChild(button("Save", () =>
     saveBlob(new Blob([body], { type: "text/markdown" }), name)));
   return row;
+}
+
+// These pages are served over plain HTTP as often as not, where the
+// Clipboard API does not exist. Same fallback as the app shell uses.
+async function copyText(body) {
+  if (navigator.clipboard?.writeText) {
+    try { await navigator.clipboard.writeText(body); return true; }
+    catch (e) { /* denied, or no permission on this origin */ }
+  }
+  const box = document.createElement("textarea");
+  box.value = body;
+  box.readOnly = true;
+  box.style.cssText = "position:fixed;top:0;left:0;width:1px;height:1px;opacity:0";
+  document.body.appendChild(box);
+  box.select();
+  box.setSelectionRange(0, body.length);
+  let copied = false;
+  try { copied = document.execCommand("copy"); } catch (e) { copied = false; }
+  box.remove();
+  return copied;
 }
 
 function button(label, run) {

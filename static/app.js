@@ -15,9 +15,8 @@ const sourcesCache = new Map();
 // list, and something you are part-way through reading should not vanish
 // because a timer fired.
 const openReaders = new Set();
-const openFiles = new Set();
-// One cache for both, keyed by URL — a rendered fragment and a raw file are
-// fetched from different URLs, so they cannot collide.
+// One cache, keyed by URL — a rendered fragment and the raw file behind it
+// are fetched from different URLs, so they cannot collide.
 const readerCache = new Map();
 // An archived page can be a few hundred kB of HTML, and a long session can
 // open a lot of them. Keep the most recent handful.
@@ -166,10 +165,15 @@ function renderJob(job) {
       links.appendChild(gone);
     } else {
       links.appendChild(link(`/jobs/${job.id}/report`, "Report"));
-      links.appendChild(readInline(`/jobs/${job.id}/report?embed=1`, li,
-                                   "read here", "close"));
-      links.appendChild(fileButton(`/jobs/${job.id}/report.md`, ".md",
-                                   job.report_name, li));
+      // Reading happens here; the file itself is an action inside the panel,
+      // not a third way of looking at the same dossier.
+      links.appendChild(reader({
+        label: "Read",
+        embedUrl: `/jobs/${job.id}/report?embed=1`,
+        rawUrl: `/jobs/${job.id}/report.md`,
+        filename: job.report_name,
+        host: li,
+      }));
       links.appendChild(sourcesToggle(job));
       links.appendChild(bundleButton(`/jobs/${job.id}/bundle.zip`,
                                      "Everything (.zip)"));
@@ -292,18 +296,32 @@ async function fillSources(jobId, panel) {
 
 function renderSource(src) {
   const li = document.createElement("li");
-  // Archived: read the local copy. Not archived: the live page is all there is.
-  const title = src.archived ? link(src.read_url, src.title)
-              : src.url ? link(src.url, src.title)
-              : text("span", src.title);
-  title.className = "src-title";
-  li.appendChild(title);
-
   const row = document.createElement("span");
   row.className = "src-links";
+
+  // The title is the way in: tapping it opens the archived copy here. Not
+  // archived, and the live page is all there is.
+  let title;
   if (src.archived) {
-    row.appendChild(readHere(src, li));
-    row.appendChild(fileButton(src.download_url, ".md", src.file, li, row));
+    title = reader({
+      label: src.title,
+      embedUrl: src.read_url + "?embed=1",
+      rawUrl: src.download_url,
+      filename: src.file,
+      pageUrl: src.read_url,
+      host: li,
+      after: row,
+    });
+  } else {
+    title = src.url ? link(src.url, src.title) : text("span", src.title);
+  }
+  // Added, not assigned: replacing the class list stripped "linkish" off the
+  // reader button, and a bare <button> is the page's primary button — white
+  // on blue, where a source title should read as a link.
+  title.classList.add("src-title");
+  li.appendChild(title);
+
+  if (src.archived) {
     if (src.url) row.appendChild(link(src.url, "original ↗"));
     row.appendChild(text("span", size(src.bytes)));
   } else {
@@ -324,62 +342,160 @@ function remember(url, body) {
   }
 }
 
-function readHere(src, li) {
-  return readInline(src.read_url + "?embed=1", li, "read here", "close");
-}
-
 function forgetReaders(jobId) {
   const prefix = `/jobs/${jobId}/`;
-  for (const set of [openReaders, openFiles]) {
-    for (const url of [...set]) if (url.startsWith(prefix)) set.delete(url);
+  for (const url of [...openReaders]) {
+    if (url.startsWith(prefix)) openReaders.delete(url);
   }
-  for (const url of [...readerCache.keys()]) if (url.startsWith(prefix)) readerCache.delete(url);
+  for (const url of [...readerCache.keys()]) {
+    if (url.startsWith(prefix)) readerCache.delete(url);
+  }
 }
 
-function readInline(url, host, openLabel, _closeLabel, after) {
+// One way to look at a dossier or an archived copy: open it here. What you
+// might want to do with the file — copy it, save it, share it, see it as a
+// page — are actions on what you are reading, offered inside the panel
+// rather than competing with it in the row above.
+function reader(spec) {
+  const { label, embedUrl, host, after } = spec;
   const button = document.createElement("button");
   button.className = "linkish";
+  button.textContent = label;
+  button.setAttribute("aria-expanded", "false");
+
   const close = () => {
     host.querySelector(":scope > .src-body")?.remove();
-    openReaders.delete(url);
+    openReaders.delete(embedUrl);
     button.setAttribute("aria-expanded", "false");
   };
+
   const open = async (auto) => {
-    openReaders.add(url);
+    openReaders.add(embedUrl);
     button.setAttribute("aria-expanded", "true");
     const panel = document.createElement("div");
     panel.className = "src-body";
-    panel.textContent = readerCache.has(url) ? "" : "Loading…";
+    panel.textContent = readerCache.has(embedUrl) ? "" : "Loading…";
     host.insertBefore(panel, (after && after.nextSibling) || null);
     if (!auto) reveal(panel);
-    if (readerCache.has(url)) {
-      const html = readerCache.get(url);
-      readerCache.delete(url);           // re-insert: least-recently-read goes
-      readerCache.set(url, html);
-      panel.innerHTML = html;
-      return;
-    }
     try {
-      const res = await fetch(url);
-      if (!res.ok) throw new Error(res.statusText);
-      const html = await res.text();
-      remember(url, html);
+      let html = readerCache.get(embedUrl);
+      if (html === undefined) {
+        const res = await fetch(embedUrl);
+        if (!res.ok) throw new Error(res.statusText || `HTTP ${res.status}`);
+        html = await res.text();
+        remember(embedUrl, html);
+      }
+      panel.textContent = "";
+      panel.appendChild(readerActions(spec));
+      // Warm the raw file now. Copy and Save must not await a fetch inside
+      // the tap that asked for them: the older copy route and a download
+      // both need the click's user activation, which an await spends.
+      rawText(spec).catch(() => {});
+      const content = document.createElement("div");
+      content.className = "src-content";
       // Sanitised server-side, by the same allowlist the standalone page uses.
-      panel.innerHTML = html;
+      content.innerHTML = html;
+      panel.appendChild(content);
+      // The toggle that opened this is far above by now.
+      const foot = document.createElement("div");
+      foot.className = "src-actions src-foot";
+      foot.appendChild(action("Close", () => { close(); button.focus(); }));
+      panel.appendChild(foot);
     } catch (e) {
       panel.textContent = "Could not read it: " + e.message;
-      openReaders.delete(url);
+      openReaders.delete(embedUrl);
       button.setAttribute("aria-expanded", "false");
     }
   };
-  button.textContent = openLabel;
-  button.setAttribute("aria-expanded", "false");
+
   button.onclick = () =>
-    host.querySelector(":scope > .src-body") ? close() : open();
-  // Deferred: at this point the card is still being assembled, so the row
-  // this panel belongs after may not be in the DOM yet. Reopening after a
-  // poll must not scroll: the reader did not ask for it this time.
-  if (openReaders.has(url)) queueMicrotask(() => open(true));
+    host.querySelector(":scope > .src-body") ? close() : open(false);
+  // Deferred: the card is still being assembled, so the row this panel
+  // belongs after may not be in the DOM yet. Reopening after a poll must not
+  // scroll — the reader did not ask for it this time.
+  if (openReaders.has(embedUrl)) queueMicrotask(() => open(true));
+  return button;
+}
+
+function readerActions(spec) {
+  const row = document.createElement("div");
+  row.className = "src-actions";
+  row.appendChild(action("Copy text", async () => {
+    if (await copyText(await rawText(spec))) flash("Copied to the clipboard.");
+    else flash("This browser would not let the page copy — " +
+               "select the text below instead.", true);
+  }));
+  row.appendChild(action("Save .md", async () => {
+    const body = await rawText(spec);
+    const name = spec.filename || "dossier.md";
+    if (await tryShare(name, body)) return;
+    saveFile(name, body);
+  }));
+  // Only where the title no longer leads there: the job card keeps its own
+  // "Report" link, and two ways to the same page is what we just removed.
+  if (spec.pageUrl) {
+    row.appendChild(link(spec.pageUrl, "Open as page ↗"));
+  }
+  return row;
+}
+
+async function rawText(spec) {
+  let body = readerCache.get(spec.rawUrl);
+  if (body === undefined) {
+    const res = await fetch(spec.rawUrl);
+    if (!res.ok) throw new Error(res.statusText || `HTTP ${res.status}`);
+    if (!spec.filename) {
+      spec.filename = nameFromDisposition(res.headers.get("content-disposition"));
+    }
+    body = await res.text();
+    remember(spec.rawUrl, body);
+  }
+  return body;
+}
+
+// Footnote is normally reached over plain HTTP on a home network, and the
+// Clipboard API is a secure-context feature: navigator.clipboard is not
+// merely refused there, it does not exist. The selection route is deprecated
+// but is what still works, so it is the fallback rather than the error.
+async function copyText(body) {
+  if (navigator.clipboard?.writeText) {
+    try { await navigator.clipboard.writeText(body); return true; }
+    catch (e) { /* denied, or no permission on this origin */ }
+  }
+  const box = document.createElement("textarea");
+  box.value = body;
+  box.readOnly = true;                 // stops the keyboard opening on iOS
+  box.style.cssText = "position:fixed;top:0;left:0;width:1px;height:1px;opacity:0";
+  document.body.appendChild(box);
+  box.select();
+  box.setSelectionRange(0, body.length);      // iOS ignores select() alone
+  let copied = false;
+  try { copied = document.execCommand("copy"); } catch (e) { copied = false; }
+  box.remove();
+  return copied;
+}
+
+// The share sheet sits over the page, which is the only way iOS hands over a
+// file without leaving the app. It needs a secure context, so on plain HTTP
+// this is absent and Save is what carries the day.
+async function tryShare(name, body) {
+  const file = new File([body], name, { type: "text/markdown" });
+  try {
+    if (navigator.canShare && navigator.canShare({ files: [file] })) {
+      await navigator.share({ files: [file], title: name });
+      return true;
+    }
+  } catch (e) { /* dismissed, or unavailable */ }
+  return false;
+}
+
+function action(label, run) {
+  const button = document.createElement("button");
+  button.className = "linkish";
+  button.textContent = label;
+  button.onclick = () => Promise.resolve()
+    .then(run)
+    .catch((e) => flash(`Could not ${label.toLowerCase()}: ` + e.message, true));
   return button;
 }
 
@@ -485,94 +601,6 @@ function flash(message, isError = false) {
 // view-or-download sheet, from which there is no way back to the app. So
 // tapping ".md" opens the text here instead, with the ways of taking it away
 // offered from inside the page — copy, share, save — none of which navigate.
-function fileButton(href, label, filename, host, after) {
-  const button = document.createElement("button");
-  button.className = "linkish";
-  button.textContent = label;
-  button.setAttribute("aria-expanded", "false");
-  const open = (auto) => {
-    openFiles.add(href);
-    // The label stays put: two toggles both saying "close" tells you nothing
-    // about which panel you are closing.
-    button.setAttribute("aria-expanded", "true");
-    const panel = document.createElement("div");
-    panel.className = "file-view";
-    panel.textContent = "Loading…";
-    // After the row it belongs to, and after anything already open, so that
-    // opening one panel never pushes another control off the screen.
-    host.insertBefore(panel, (after && after.nextSibling) || null);
-    if (!auto) reveal(panel);
-    showFile(panel, href, filename).catch((e) => {
-      panel.textContent = "Could not read that file: " + e.message;
-      openFiles.delete(href);
-      button.setAttribute("aria-expanded", "false");
-    });
-  };
-  button.onclick = () => {
-    const showing = host.querySelector(":scope > .file-view");
-    if (showing) {
-      showing.remove();
-      openFiles.delete(href);
-      button.setAttribute("aria-expanded", "false");
-      return;
-    }
-    open(false);
-  };
-  // Remembered like the readers are: polling rebuilds the list every five
-  // seconds while a job runs, and a file you are part-way through reading
-  // should not close because a timer fired.
-  if (openFiles.has(href)) queueMicrotask(() => open(true));
-  return button;
-}
-
-async function showFile(panel, href, filename) {
-  let name = filename;
-  let body = readerCache.get(href);
-  if (body === undefined) {
-    const res = await fetch(href);
-    if (!res.ok) throw new Error(res.statusText || `HTTP ${res.status}`);
-    name = name ||
-      nameFromDisposition(res.headers.get("content-disposition")) || "download";
-    body = await res.text();
-    remember(href, body);
-  }
-  name = name || "download";
-
-  panel.textContent = "";
-  const actions = document.createElement("div");
-  actions.className = "file-actions";
-  actions.appendChild(text("span", name));
-  actions.appendChild(action("Copy", async () => {
-    await navigator.clipboard.writeText(body);
-    flash("Copied to the clipboard.");
-  }));
-  // Offered only where it exists: on iOS this is a sheet over the page, so
-  // dismissing it returns here. It needs a secure context.
-  if (canShareFile(name, body)) {
-    actions.appendChild(action("Share", () => shareFile(name, body)));
-  }
-  actions.appendChild(action("Save", () => saveFile(name, body)));
-  panel.appendChild(actions);
-
-  const pre = document.createElement("pre");
-  pre.className = "file-text";
-  pre.textContent = body;
-  panel.appendChild(pre);
-}
-
-function action(label, run) {
-  const button = document.createElement("button");
-  button.className = "linkish";
-  button.textContent = label;
-  button.onclick = () => Promise.resolve()
-    .then(run)
-    .catch((e) => flash(`Could not ${label.toLowerCase()}: ` + e.message, true));
-  return button;
-}
-
-// A zip has nothing to show, so it is fetched and handed over directly:
-// the share sheet where that exists, a blob otherwise. Still a button, so
-// the page cannot navigate to it either way.
 function bundleButton(href, label) {
   const button = document.createElement("button");
   button.className = "linkish";
@@ -607,22 +635,6 @@ async function takeBundle(href) {
   a.click();
   a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 30000);
-}
-
-function asFile(name, body) {
-  return new File([body], name, { type: "text/markdown" });
-}
-
-function canShareFile(name, body) {
-  try {
-    return !!navigator.canShare && navigator.canShare({ files: [asFile(name, body)] });
-  } catch (e) {
-    return false;
-  }
-}
-
-function shareFile(name, body) {
-  return navigator.share({ files: [asFile(name, body)], title: name });
 }
 
 function saveFile(name, body) {

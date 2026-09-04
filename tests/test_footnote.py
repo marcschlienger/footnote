@@ -875,18 +875,17 @@ def test_a_dossier_can_be_read_without_leaving_the_app(client, tmp_path):
 def test_nothing_in_the_app_navigates_to_a_file():
     """iOS Safari navigates to a file — or to a blob: URL — and shows a
     view-or-download sheet with no way back. So no file is reachable through
-    an anchor at all: .md opens its text in place, the zip is fetched and
-    handed over, and both are buttons."""
+    an anchor: the raw file is fetched for Copy and Save inside the panel,
+    and the zip is fetched and handed over from a button."""
     app_js = (Path(__file__).resolve().parent.parent
               / "static" / "app.js").read_text()
     for target in ("/report.md", "bundle.zip", "src.download_url",
-                   "data.bundle_url"):
+                   "data.bundle_url", "spec.rawUrl"):
         for match in re.finditer(re.escape(target), app_js):
             line = app_js[app_js.rfind("\n", 0, match.start()) + 1:
                           app_js.find("\n", match.start())]
-            assert "link(" not in line or "fileButton(" in line \
-                or "bundleButton(" in line, line.strip()
-    assert "fileButton(" in app_js and "bundleButton(" in app_js
+            assert "link(" not in line, line.strip()
+    assert "bundleButton(" in app_js
     # The ways out of the panel, none of which leave the page.
     assert "clipboard.writeText" in app_js
     assert "navigator.canShare" in app_js and "navigator.share" in app_js
@@ -932,39 +931,76 @@ def test_opening_one_panel_does_not_hide_another_control(client, tmp_path):
     app_js = (Path(__file__).resolve().parent.parent
               / "static" / "app.js").read_text()
     # The cause, not a proxy for it: a card-level panel given an anchor row
-    # is inserted straight after it, which is above the sources list. Both
-    # must be opened without one, so they append to the end of the card.
-    for call in re.finditer(r"(fileButton|readInline)\((?:[^()]|\([^()]*\))*\)",
-                            app_js):
-        if "job.id}/report" not in call.group(0):
-            continue                       # source-level panels do use a row
-        assert "meta" not in call.group(0), call.group(0)
+    # is inserted straight after it, which is above the sources list. The
+    # dossier reader must be opened without one, so it appends to the end.
+    card_reader = app_js[app_js.index('label: "Read"'):]
+    assert "after:" not in card_reader[:card_reader.index("}))")], card_reader[:200]
     assert "function reveal(" in app_js
     assert app_js.count("reveal(panel)") >= 2      # sources and file panels
 
 
-def test_the_three_panels_are_independent_and_outlive_a_poll():
-    """read here, .md and Sources toggle separately, and none of them closes
-    because the five-second poll rebuilt the list."""
+def test_the_panels_are_independent_and_outlive_a_poll():
+    """Read and Sources toggle separately, and neither closes because the
+    five-second poll rebuilt the list."""
     app_js = (Path(__file__).resolve().parent.parent
               / "static" / "app.js").read_text()
-    # Distinct classes, so one panel's presence never answers for another.
-    assert '.src-body' in app_js and '.file-view' in app_js
-    # Each kind is remembered across a re-render.
-    for remembered in ("openSources", "openReaders", "openFiles"):
+    # Both are remembered across a re-render, by what they show.
+    for remembered in ("openSources", "openReaders"):
         assert f"{remembered}.has(" in app_js, remembered
         assert f"{remembered}.delete(" in app_js, remembered
     # Reopened without scrolling, since the reader did not ask this time.
-    assert app_js.count("queueMicrotask(() => open(true))") >= 2
-    # Removing a job forgets all of its panels, not only its readers.
+    assert "queueMicrotask(() => open(true))" in app_js
+    # Removing a job forgets its readers and their cached content.
     forget = app_js[app_js.index("function forgetReaders("):]
-    assert "openFiles" in forget[:forget.index("\n}")]
+    body = forget[:forget.index("\n}")]
+    assert "openReaders" in body and "readerCache" in body
+
+
+def test_a_source_title_still_looks_like_a_link():
+    """The title became a button so it can open the copy in place, and a bare
+    <button> is the page's primary button — white on blue, the size of the
+    Research button. It only escapes that by keeping the linkish class."""
+    app_js = (Path(__file__).resolve().parent.parent
+              / "static" / "app.js").read_text()
+    assert 'classList.add("src-title")' in app_js
+    assert 'className = "src-title"' not in app_js
+    css = (Path(__file__).resolve().parent.parent
+           / "static" / "style.css").read_text()
+    rule = css[css.index(".sources .src-title {"):]
+    rule = rule[:rule.index("}")]
+    # A button centres its own text and shrinks to fit; the link it replaced
+    # did neither.
+    assert "text-align: left" in rule and "width: 100%" in rule
+
+
+def test_copying_works_without_a_secure_context():
+    """The Clipboard API is a secure-context feature, and Footnote is reached
+    over plain HTTP on a home network: navigator.clipboard is not refused
+    there, it is absent, and Copy raised a TypeError instead of copying."""
+    static = Path(__file__).resolve().parent.parent / "static"
+    for name in ("app.js", "document.js"):
+        source = (static / name).read_text()
+        assert 'document.execCommand("copy")' in source, name
+        assert "navigator.clipboard?.writeText" in source, name
+        # And the API is reached from copyText alone: a call site that skips
+        # it skips the fallback too, which is the bug this replaced.
+        start = source.index("async function copyText(")
+        elsewhere = source[:start] + source[source.index("\n}\n", start):]
+        elsewhere = "\n".join(line for line in elsewhere.splitlines()
+                              if not line.lstrip().startswith("//"))
+        assert "navigator.clipboard" not in elsewhere, name
 
 
 def test_the_pwa_can_read_in_place():
     app_js = (Path(__file__).resolve().parent.parent
               / "static" / "app.js").read_text()
-    assert "embed=1" in app_js and "readInline" in app_js
+    assert "embed=1" in app_js and "function reader(" in app_js
+    # One way in per thing: the file is an action inside what you are
+    # reading, not a second control beside it.
+    assert "Copy text" in app_js and "Save .md" in app_js
+    # Warmed on open, so Copy and Save don't spend the tap's user activation
+    # on a fetch — the fallback copy route and a download both need it.
+    assert "rawText(spec).catch(() => {})" in app_js
     css = (Path(__file__).resolve().parent.parent
            / "static" / "style.css").read_text()
     # The section heading rule must not restyle embedded dossier headings.

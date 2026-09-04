@@ -498,14 +498,15 @@ Tailscale, WireGuard) and/or use the per-instance `FOOTNOTE_TOKEN`.
 ## Clients
 
 - **The PWA** — open `http://YOUR-SERVER:8010/`: ask, pick a depth, watch
-  status live, read finished reports, and open **Sources** on any finished
-  dossier to read the archived pages in the browser, download one as
-  Markdown, or take the report and every source as a single zip. **read
-  here** opens a dossier or an archived copy inside the card, and **.md**
-  shows the file's own text with Copy, Save and (over HTTPS) Share. Nothing
-  in the app navigates to a file: iOS Safari answers that with a
-  view-or-download sheet you cannot get back from. Every standalone page has
-  a link back to the app. A dossier
+  status live, and read finished dossiers without leaving the page. A
+  finished job offers **Report** (the standalone page), **Read** (here),
+  **Sources (n)** and **Everything (.zip)**; in the source list, a title
+  opens that archived page in the card. Inside whatever you are reading sit
+  **Copy text** and **Save .md**, so the file is something you do with the
+  document rather than a second way of opening it. Nothing in the app
+  navigates to a file: iOS Safari answers that with a view-or-download sheet
+  you cannot get back from. Every standalone page has a link back to the app.
+  A dossier
   you have opened once stays readable with no network at all — the service
   worker keeps the report and its sources, and says so when the list it is
   showing you is the last one it saw. On
