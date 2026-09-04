@@ -151,7 +151,16 @@ class JsonStore:
         if not path.exists():
             return
         try:
-            self.data = json.loads(path.read_text(encoding="utf-8"))
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(loaded, dict):
+                raise json.JSONDecodeError(
+                    f"expected an object, found {type(loaded).__name__}", "", 0)
+            # One damaged record must not cost the rest of the history.
+            self.data = {k: v for k, v in loaded.items() if isinstance(v, dict)}
+            dropped = len(loaded) - len(self.data)
+            if dropped:
+                print(f"{path.name}: ignored {dropped} malformed record"
+                      f"{'s' * (dropped != 1)}", flush=True)
         except OSError as exc:
             print(f"could not read {path.name}: {exc}", flush=True)
         except json.JSONDecodeError as exc:
@@ -182,7 +191,7 @@ subs = JsonStore(DATA_DIR / "subscriptions.json")
 def _valid_subscription(sub) -> bool:
     """What _push_one needs to exist before it tries."""
     return (isinstance(sub, dict)
-            and pipeline.is_safe_url(sub.get("endpoint", ""), relative_ok=False)
+            and pipeline.is_http_url(sub.get("endpoint", ""))
             and isinstance(sub.get("keys"), dict)
             and all(isinstance(sub["keys"].get(k), str) and sub["keys"][k]
                     for k in ("p256dh", "auth")))
@@ -335,8 +344,9 @@ async def run_research(job_id: str) -> None:
             archived = len(written.source_files)
             print(f"[{job_id}] adopting the dossier written before the restart",
                   flush=True)
-        elif FIRECRAWL_API_KEY and result.citations and MAX_SOURCES > 0:
-            n = min(len(result.citations), MAX_SOURCES)
+        elif FIRECRAWL_API_KEY and MAX_SOURCES > 0 and pipeline.scrapable(
+                result.citations, MAX_SOURCES):
+            n = len(pipeline.scrapable(result.citations, MAX_SOURCES))
             _update_job(job_id, status="archiving",
                         progress=f"Archiving {n} cited source{'s' * (n != 1)}…")
 
@@ -818,12 +828,29 @@ async def delete_job(job_id: str):
     return {"status": "deleted"}
 
 
+def _inside(path: Path, folder: Path) -> bool:
+    """Whether path really lives under folder, symlinks resolved.
+
+    The dossier folder is a synced notes directory that people edit, so a
+    name inside it can be a link to somewhere else entirely.
+    """
+    try:
+        path.resolve().relative_to(folder.resolve())
+        return True
+    except (OSError, ValueError):
+        return False
+
+
 def _report_file(job_id: str) -> Path:
     job = jobs.data.get(job_id)
     if not job:
         raise HTTPException(404, "Job not found")
     path = Path(job.get("report_path") or "")
-    if not job.get("report_path") or not path.exists():
+    # A regular file inside the output directory, resolved. The dossier lives
+    # in a synced notes folder: the name Footnote recorded can since have
+    # become a link to anything the service account can read.
+    if (not job.get("report_path") or not path.is_file()
+            or not _inside(path, OUTPUT_DIR)):
         raise HTTPException(404, "No report for this job (yet)")
     return path
 
@@ -856,17 +883,11 @@ def _source_file(job_id: str, name: str) -> Path:
     return path
 
 
-def _inside(path: Path, folder: Path) -> bool:
-    """Whether path really lives under folder, symlinks resolved.
-
-    The dossier folder is a synced notes directory that people edit, so a
-    name inside it can be a link to somewhere else entirely.
-    """
+def _size(path: Path) -> int:
     try:
-        path.resolve().relative_to(folder.resolve())
-        return True
-    except (OSError, ValueError):
-        return False
+        return path.stat().st_size
+    except OSError:
+        return 0
 
 
 def _head(path: Path, limit: int = 1024) -> str:
@@ -883,7 +904,11 @@ def _source_entries(job: dict, folder: Path) -> list:
     degrades to a plain citation instead of a broken link. Dossiers written
     before jobs kept a citation list are described by their files alone.
     """
-    files = {f.name: f for f in sorted((folder / "sources").glob("*.md"))}
+    # Only what the read endpoint would serve: a link pointing out of the
+    # folder is not an archived source, and a broken one must not take the
+    # whole index down when its size is asked for.
+    files = {f.name: f for f in sorted((folder / "sources").glob("*.md"))
+             if f.is_file() and _inside(f, folder)}
     listed = [(cit.get("title", ""), cit.get("url", ""),
                cit.get("file", "") if cit.get("file") in files else "",
                cit.get("note", ""))
@@ -904,7 +929,7 @@ def _source_entries(job: dict, folder: Path) -> list:
          "archived": bool(name),
          "read_url": base + quote(name) if name else "",
          "download_url": f"{base}{quote(name)}?raw=1" if name else "",
-         "bytes": files[name].stat().st_size if name else 0,
+         "bytes": _size(files[name]) if name else 0,
          "note": note}
         for n, (title, url, name, note) in enumerate(listed, start=1)
     ]
@@ -987,7 +1012,7 @@ async def subscribe(req: SubscribeRequest):
     if not _valid_subscription({"endpoint": req.endpoint, "keys": req.keys}):
         raise HTTPException(
             422, "a subscription needs an http(s) endpoint and string "
-                 "p256dh and auth keys")
+                 "p256dh and auth keys")   # mailto: is a link, not an endpoint
     key = uuid.uuid5(uuid.NAMESPACE_URL, req.endpoint).hex
     subs.data[key] = {"endpoint": req.endpoint, "keys": req.keys}
     subs.save()

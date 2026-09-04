@@ -174,6 +174,10 @@ function renderJob(job) {
       }
       openSources.delete(job.id);
       sourcesCache.delete(job.id);
+      // Tell the worker now: the 404-driven cleanup only fires if someone
+      // asks for the job again, and offline that may never happen.
+      navigator.serviceWorker?.controller?.postMessage(
+        { type: "forget-job", jobId: job.id });
       refreshJobs();
     };
     meta.appendChild(del);

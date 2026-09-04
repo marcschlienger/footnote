@@ -74,9 +74,20 @@ SAFE_SCHEMES = frozenset({"http", "https", "mailto"})
 _SCHEME = re.compile(r"^([a-zA-Z][a-zA-Z0-9+.-]*):")
 
 
-def _is_http_url(url: str) -> bool:
+def is_http_url(url: str) -> bool:
+    """Fetchable over the web — a stricter test than is_safe_url's link policy."""
     match = _SCHEME.match(re.sub(r"[\x00-\x20]", "", str(url or "")))
     return match is not None and match.group(1).lower() in ("http", "https")
+
+
+def scrapable(citations: list, max_sources: int) -> list:
+    """The citations archiving will actually attempt.
+
+    mailto: and the like are legitimate citations but not scrape targets;
+    spending a request and a credit to be told so helps nobody. The caller
+    counts these too, so the progress it announces matches what happens.
+    """
+    return [c for c in citations if is_http_url(c.url)][:max_sources]
 
 
 def is_safe_url(url: str, relative_ok: bool = True) -> bool:
@@ -377,9 +388,7 @@ async def scrape_sources(
     `on_progress(done, total)` is called as copies land; archiving is slow
     enough under pacing to be worth reporting.
     """
-    # mailto: and the like are legitimate citations but not scrape targets;
-    # spending a request and a credit to be told so helps nobody.
-    todo = [c for c in citations if _is_http_url(c.url)][:max_sources]
+    todo = scrapable(citations, max_sources)
     state = {"done": 0}
 
     async def one(cit: Citation) -> SourceCopy:
@@ -456,10 +465,18 @@ async def _scrape_one(
             data = resp.json() if resp.content else {}
         except ValueError:      # an HTML 502 from a proxy, say — not our JSON
             data, malformed = {}, True
+        if not isinstance(data, dict):
+            # Valid JSON, wrong shape — a list or a bare null. Same fault as
+            # unparseable text, and it must take the same retry path rather
+            # than an AttributeError from the first .get().
+            data, malformed = {}, True
         if resp.status_code == 200 and data.get("success", False):
-            page = data.get("data") or {}
+            page = data.get("data")
+            page = page if isinstance(page, dict) else {}
             md = page.get("markdown") or ""
-            title = (page.get("metadata") or {}).get("title") or cit.title
+            metadata = page.get("metadata")
+            title = (metadata if isinstance(metadata, dict) else {}).get(
+                "title") or cit.title
             if not md.strip():
                 return SourceCopy(cit.url, title, "", False, "empty extraction")
             return SourceCopy(cit.url, title or cit.url, md, True)
@@ -702,6 +719,7 @@ def _yaml_escape(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 NOTION_BASE = "https://api.notion.com/v1"
+NOTION_MAX_BLOCKS = 100      # per page-create call
 
 
 async def save_to_notion(
@@ -716,6 +734,13 @@ async def save_to_notion(
     Best-effort mirror for reading on the go — the file written by
     write_report stays the canonical copy.
     """
+    # Notion takes at most 100 blocks in one create, and the sources are the
+    # point of the dossier: keep room for them rather than letting a long
+    # report use the whole allowance.
+    cited = [c for c in result.citations if is_safe_url(c.url, relative_ok=False)]
+    reserved = min(len(cited) + 1, 30) if cited else 0
+    body_limit = NOTION_MAX_BLOCKS - reserved
+
     children: list[dict] = []
     for para in result.content.split("\n\n"):
         text = para.strip()
@@ -728,9 +753,12 @@ async def save_to_notion(
         else:
             for chunk in _chunks(text, 1900):
                 children.append(_notion_block("paragraph", chunk))
-    if result.citations:
+    del children[body_limit:]
+    if cited:
         children.append(_notion_block("heading_2", "Sources"))
-        for cit in result.citations[:30]:
+        for cit in cited[:reserved - 1]:
+            # An unsafe URL would have the whole page rejected; those
+            # citations are already listed as text in the dossier itself.
             children.append(_notion_block("paragraph", cit.title or cit.url,
                                           link=cit.url))
     resp = await client.post(
@@ -742,7 +770,7 @@ async def save_to_notion(
         json={
             "parent": {"database_id": database_id},
             "properties": {"Name": {"title": [{"text": {"content": question[:100]}}]}},
-            "children": children[:100],
+            "children": children[:NOTION_MAX_BLOCKS],
         },
     )
     if resp.status_code != 200:

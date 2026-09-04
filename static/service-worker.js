@@ -89,7 +89,9 @@ async function networkFirst(request, cacheName, markFallback = false) {
     const res = await fetch(request);
     // Only successful responses: an unauthorized page must never be cached
     // as though it were the app.
-    if (res.ok) (await caches.open(cacheName)).put(request, res.clone());
+    // Awaited: an unawaited put can still be in flight when the response
+    // settles, and the browser is free to stop the worker at that point.
+    if (res.ok) await (await caches.open(cacheName)).put(request, res.clone());
     else if (res.status === 401) await forgetEverything();
     else if (res.status === 404 || res.status === 410) await forgetJob(url);
     return res;
@@ -137,6 +139,14 @@ async function forgetJob(url) {
     }
   }
 }
+
+// The page deleted a job: clear it now rather than waiting for someone to
+// ask for it again, which offline may be never.
+self.addEventListener("message", (event) => {
+  const { type, jobId } = event.data || {};
+  if (type !== "forget-job" || !jobId) return;
+  event.waitUntil(forgetJob(new URL(`/jobs/${jobId}/`, self.location.origin)));
+});
 
 // The token was changed or revoked: drop what was read under the old one.
 // Only reachable while online — an offline device keeps whatever it cached

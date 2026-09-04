@@ -67,7 +67,11 @@ queued ──► researching ──► archiving ──► saving ──► done
   optional Notion mirror, the push notification — is post-processing that
   updates `notion_url` at most and cannot leave a job looking unfinished. The
   mirror's failures are logged and never fatal, *any* failure and not only a
-  PipelineError, because the dossier is already on disk by then.
+  PipelineError, because the dossier is already on disk by then. The flip
+  side is worth stating: a crash *after* the checkpoint skips both
+  permanently, because a job that is already `done` is not resumed — the
+  dossier is complete, but the Notion copy and the notification are not
+  retried.
 - **done / failed** — terminal. Push notifications fire for both. A done
   job also keeps its citation list (URL, title, the file its copy went to,
   and the archiving error if there wasn't one) — capped at
@@ -243,6 +247,14 @@ into `NOTION_DATABASE_ID`. The report body is converted paragraph-wise
 limit, capped at 100 blocks) plus a linked source list. Mirror failure logs
 and moves on — the file already exists.
 
+Two limits shape what is sent. Notion accepts at most
+`NOTION_MAX_BLOCKS` blocks per page-create, so the report body is truncated
+to leave room for the source list rather than letting a long report consume
+the whole allowance — the sources are the point of a dossier. And a citation
+whose URL is not a safe link is left out of the mirror entirely: Notion
+rejects the whole page over one bad link, and those citations are already
+recorded as text in the dossier itself.
+
 ### Web Push
 
 `pywebpush` with VAPID keys; the blocking `webpush()` call runs in a thread
@@ -393,7 +405,14 @@ Behavior notes:
   they are files to save, not pages to read. Only successful responses are
   stored, so an unauthorized page cannot poison the cache. Push and
   notification-click handlers complete the notification loop.
-- **Deleting a job clears everything cached under it.** A 404 or 410 for any
+- **Cache writes are awaited.** A `put` still in flight when the response
+  settles can be cut short — the browser is free to stop the worker at that
+  point — which would make caching of the shell, the job list and the source
+  indexes quietly unreliable.
+- **Deleting a job clears everything cached under it.** The PWA posts a
+  `forget-job` message the moment a delete succeeds, since waiting for
+  someone to ask for a deleted job again could mean waiting forever. A 404 or
+  410 for any
   URL beneath `/jobs/{id}/` drops every entry with that prefix, so an offline
   visit cannot resurrect a deleted dossier one page at a time.
 - **Offline**: the app opens, shows the last job list it saw under a notice
@@ -419,6 +438,16 @@ optionally hardened one notch.
   model, and the report/source endpoints resolve only through the job
   store (no filesystem paths from the client; source filenames are checked
   against `/`, `\` and leading dots).
+- **One containment rule, applied everywhere.** The report and every source
+  copy must be a regular file that resolves inside `OUTPUT_DIR`, checked when
+  serving, when zipping, and when listing. The dossier lives in a synced
+  notes folder that people and sync clients write to, so a name Footnote
+  recorded can since have become a link to anything the service account can
+  read; the index lists only what the read endpoint would actually serve, so
+  the two can never disagree.
+- A push endpoint must be `http(s)`, which is stricter than the link policy
+  the dossier uses: `mailto:` is a legitimate citation and not somewhere a
+  notification can be delivered.
 - Rendered Markdown is rebuilt from an allowlist, so an archived page
   cannot run script on the origin that holds the session cookie.
 - Server filesystem paths stay server-side (see *What the client is not
@@ -439,9 +468,11 @@ optionally hardened one notch.
 - The token cookie is marked `Secure` when the request arrived over TLS, and
   not when it did not — setting it unconditionally would stop the cookie
   being sent at all on a plain-HTTP LAN.
-- A state file that is not valid JSON is renamed aside rather than silently
-  treated as empty, so the history can be looked at instead of being
-  overwritten by the next save.
+- A state file that is not valid JSON — or valid JSON that is not an object
+  of records — is renamed aside rather than silently treated as empty, so the
+  history can be looked at instead of being overwritten by the next save. A
+  single damaged record is dropped with a note instead of costing the rest of
+  the history.
 - **Response headers back the sanitizer up.** Every response carries a CSP
   (`script-src 'self'`, `connect-src 'self'`, `frame-ancestors 'none'`,
   `base-uri 'none'`), `X-Content-Type-Options: nosniff` and

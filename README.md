@@ -314,14 +314,14 @@ Details worth knowing:
 | Firecrawl requests per minute | `FIRECRAWL_RATE_LIMIT` (`0` disables pacing) | `10` — the free plan's limit |
 | Firecrawl requests in flight | `FIRECRAWL_CONCURRENCY` | `2` — the free plan's limit |
 | Cross-origin browser clients | `FOOTNOTE_CORS_ORIGINS` (comma-separated) | none — the PWA is same-origin |
+| API token | `FOOTNOTE_TOKEN` | unset — no authentication |
+| Push keys | `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `VAPID_CLAIM_EMAIL` | unset — push disabled |
+| Notion mirror | `NOTION_API_KEY`, `NOTION_DATABASE_ID` | unset — mirror disabled |
 
 Numeric settings are validated at startup: a non-numeric or out-of-range
 `MAX_SOURCES`, `FIRECRAWL_RATE_LIMIT` or `FIRECRAWL_CONCURRENCY`, or a
 `DEFAULT_PROCESSOR` that is not a processor, refuses to start with a message
 naming the setting rather than failing on the first request.
-| API token | `FOOTNOTE_TOKEN` | unset — no authentication |
-| Push keys | `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `VAPID_CLAIM_EMAIL` | unset — push disabled |
-| Notion mirror | `NOTION_API_KEY`, `NOTION_DATABASE_ID` | unset — mirror disabled |
 
 All of it can live in `.env` (see [.env.example](.env.example)). Real
 environment variables win over `.env` entries — which is what lets the

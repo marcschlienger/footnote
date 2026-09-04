@@ -506,6 +506,9 @@ def test_split_front_matter_passes_plain_text_through():
 def client(monkeypatch):
     app_module.jobs.data.clear()
     monkeypatch.setattr(app_module, "FOOTNOTE_TOKEN", "")
+    # _finished_job repoints OUTPUT_DIR at its dossier; put it back afterwards
+    # so one test's tmp_path is not the next test's output directory.
+    monkeypatch.setattr(app_module, "OUTPUT_DIR", app_module.OUTPUT_DIR)
     with TestClient(app_module.app) as c:
         yield c
 
@@ -556,7 +559,12 @@ def test_research_lifecycle(client, monkeypatch):
 
 
 def _finished_job(tmp_path, **extra):
-    """A done job whose dossier really exists on disk, as write_report leaves it."""
+    """A done job whose dossier really exists on disk, as write_report leaves it.
+
+    OUTPUT_DIR moves with it: report and source files are served only from
+    inside the configured output directory.
+    """
+    app_module.OUTPUT_DIR = tmp_path
     written = pipeline.write_report(
         tmp_path, "How do solid-state batteries work?", "core",
         _sample_result(),
@@ -991,6 +999,131 @@ def test_a_symlink_out_of_the_dossier_is_not_served(client, tmp_path):
         assert not any("sneaky" in n for n in z.namelist())
 
 
+def test_a_symlinked_report_is_not_served(client, tmp_path):
+    """The report is inside the same boundary as the sources beside it."""
+    secret = tmp_path / "secret.txt"
+    secret.write_text("PRIVATE KEY MATERIAL")
+    folder = tmp_path / "out" / "2026-01-01 sym"
+    folder.mkdir(parents=True)
+    app_module.OUTPUT_DIR = tmp_path / "out"
+    link = folder / "sym.md"
+    try:
+        link.symlink_to(secret)                 # outside OUTPUT_DIR
+    except OSError:
+        pytest.skip("symlinks unavailable")
+    app_module.jobs.data["sym"] = {
+        "id": "sym", "question": "q", "status": "done",
+        "created_at": "2026-01-01T00:00:00Z", "report_path": str(link)}
+    for url in ("/jobs/sym/report", "/jobs/sym/report.md",
+                "/jobs/sym/bundle.zip", "/jobs/sym/sources"):
+        resp = client.get(url)
+        assert resp.status_code == 404, url
+        assert "PRIVATE KEY" not in resp.text, url
+
+
+def test_the_source_index_lists_only_files_it_would_serve(client, tmp_path):
+    """A link out of the folder is not an archived source; a broken one is not
+    an excuse to fail the whole index."""
+    written = _finished_job(tmp_path)
+    sources = written.path.parent / "sources"
+    outside = tmp_path / "outside.md"
+    outside.write_text("not part of the dossier")
+    try:
+        (sources / "08 escape.md").symlink_to(outside)
+        (sources / "09 broken.md").symlink_to(sources / "gone.md")
+    except OSError:
+        pytest.skip("symlinks unavailable")
+
+    body = client.get("/jobs/xyz/sources").json()
+    listed = [s["file"] for s in body["sources"] if s["file"]]
+    assert listed == ["01 Paper A.md"]
+    assert all(s["bytes"] >= 0 for s in body["sources"])
+
+
+def test_a_mailto_endpoint_is_not_a_push_subscription(client, monkeypatch):
+    monkeypatch.setattr(app_module, "VAPID_PUBLIC_KEY", "pub")
+    monkeypatch.setattr(app_module, "VAPID_PRIVATE_KEY", "priv")
+    monkeypatch.setattr(app_module, "VAPID_CLAIM_EMAIL", "me@example.test")
+    assert not app_module._valid_subscription(
+        {"endpoint": "mailto:x@example.test", "keys": {"p256dh": "a", "auth": "b"}})
+    assert client.post("/subscribe", json={
+        "endpoint": "mailto:x@example.test",
+        "keys": {"p256dh": "a", "auth": "b"}}).status_code == 422
+    app_module.subs.data.clear()
+
+
+def test_a_store_that_is_not_a_dict_of_records_does_not_load(tmp_path):
+    listed = tmp_path / "jobs.json"
+    listed.write_text("[]")
+    store = app_module.JsonStore(listed)
+    assert store.data == {}                     # and kept aside for inspection
+    assert list(tmp_path.glob("jobs.corrupt-*.json"))
+
+    mixed = tmp_path / "subs.json"
+    mixed.write_text('{"good": {"status": "done"}, "bad": "not a record"}')
+    assert app_module.JsonStore(mixed).data == {"good": {"status": "done"}}
+
+
+def test_json_of_the_wrong_shape_takes_the_retry_path(monkeypatch):
+    monkeypatch.setattr(pipeline, "BASE_BACKOFF_S", 0.01)
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(200, json=["not", "an", "object"])
+
+    copy, = _run_scrape(handler, 1)
+    assert calls["n"] == pipeline.MAX_ATTEMPTS
+    assert copy.error == "HTTP 200 with an unreadable body"
+
+
+def test_a_data_field_of_the_wrong_shape_is_not_a_crash(monkeypatch):
+    monkeypatch.setattr(pipeline, "BASE_BACKOFF_S", 0.01)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"success": True, "data": []})
+
+    copy, = _run_scrape(handler, 1)
+    assert not copy.ok and "attribute" not in copy.error.lower()
+
+
+def test_archiving_announces_what_it_will_attempt():
+    cits = [Citation("https://a.test/1"), Citation("mailto:x@example.test"),
+            Citation("javascript:alert(1)")]
+    assert [c.url for c in pipeline.scrapable(cits, 10)] == ["https://a.test/1"]
+    assert pipeline.scrapable(cits, 0) == []
+    assert pipeline.scrapable([Citation("mailto:x@example.test")], 10) == []
+
+
+def test_notion_keeps_room_for_the_sources(monkeypatch):
+    sent = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.update(json.loads(request.content))
+        return httpx.Response(200, json={"url": "https://notion.test/p"})
+
+    result = ResearchResult(
+        content="\n\n".join(f"Paragraph {i}." for i in range(200)),
+        citations=[Citation(f"https://s.test/{i}", f"Source {i}") for i in range(5)]
+        + [Citation("javascript:alert(1)", "Unsafe")],
+        confidence="", reasoning="")
+
+    async def run():
+        async with httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)) as client:
+            return await pipeline.save_to_notion(client, "k", "db", "q", result)
+
+    assert asyncio.run(run()) == "https://notion.test/p"
+    blocks = sent["children"]
+    assert len(blocks) <= pipeline.NOTION_MAX_BLOCKS
+    kinds = [b["type"] for b in blocks]
+    assert "heading_2" in kinds                 # the sources survived the report
+    links = [b["paragraph"]["rich_text"][0]["text"].get("link")
+             for b in blocks if b["type"] == "paragraph"]
+    assert {"url": "https://s.test/0"} in links
+    assert not any(l and "javascript" in l["url"] for l in links if l)
+
+
 def test_a_citation_that_is_not_a_web_link_is_not_linked(tmp_path):
     result = ResearchResult(
         content="b", citations=[Citation("javascript:alert(1)", "Click me")],
@@ -1124,6 +1257,25 @@ def _sw_pattern(name):
     literal = re.search(rf"const {name} = \(url\) =>\s*/(.+?)/\.test",
                         source, re.S).group(1)
     return re.compile(literal.replace("\\/", "/"))   # JS escapes its delimiter
+
+
+def test_the_worker_awaits_its_cache_writes():
+    """An unawaited put can be in flight when the worker is stopped."""
+    source = (Path(__file__).resolve().parent.parent
+              / "static" / "service-worker.js").read_text()
+    puts = re.findall(r"^.*\.put\(.*$", source, re.M)
+    assert puts, "no cache writes found"
+    for line in puts:
+        assert "await" in line, line
+
+
+def test_the_page_can_tell_the_worker_to_forget_a_job():
+    sw = (Path(__file__).resolve().parent.parent
+          / "static" / "service-worker.js").read_text()
+    app_js = (Path(__file__).resolve().parent.parent
+              / "static" / "app.js").read_text()
+    assert '"forget-job"' in sw and 'addEventListener("message"' in sw
+    assert '"forget-job"' in app_js and "postMessage" in app_js
 
 
 def test_deleting_a_job_clears_every_entry_it_owns():
