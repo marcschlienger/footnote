@@ -11,6 +11,11 @@ let pushConfigured = false;
 // re-renders the whole list, and an open panel must survive that.
 const openSources = new Set();
 const sourcesCache = new Map();
+// Readers opened in place, by the URL they show. Polling rebuilds the whole
+// list, and something you are part-way through reading should not vanish
+// because a timer fired.
+const openReaders = new Set();
+const readerCache = new Map();
 const SOURCES_TTL_MS = 60000;   // a copy can be moved or deleted in the notes
 
 // --------------------------------------------------------------------
@@ -155,6 +160,8 @@ function renderJob(job) {
       links.appendChild(gone);
     } else {
       links.appendChild(link(`/jobs/${job.id}/report`, "Report"));
+      links.appendChild(readInline(`/jobs/${job.id}/report?embed=1`, li,
+                                   "read here", "close", meta));
       links.appendChild(link(`/jobs/${job.id}/report.md`, ".md"));
       links.appendChild(sourcesToggle(job));
       links.appendChild(link(`/jobs/${job.id}/bundle.zip`, "Everything (.zip)"));
@@ -182,6 +189,7 @@ function renderJob(job) {
       }
       openSources.delete(job.id);
       sourcesCache.delete(job.id);
+      forgetReaders(job.id);
       // Tell the worker now: the 404-driven cleanup only fires if someone
       // asks for the job again, and offline that may never happen.
       navigator.serviceWorker?.controller?.postMessage(
@@ -264,6 +272,7 @@ function renderSource(src) {
   const row = document.createElement("span");
   row.className = "src-links";
   if (src.archived) {
+    row.appendChild(readHere(src, li));
     row.appendChild(link(src.download_url, ".md"));
     if (src.url) row.appendChild(link(src.url, "original ↗"));
     row.appendChild(text("span", size(src.bytes)));
@@ -273,6 +282,62 @@ function renderSource(src) {
   }
   li.appendChild(row);
   return li;
+}
+
+// Read a dossier or an archived copy without leaving the page. The links
+// beside these still open the standalone views — those are what a push
+// notification and the report's "local copy" links point at.
+function readHere(src, li) {
+  return readInline(src.read_url + "?embed=1", li, "read here", "close");
+}
+
+function forgetReaders(jobId) {
+  const prefix = `/jobs/${jobId}/`;
+  for (const url of [...openReaders]) if (url.startsWith(prefix)) openReaders.delete(url);
+  for (const url of [...readerCache.keys()]) if (url.startsWith(prefix)) readerCache.delete(url);
+}
+
+function readInline(url, host, openLabel, closeLabel, after) {
+  const button = document.createElement("button");
+  button.className = "linkish";
+  const close = () => {
+    host.querySelector(":scope > .src-body")?.remove();
+    openReaders.delete(url);
+    button.textContent = openLabel;
+  };
+  const open = async () => {
+    openReaders.add(url);
+    button.textContent = closeLabel;
+    const panel = document.createElement("div");
+    panel.className = "src-body";
+    panel.textContent = readerCache.has(url) ? "" : "Loading…";
+    // After the row it belongs to, so an open reader does not push the
+    // source list away from the links that opened it.
+    host.insertBefore(panel, (after && after.nextSibling) || null);
+    if (readerCache.has(url)) {
+      panel.innerHTML = readerCache.get(url);
+      return;
+    }
+    try {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(res.statusText);
+      const html = await res.text();
+      readerCache.set(url, html);
+      // Sanitised server-side, by the same allowlist the standalone page uses.
+      panel.innerHTML = html;
+    } catch (e) {
+      panel.textContent = "Could not read it: " + e.message;
+      openReaders.delete(url);
+      button.textContent = openLabel;
+    }
+  };
+  button.textContent = openLabel;
+  button.onclick = () =>
+    host.querySelector(":scope > .src-body") ? close() : open();
+  // Deferred: at this point the card is still being assembled, so the row
+  // this panel belongs after may not be in the DOM yet.
+  if (openReaders.has(url)) queueMicrotask(open);
+  return button;
 }
 
 function size(bytes) {

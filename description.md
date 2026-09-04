@@ -386,6 +386,20 @@ in a `<pre>` — the dependency is optional, like Margin's. No client-side
 rendering: the page must be readable from a push-notification tap on a phone
 that has never loaded the PWA.
 
+Both rendered views also take `?embed=1`, returning the body alone. Relative
+links are resolved against the document's own URL there: a dossier links its
+sources relatively — correct in a notes folder and on the report's own page —
+but a fragment shown inside the app lives at a different URL, and those links
+would otherwise resolve against that one and 404.
+
+**Every rendered page leads back to the app.** A source page is reached from
+the source list at least as often as from the report, so "← Report" was a way
+out to somewhere the reader had never been. And an HTTPException in a browser
+now renders as a page with a way home rather than a bare JSON body: a stale
+bookmark, a notification for a job since removed, a dossier moved in the
+notes folder are all ordinary, and none of them should be a dead end. API
+clients still get the JSON.
+
 **The rendered HTML is rebuilt, not filtered.** Everything on these pages
 started on the open web — an archived page, or a report written from archived
 pages — and python-markdown passes raw HTML straight through. So the output
@@ -410,7 +424,8 @@ which may not sync the notes folder at all. Three endpoints do that:
 - `GET /jobs/{id}/sources/{file}` renders one archived copy in the same
   paper style, with the frontmatter turned into a header (title, retrieval
   date, link to the original). `?raw=1` returns the Markdown file itself as
-  a download. File names are resolved by name only — never a path from the
+  a download, and `?embed=1` returns the same body with no page around it,
+  which is what the PWA shows when a source is read in place. File names are resolved by name only — never a path from the
   client — under the job's own folder.
 - `GET /jobs/{id}/bundle.zip` zips the report and its sources in memory,
   laid out exactly as they sit on disk, so unzipping reproduces the folder.
@@ -448,6 +463,13 @@ Behavior notes:
 - **Configuration surface**: on load the app calls `/health` and shows a
   red flash if `PARALLEL_API_KEY` is missing or the output folder is not
   writable — the two failures worth catching before the first question.
+- **Reading in place**: both the dossier and any archived copy can be opened
+  inside the card ("read here"), fetched as a sanitised fragment. Open
+  readers are remembered by URL and their HTML is cached, so a poll — every
+  five seconds while a job is running — cannot make what you are reading
+  disappear or refetch it. The links beside them still open the standalone
+  pages, which is what a push notification and the report's "local copy"
+  links point at.
 - **Source panels** expand in place on a finished job: the list comes from
   `/jobs/{id}/sources`, cached per job and re-expanded after every poll, so
   a five-second refresh doesn't collapse what you are reading. That cache

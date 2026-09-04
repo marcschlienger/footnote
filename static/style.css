@@ -116,7 +116,9 @@ button.ghost {
 #push-offer { margin-top: .8rem; }
 
 /* Jobs list ---------------------------------------------------------- */
-#jobs-section h2 {
+/* Direct child only: embedded dossier content lives inside this section, and
+   an id selector would otherwise restyle every heading in it. */
+#jobs-section > h2 {
   font: 700 1.15rem var(--serif);
   margin: 1.8rem 0 .6rem;
   border-bottom: 2px solid var(--rule-red);
@@ -222,6 +224,47 @@ li.job {
 }
 .sources .src-links a { font-weight: 600; }
 .srcs-foot { margin: .75rem 0 0; font-size: .8rem; }
+
+/* An archived copy read in place, inside the job card. */
+.src-body {
+  margin: .5rem 0 .2rem;
+  padding: .6rem .8rem;
+  max-height: 22rem;
+  overflow-y: auto;
+  background: var(--paper);
+  border: 1px solid #E2D8BE;
+  border-left: 3px solid var(--pen-blue);
+  border-radius: 8px;
+  font: .92rem/1.55 var(--serif);
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+.src-body h1, .src-body h2, .src-body h3 {
+  font: 600 1rem/1.3 var(--serif);
+  margin: .9rem 0 .3rem;
+  border-bottom: 1px solid var(--paper-deep);
+  padding-bottom: .15rem;
+}
+.src-body h1:first-child, .src-body h2:first-child { margin-top: 0; }
+.src-body p { margin: .5rem 0; }
+/* Prose links, not the card's navigation links, which .job a styles. */
+.src-body a {
+  color: var(--pen-blue);
+  font-weight: 400;
+  text-decoration: underline;
+}
+/* A link whose URL the sanitizer rejected keeps its text and loses its href;
+   it should not go on looking clickable here either. */
+.src-body a:not([href]) { color: inherit; }
+.src-body img { max-width: 100%; height: auto; }
+.src-body pre { overflow-x: auto; background: var(--paper-deep); padding: .5em .7em; }
+.src-body table { border-collapse: collapse; font-size: .9em; }
+.src-body th, .src-body td { border: 1px solid #D0C5A8; padding: .2rem .45rem; }
+.src-body .source-note {
+  margin: 0 0 .4rem;
+  font: .78rem var(--sans);
+  color: var(--ink-soft);
+}
 
 .spin {
   display: inline-block; width: .8em; height: .8em;

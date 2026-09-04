@@ -661,6 +661,54 @@ def test_bundle_zip_holds_report_and_sources(client, tmp_path):
         assert b"# A body" in archive.read(f"{folder}/sources/01 Paper A.md")
 
 
+def test_every_rendered_page_leads_back_to_the_app(client, tmp_path):
+    """A source page is reached from the list as often as from the report."""
+    _finished_job(tmp_path)
+    for url in ("/jobs/abcdefabcdef/report",
+                "/jobs/abcdefabcdef/sources/01 Paper A.md"):
+        assert 'href="/">← Footnote' in client.get(url).text, url
+
+
+def test_a_dead_link_in_a_browser_is_not_a_dead_end(client):
+    """A stale bookmark or a notification for a job since removed."""
+    page = client.get("/jobs/deadbeefdead/report",
+                      headers={"Accept": "text/html"})
+    assert page.status_code == 404
+    assert 'href="/"' in page.text and "<h1>" in page.text
+    # An API client still gets what it expects.
+    api = client.get("/jobs/deadbeefdead/report")
+    assert api.status_code == 404 and api.json()["detail"]
+
+
+def test_a_dossier_can_be_read_without_leaving_the_app(client, tmp_path):
+    """?embed=1 is the same body without the page around it."""
+    _finished_job(tmp_path)
+    for url in ("/jobs/abcdefabcdef/report",
+                "/jobs/abcdefabcdef/sources/01 Paper A.md"):
+        embedded = client.get(url, params={"embed": 1})
+        assert embedded.status_code == 200
+        assert "<!doctype" not in embedded.text.lower()
+        assert "page-nav" not in embedded.text
+        assert "<h1>" in embedded.text or "<p" in embedded.text
+
+    # And the relative links a dossier carries are resolved against the URL
+    # the document really lives at, not the page it is shown inside.
+    embedded = client.get("/jobs/abcdefabcdef/report", params={"embed": 1}).text
+    assert 'href="/jobs/abcdefabcdef/sources/01 Paper A.md"' in embedded
+    standalone = client.get("/jobs/abcdefabcdef/report").text
+    assert 'href="sources/01 Paper A.md"' in standalone   # correct on its page
+
+
+def test_the_pwa_can_read_in_place():
+    app_js = (Path(__file__).resolve().parent.parent
+              / "static" / "app.js").read_text()
+    assert "embed=1" in app_js and "readInline" in app_js
+    css = (Path(__file__).resolve().parent.parent
+           / "static" / "style.css").read_text()
+    # The section heading rule must not restyle embedded dossier headings.
+    assert "#jobs-section > h2" in css
+
+
 def test_report_view_links_to_the_bundle(client, tmp_path):
     _finished_job(tmp_path)
     page = client.get("/jobs/abcdefabcdef/report")

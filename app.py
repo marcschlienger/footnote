@@ -48,7 +48,7 @@ from datetime import datetime, timezone
 from html import escape
 from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urljoin
 
 import httpx
 from dotenv import load_dotenv
@@ -839,10 +839,15 @@ def _safe_image_url(url: str) -> bool:
 class _Sanitizer(HTMLParser):
     """Re-emit only allowlisted markup; everything else becomes text."""
 
-    def __init__(self) -> None:
+    def __init__(self, base: str = "") -> None:
         super().__init__(convert_charrefs=True)
         self.out: list = []
         self._muted = 0
+        # Where relative links should point. A dossier links its sources
+        # relatively, which is right in a notes folder and right on the
+        # report's own page — but a fragment shown inside the app is at a
+        # different URL, and those links would resolve against that instead.
+        self.base = base
 
     def handle_starttag(self, tag, attrs):
         if tag in _DROP_WITH_CONTENT:
@@ -860,6 +865,8 @@ class _Sanitizer(HTMLParser):
                 continue
             if name == "src" and not _safe_image_url(value):
                 continue
+            if self.base and name in ("href", "src"):
+                value = urljoin(self.base, value)
             parts.append(f'{name}="{escape(value, quote=True)}"')
         self.out.append("<" + " ".join(parts) + ">")
 
@@ -875,18 +882,18 @@ class _Sanitizer(HTMLParser):
             self.out.append(escape(data, quote=False))
 
 
-def _render_markdown(text: str) -> str:
+def _render_markdown(text: str, base: str = "") -> str:
     if _markdown is None:              # optional dependency; show it plain
         return f"<pre style='white-space:pre-wrap'>{escape(text)}</pre>"
-    parser = _Sanitizer()
+    parser = _Sanitizer(base)
     parser.feed(_markdown.markdown(text, extensions=["tables", "fenced_code"]))
     parser.close()
     return "".join(parser.out)
 
 
-def _page(title: str, nav: str, body: str) -> HTMLResponse:
+def _page(title: str, nav: str, body: str, status_code: int = 200) -> HTMLResponse:
     """The shared paper-styled document shell (report and source views)."""
-    return HTMLResponse(f"""<!doctype html><html><head><meta charset="utf-8">
+    return HTMLResponse(status_code=status_code, content=f"""<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{escape(title)} — Footnote</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
@@ -1110,6 +1117,29 @@ async def _security_headers(request: Request, call_next):
     return response
 
 
+@app.exception_handler(HTTPException)
+async def _http_error(request: Request, exc: HTTPException):
+    """An error a browser can get out of.
+
+    A stale bookmark, a notification for a job since removed, a dossier moved
+    in the notes folder — all of these are ordinary, and answering them with
+    a bare JSON body leaves the reader on a page with no way back to the app.
+    API clients still get the JSON they expect.
+    """
+    wants_html = ("text/html" in request.headers.get("accept", "")
+                  and request.method == "GET")
+    if not wants_html:
+        return JSONResponse({"detail": exc.detail}, status_code=exc.status_code,
+                            headers=getattr(exc, "headers", None))
+    detail = escape(str(exc.detail))
+    return _page(f"{exc.status_code}", '<a href="/">← Footnote</a>',
+                 f"<h1>Not here</h1><p>{detail}</p>"
+                 f"<p class='source-note'>The dossier itself is a folder of "
+                 f"Markdown files; if it was moved or removed, it is still "
+                 f"wherever you put it.</p>",
+                 status_code=exc.status_code)
+
+
 @app.exception_handler(RequestValidationError)
 async def _validation_error(request: Request, exc: RequestValidationError):
     """A 422 that can always be encoded.
@@ -1265,14 +1295,20 @@ async def report_markdown(job_id: str):
 
 
 @app.get("/jobs/{job_id}/report")
-async def report_html(job_id: str):
+async def report_html(job_id: str, embed: int = 0):
+    """The dossier, rendered. `?embed=1` is the same body without the page,
+    for reading it inside the app rather than navigating away from it."""
     path = _report_file(job_id)
     _, text = pipeline.split_front_matter(_read_file(path))
+    if embed:
+        return HTMLResponse(
+            _render_markdown(text, base=f"/jobs/{job_id}/report"))
+    rendered = _render_markdown(text)
     nav = (f'<a href="/">← Footnote</a> &nbsp;·&nbsp; '
            f'<a href="/jobs/{job_id}/report.md" download>Download .md</a>'
            f' &nbsp;·&nbsp; '
            f'<a href="/jobs/{job_id}/bundle.zip">Download everything (.zip)</a>')
-    return _page(path.stem, nav, _render_markdown(text))
+    return _page(path.stem, nav, rendered)
 
 
 def _source_file(job_id: str, name: str) -> Path:
@@ -1379,29 +1415,40 @@ async def list_sources(job_id: str):
 
 
 @app.get("/jobs/{job_id}/sources/{name}")
-async def report_source(job_id: str, name: str, raw: int = 0):
+async def report_source(job_id: str, name: str, raw: int = 0, embed: int = 0):
     """One archived source: rendered for reading, `?raw=1` for the file.
 
     The rendered form is also what the report's relative "local copy" links
-    resolve to in the web view, exactly as they do in a notes app.
+    resolve to in the web view, exactly as they do in a notes app. `?embed=1`
+    returns the same body without the page around it, for the PWA to show in
+    place — the sanitising has already happened either way.
     """
     path = _source_file(job_id, name)
     if raw:
         return FileResponse(path, media_type="text/markdown", filename=path.name)
     meta, text = pipeline.split_front_matter(_read_file(path))
     origin = meta.get("source", "")
-    nav = [f'<a href="/jobs/{job_id}/report">← Report</a>']
+    title = meta.get("title") or path.stem
+    retrieved = (f", retrieved {escape(meta['retrieved'])}"
+                 if meta.get("retrieved") else "")
+    if embed:
+        base = f"/jobs/{job_id}/sources/{quote(name)}"
+        return HTMLResponse(f'<p class="source-note">Archived copy{retrieved}'
+                            f'</p>{_render_markdown(text, base=base)}')
+    rendered = _render_markdown(text)
+
+    # Back to the app, not only back to the report: this page is reached from
+    # the source list as often as from the report, and "← Report" was then a
+    # way out to somewhere the reader had never been.
+    nav = [f'<a href="/">← Footnote</a>',
+           f'<a href="/jobs/{job_id}/report">Report</a>']
     if _safe_url(origin):
         nav.append(f'<a href="{escape(origin, quote=True)}" target="_blank" '
                    f'rel="noopener noreferrer">Original page ↗</a>')
     nav.append('<a href="?raw=1" download>Download .md</a>')
-    title = meta.get("title") or path.stem
     heading = (f'<h1>{escape(title)}</h1>'
-               f'<p class="source-note">Archived copy'
-               + (f", retrieved {escape(meta['retrieved'])}"
-                  if meta.get("retrieved") else "") + '</p>')
-    return _page(title, " &nbsp;·&nbsp; ".join(nav),
-                 heading + _render_markdown(text))
+               f'<p class="source-note">Archived copy{retrieved}</p>')
+    return _page(title, " &nbsp;·&nbsp; ".join(nav), heading + rendered)
 
 
 def _zip_bundle(report: Path) -> bytes:
