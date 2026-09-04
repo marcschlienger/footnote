@@ -15,6 +15,9 @@ RestartSec=5
 
 # Hardening — moderate: the app needs the user's home (saves in OUTPUT_DIR)
 # and its own data/ directory for job state.
+# Dossiers and job state are private to the instance's user by default,
+# whatever the host umask happens to be.
+UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full

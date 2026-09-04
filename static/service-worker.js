@@ -68,6 +68,10 @@ self.addEventListener("fetch", (event) => {
   if (event.request.method !== "GET") return;
   const url = new URL(event.request.url);
   if (url.origin !== self.location.origin) return;
+  // A ?token= URL is answered by the network and never stored: the cache key
+  // is the whole URL, so caching it would write the token into Cache Storage
+  // and leave it there long after the redirect cleaned the address bar.
+  if (url.searchParams.has("token")) return;
 
   if (isShell(url)) {
     event.respondWith(networkFirst(event.request, SHELL_CACHE));

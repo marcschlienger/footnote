@@ -3,7 +3,8 @@
 # Licensed under the GNU AGPL v3.0 or later; see the LICENSE file for details.
 # SPDX-License-Identifier: AGPL-3.0-or-later
 #
-# Install the shared Footnote platform on Ubuntu (20.04+): application code
+# Install the shared Footnote platform on Ubuntu (22.04+, for Python 3.10;
+# 20.04's default python3 is 3.8 and the installer refuses it): application code
 # and virtualenv in APP_DIR, and the footnote@ systemd template unit. Run as
 # root:
 #
@@ -19,6 +20,7 @@
 set -euo pipefail
 
 APP_DIR="${APP_DIR:-/opt/footnote}"
+SHARED_GROUP="${SHARED_GROUP:-footnote}"
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -29,6 +31,18 @@ fi
 echo "==> Installing system packages"
 apt-get update
 apt-get install -y python3-venv python3-pip rsync
+
+# Footnote needs 3.10 (README's stated floor). Ubuntu 22.04 ships 3.10 and
+# 24.04 ships 3.12; 20.04's default python3 is 3.8, which starts the service
+# and then fails inside jobs — the worst possible way to find out.
+PYTHON="${PYTHON:-python3}"
+PY_VERSION="$("$PYTHON" -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
+if ! "$PYTHON" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)'; then
+  echo "Footnote needs Python 3.10 or newer; $PYTHON is $PY_VERSION." >&2
+  echo "On Ubuntu 20.04, install a newer Python (for example the deadsnakes" >&2
+  echo "PPA) and re-run with PYTHON=/usr/bin/python3.12, or use 22.04+." >&2
+  exit 1
+fi
 
 echo "==> Copying application to $APP_DIR"
 mkdir -p "$APP_DIR"
@@ -44,12 +58,17 @@ rsync -a --delete \
 [ -f "$APP_DIR/.env" ] || cp "$APP_DIR/.env.example" "$APP_DIR/.env"
 
 echo "==> Creating virtualenv and installing Python dependencies"
-[ -d "$APP_DIR/.venv" ] || python3 -m venv "$APP_DIR/.venv"
+[ -d "$APP_DIR/.venv" ] || "$PYTHON" -m venv "$APP_DIR/.venv"
 "$APP_DIR/.venv/bin/pip" install --upgrade pip -q
 "$APP_DIR/.venv/bin/pip" install -r "$APP_DIR/requirements.txt" -q
 
 # Instances run as their own users — they need read access to the shared code
 chmod -R a+rX "$APP_DIR"
+# …but not to the shared API keys. A dedicated group carries that access;
+# add-instance.sh puts each instance's user into it.
+groupadd -f "$SHARED_GROUP"
+chgrp "$SHARED_GROUP" "$APP_DIR/.env"
+chmod 640 "$APP_DIR/.env"
 
 echo "==> Installing systemd template unit footnote@.service"
 mkdir -p /etc/footnote

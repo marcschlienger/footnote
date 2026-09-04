@@ -29,6 +29,8 @@ Output directory: --output-dir flag > OUTPUT_DIR env var > platform default.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import io
 import json
 import os
@@ -50,6 +52,7 @@ from urllib.parse import quote
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import (
     FileResponse,
@@ -180,8 +183,17 @@ class JsonStore:
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=self.path.parent, suffix=".tmp")
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(self.data, fh, ensure_ascii=False, indent=1)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(self.data, fh, ensure_ascii=False, indent=1)
+        except UnicodeEncodeError:
+            # Text that UTF-8 cannot represent — an unpaired surrogate — is
+            # refused at the door, but one slipping through must not wedge
+            # every future save. Escaping it keeps the history writable.
+            print(f"{self.path.name}: escaping text that is not valid UTF-8",
+                  flush=True)
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(self.data, fh, ensure_ascii=True, indent=1)
         os.replace(tmp, self.path)
 
 
@@ -215,6 +227,9 @@ def _question_problem(question) -> str:
         return "question is too short"
     if len(text) > QUESTION_MAX:
         return f"question is too long ({QUESTION_MAX} chars max)"
+    if pipeline.has_lone_surrogate(text):
+        # It survives JSON decoding and then cannot be written back out.
+        return "question contains unpaired surrogate characters"
     return ""
 
 
@@ -282,13 +297,28 @@ def _resumable(job: dict) -> bool:
             and job.get("processor") in ALL_PROCESSORS)
 
 
+# Web Push key sizes: an uncompressed P-256 point, and the auth secret.
+_KEY_BYTES = {"p256dh": 65, "auth": 16}
+
+
 def _valid_subscription(sub) -> bool:
-    """What _push_one needs to exist before it tries."""
-    return (isinstance(sub, dict)
+    """What _push_one needs to exist, and to be usable, before it tries."""
+    if not (isinstance(sub, dict)
             and pipeline.is_http_url(sub.get("endpoint", ""))
-            and isinstance(sub.get("keys"), dict)
-            and all(isinstance(sub["keys"].get(k), str) and sub["keys"][k]
-                    for k in ("p256dh", "auth")))
+            and isinstance(sub.get("keys"), dict)):
+        return False
+    for name, size in _KEY_BYTES.items():
+        value = sub["keys"].get(name)
+        if not isinstance(value, str):
+            return False
+        try:
+            # base64url without padding, as the Push API hands it over.
+            decoded = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+        except (ValueError, binascii.Error):
+            return False
+        if len(decoded) != size:
+            return False        # would fail on every notification, for ever
+    return True
 
 
 def _drop_unusable_subscriptions() -> None:
@@ -856,6 +886,20 @@ async def _security_headers(request: Request, call_next):
     return response
 
 
+@app.exception_handler(RequestValidationError)
+async def _validation_error(request: Request, exc: RequestValidationError):
+    """A 422 that can always be encoded.
+
+    FastAPI's default handler echoes the offending input, and the input is
+    sometimes exactly what could not be encoded — a question carrying an
+    unpaired surrogate would fail validation and then fail again on the way
+    out. ensure_ascii escapes it instead, and the body is written directly so
+    nothing re-encodes it.
+    """
+    body = json.dumps({"detail": exc.errors()}, ensure_ascii=True, default=str)
+    return Response(body, media_type="application/json", status_code=422)
+
+
 # ---------------------------------------------------------------------------
 # API
 # ---------------------------------------------------------------------------
@@ -912,10 +956,13 @@ def _job_public(job: dict) -> dict:
     public = {k: v for k, v in job.items() if k not in _PRIVATE_JOB_FIELDS}
     if job.get("report_path"):
         public["report_name"] = Path(job["report_path"]).name
+    if job.get("status") == "done" or job.get("report_path"):
         # Completion and availability are different facts: the dossier lives
         # in a folder people reorganise, and a link to a file that is gone is
-        # worse than no link. Costs one stat per job on the page being shown.
-        public["report_available"] = _servable_report(job["report_path"]) is not None
+        # worse than no link. Always present for a finished job, so a record
+        # with no path at all reads as unavailable rather than as unknown.
+        public["report_available"] = _servable_report(
+            job.get("report_path") or "") is not None
     return public
 
 
@@ -1060,7 +1107,9 @@ def _source_entries(job: dict, folder: Path) -> list:
     return [
         {"n": n,
          "title": title or url or name,
-         "url": url if _safe_url(url) else "",
+         # is_http_url, not the general link policy: a relative-looking
+         # citation would resolve against Footnote's own origin in the PWA.
+         "url": url if pipeline.is_http_url(url) else "",
          "file": name,
          "archived": bool(name),
          "read_url": base + quote(name) if name else "",

@@ -22,6 +22,7 @@
 set -euo pipefail
 
 APP_DIR="${APP_DIR:-/opt/footnote}"
+SHARED_GROUP="${SHARED_GROUP:-footnote}"
 USAGE="usage: sudo bash deploy/add-instance.sh <user> <port> [output-dir]"
 USER_NAME="${1:?$USAGE}"
 PORT="${2:?$USAGE}"
@@ -57,8 +58,14 @@ EOF
   chmod 600 "$ENV_FILE"
 fi
 
+# Read access to the shared API keys is carried by a group, not by "everyone".
+if getent group "$SHARED_GROUP" >/dev/null; then
+  usermod -a -G "$SHARED_GROUP" "$USER_NAME"
+fi
 echo "==> Creating output directory $OUT and data directory $DATA"
-install -d -o "$USER_NAME" -g "$GROUP_NAME" "$OUT"
+# 0700: a dossier is research someone paid for, and the host's default umask
+# is not a decision this script should inherit.
+install -d -o "$USER_NAME" -g "$GROUP_NAME" -m 700 "$OUT"
 install -d -o "$USER_NAME" -g "$GROUP_NAME" -m 700 "$DATA"
 
 echo "==> Enabling footnote@$USER_NAME"

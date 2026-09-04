@@ -443,6 +443,12 @@ LaunchAgent plist example is in
 
 ### Ubuntu server (systemd)
 
+**22.04 or newer**, for Python 3.10. Ubuntu 20.04's default `python3` is 3.8,
+which will start the service and then fail inside jobs — the installer checks
+and refuses rather than letting you find out that way; pass
+`PYTHON=/usr/bin/python3.12` if you have a newer interpreter installed
+another way.
+
 Footnote is single-user by design, so the deployment model is **one instance
 per person**: each instance runs as that person's own Unix account, writes
 into that person's own (synced) folder, and has its own port, token, and job
@@ -461,6 +467,11 @@ the [footnote@.service](deploy/footnote@.service) systemd template.
 `/etc/footnote/<user>.env` (output dir defaults to
 `/home/<user>/Research/inbox`, job state to `/var/lib/footnote/<user>`; a
 `FOOTNOTE_TOKEN` is generated and printed) and enables `footnote@<user>`.
+Dossier and data directories are created `0700` and the unit runs with
+`UMask=0077`, so research stays private to its own user whatever the host
+default is; the shared `/opt/footnote/.env` is `0640` and readable through a
+`footnote` group each instance user joins, rather than by every local
+account.
 Both are idempotent. API keys resolve per-person first
 (`/etc/footnote/<user>.env`), then shared (`/opt/footnote/.env`).
 

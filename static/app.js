@@ -147,7 +147,7 @@ function renderJob(job) {
   } else if (job.status === "done") {
     const links = document.createElement("span");
     links.className = "links";
-    if (job.report_available === false) {
+    if (job.report_available !== true) {
       // The dossier moved or was deleted in the notes folder. Say so instead
       // of offering links that answer 404.
       const gone = text("span", "report not where it was filed");

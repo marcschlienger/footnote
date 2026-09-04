@@ -139,7 +139,11 @@ connectivity.
 The deadline is enforced on the calls, not only between them: the HTTP
 client's own timeout and the long-poll window Parallel is asked for are both
 cut to what remains, and every retry sleep is measured from *after* the
-request rather than before it. A bound the caller passes is a bound.
+request rather than before it. The request is also wrapped in
+`asyncio.wait_for`, because httpx's timeouts bound individual operations —
+connect, and inactivity between reads — not the wall clock of the whole call,
+and a slow response that keeps trickling would otherwise outlast them. A
+bound the caller passes is a bound.
 
 ### Nothing arrives trusted
 
@@ -158,6 +162,21 @@ The result endpoint gets the same treatment for a different reason. The run
 behind it is finished and paid for, so a 429 or a bad gateway *in front of*
 the result is not a reason to throw it away: those are retried inside the
 existing deadline instead of failing the job.
+
+One class deserves naming because it bites twice: text that survives JSON
+*decoding* but cannot be JSON *encoded*. A client can send `"\ud800"`, and
+Python will hold the unpaired surrogate happily — until `json.dump` refuses
+it, at which point the job store cannot be written again and every later job
+is lost. So questions carrying one are refused at the door, provider text has
+them replaced, `JsonStore.save` falls back to escaping rather than failing,
+and the 422 that reports the refusal is serialized with `ensure_ascii` —
+because the default handler echoes the offending input, which is the very
+thing that could not be encoded.
+
+Filenames have their own version of the same lesson: `slug_for` budgets in
+UTF-8 *bytes*, not characters, because ext4 limits a path component to 255
+bytes and 64 emoji are 256 — a limit that would only ever be hit after the
+research was paid for.
 
 ## External API contracts
 

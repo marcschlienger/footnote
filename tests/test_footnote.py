@@ -8,6 +8,7 @@ Run with:  python -m pytest
 No network access required — external APIs are mocked.
 """
 import asyncio
+import base64
 import io
 import json
 import re
@@ -747,6 +748,12 @@ def test_index_and_pwa_assets(client):
 # Failure modes that must not touch a finished job
 # ---------------------------------------------------------------------------
 
+def _push_keys():
+    """Keys of the sizes the Push API actually hands over."""
+    return {"p256dh": base64.urlsafe_b64encode(b"\x04" + b"k" * 64).decode().rstrip("="),
+            "auth": base64.urlsafe_b64encode(b"a" * 16).decode().rstrip("=")}
+
+
 def test_a_broken_subscription_cannot_fail_a_finished_job(monkeypatch):
     """Push is best-effort; notify_all is called from inside run_research."""
     def explode(**kwargs):
@@ -966,8 +973,7 @@ def test_subscriptions_are_checked_when_they_are_registered(client, monkeypatch)
     monkeypatch.setattr(app_module, "VAPID_PUBLIC_KEY", "pub")
     monkeypatch.setattr(app_module, "VAPID_PRIVATE_KEY", "priv")
     monkeypatch.setattr(app_module, "VAPID_CLAIM_EMAIL", "me@example.test")
-    good = {"endpoint": "https://push.test/x",
-            "keys": {"p256dh": "abc", "auth": "def"}}
+    good = {"endpoint": "https://push.test/x", "keys": _push_keys()}
     assert client.post("/subscribe", json=good).status_code == 200
 
     assert client.post("/subscribe", json={**good, "keys": {}}).status_code == 422
@@ -984,7 +990,7 @@ def test_push_needs_a_claim_email_before_it_claims_to_work(client, monkeypatch):
     assert client.get("/health").json()["push_configured"] is False
     assert client.post("/subscribe", json={
         "endpoint": "https://push.test/x",
-        "keys": {"p256dh": "a", "auth": "b"}}).status_code == 503
+        "keys": _push_keys()}).status_code == 503
 
 
 def test_a_symlink_out_of_the_dossier_is_not_served(client, tmp_path):
@@ -1052,6 +1058,109 @@ def test_normalization_validates_rather_than_stringifies(monkeypatch):
         assert job.get("question") != "None"
         assert job.get("processor") != "{}"
     app_module.jobs.data.clear()
+
+
+def test_a_lone_surrogate_cannot_reach_the_store(client, monkeypatch):
+    """It survives JSON decoding and then cannot be written back out."""
+    monkeypatch.setattr(app_module, "PARALLEL_API_KEY", "k")
+    app_module.jobs.data.clear()
+
+    body = b'{"question": "' + (b"\\ud800" * 8) + b'"}'   # as a client sends it
+    resp = client.post("/research", content=body,
+                       headers={"Content-Type": "application/json"})
+    assert resp.status_code == 422
+    assert app_module.jobs.data == {}
+    assert app_module._question_problem("\ud800" * 8)
+
+
+def test_the_store_survives_text_it_should_never_have_held(tmp_path):
+    """Belt and braces: one bad value must not wedge every future save."""
+    store = app_module.JsonStore(tmp_path / "jobs.json")
+    store.data["x"] = {"question": "\ud800"}
+    store.save()                                   # must not raise
+    assert json.loads((tmp_path / "jobs.json").read_text())["x"]
+
+
+def test_provider_text_with_a_surrogate_is_neutralised():
+    payload = {"run": {"status": "completed"},
+               "output": {"content": "answer \ud800 here", "basis": [
+                   {"citations": [{"url": "https://a.test/1",
+                                   "title": "bad \ud800 title"}]}]}}
+    result = pipeline._parse_task_result(payload, "trun_x")
+    assert not pipeline.has_lone_surrogate(result.content)
+    assert not pipeline.has_lone_surrogate(result.citations[0].title)
+    result.content.encode("utf-8")                 # would raise before
+
+
+def test_slugs_are_budgeted_in_bytes_not_characters(tmp_path):
+    """ext4 limits a name to 255 bytes; 64 emoji are 256."""
+    slug = pipeline.slug_for("🙂" * 64)
+    assert len(slug.encode("utf-8")) <= 64
+    written = pipeline.write_report(tmp_path, "🙂" * 64, "core",
+                                    _sample_result(), [])
+    for part in (written.path.parent.name, written.path.name):
+        assert len(part.encode("utf-8")) <= 255, part
+    assert pipeline.slug_for("How do solid-state batteries work?") == \
+        "How do solid-state batteries work"        # ASCII is unaffected
+
+
+def test_a_run_id_must_be_a_string_of_the_right_shape():
+    async def create(body):
+        async with httpx.AsyncClient(transport=httpx.MockTransport(
+                lambda r: httpx.Response(200, json=body))) as client:
+            return await pipeline.start_task_run(client, "k", "q", "core")
+
+    for value in (123, True, 3.5, None, {"nested": 1}, "with space", "a/b"):
+        with pytest.raises(PipelineError, match="run_id"):
+            asyncio.run(create({"run_id": value}))
+    assert asyncio.run(create({"run_id": "trun_abc.123-x"})) == "trun_abc.123-x"
+
+
+def test_a_done_job_without_a_report_says_so(client):
+    app_module.jobs.data["dddddddddddd"] = {
+        "id": "dddddddddddd", "question": "a perfectly fine question",
+        "processor": "core", "status": "done",
+        "created_at": "2026-01-01T00:00:00Z"}
+    job = client.get("/jobs").json()["jobs"][0]
+    assert job["report_available"] is False        # not absent, which reads as yes
+
+
+def test_the_worker_never_caches_a_token_url():
+    source = (Path(__file__).resolve().parent.parent
+              / "static" / "service-worker.js").read_text()
+    assert 'searchParams.has("token")' in source
+
+
+def test_a_non_web_citation_is_not_linkable_from_the_index(client, tmp_path):
+    written = _finished_job(tmp_path)
+    app_module.jobs.data["abcdefabcdef"]["citations"] = [
+        {"url": "not-a-url", "title": "Bare", "file": "", "note": ""},
+        {"url": "https://a.test/1", "title": "Paper A", "file": "01 Paper A.md"},
+    ]
+    sources = client.get("/jobs/abcdefabcdef/sources").json()["sources"]
+    assert sources[0]["url"] == ""                 # would resolve against us
+    assert sources[0]["title"] == "Bare"           # still listed
+    assert sources[1]["url"] == "https://a.test/1"
+    assert written.path.exists()
+
+
+def test_push_keys_must_decode_to_their_real_sizes():
+    good = {"endpoint": "https://push.test/x", "keys": _push_keys()}
+    assert app_module._valid_subscription(good)
+    for broken in ({"p256dh": "x", "auth": "x"},
+                   {"p256dh": _push_keys()["p256dh"], "auth": "short"},
+                   {"p256dh": "!!!not base64!!!", "auth": _push_keys()["auth"]}):
+        assert not app_module._valid_subscription(
+            {"endpoint": "https://push.test/x", "keys": broken})
+
+
+def test_the_installer_refuses_an_unsupported_python():
+    install = (Path(__file__).resolve().parent.parent
+               / "deploy" / "install.sh").read_text()
+    assert "(3, 10)" in install and "PYTHON" in install
+    unit = (Path(__file__).resolve().parent.parent
+            / "deploy" / "footnote@.service").read_text()
+    assert "UMask=0077" in unit
 
 
 def test_an_unroutable_store_key_is_rekeyed(client, monkeypatch):
@@ -1402,7 +1511,7 @@ def test_a_push_endpoint_needs_a_host():
     assert not pipeline.is_http_url("http://")
     assert pipeline.is_http_url("https://push.test/x")
     assert not app_module._valid_subscription(
-        {"endpoint": "https:", "keys": {"p256dh": "a", "auth": "b"}})
+        {"endpoint": "https:", "keys": _push_keys()})
 
 
 def test_post_processing_stops_when_the_job_is_deleted(client, tmp_path,
@@ -1502,10 +1611,10 @@ def test_a_mailto_endpoint_is_not_a_push_subscription(client, monkeypatch):
     monkeypatch.setattr(app_module, "VAPID_PRIVATE_KEY", "priv")
     monkeypatch.setattr(app_module, "VAPID_CLAIM_EMAIL", "me@example.test")
     assert not app_module._valid_subscription(
-        {"endpoint": "mailto:x@example.test", "keys": {"p256dh": "a", "auth": "b"}})
+        {"endpoint": "mailto:x@example.test", "keys": _push_keys()})
     assert client.post("/subscribe", json={
         "endpoint": "mailto:x@example.test",
-        "keys": {"p256dh": "a", "auth": "b"}}).status_code == 422
+        "keys": _push_keys()}).status_code == 422
     app_module.subs.data.clear()
 
 
@@ -1689,13 +1798,15 @@ def test_a_corrupt_state_file_is_kept_for_inspection(tmp_path):
 
 
 def test_legacy_subscriptions_are_dropped_on_load(monkeypatch):
-    good = {"endpoint": "https://push.test/x", "keys": {"p256dh": "a", "auth": "b"}}
+    good = {"endpoint": "https://push.test/x", "keys": _push_keys()}
     app_module.subs.data.clear()
     app_module.subs.data.update({
         "keep": good,
         "no-keys": {"endpoint": "https://push.test/y", "keys": {}},
         "bad-endpoint": {"endpoint": "ftp://push.test/z",
-                         "keys": {"p256dh": "a", "auth": "b"}},
+                         "keys": _push_keys()},
+        "undecodable": {"endpoint": "https://push.test/w",
+                        "keys": {"p256dh": "x", "auth": "x"}},
     })
     monkeypatch.setattr(app_module.subs, "save", lambda: None)
     app_module._drop_unusable_subscriptions()
@@ -1736,7 +1847,7 @@ def test_the_pwa_replaces_a_subscription_made_with_an_old_key():
 def test_the_pwa_hides_links_to_a_report_that_is_gone():
     app_js = (Path(__file__).resolve().parent.parent
               / "static" / "app.js").read_text()
-    assert "report_available === false" in app_js
+    assert "report_available !== true" in app_js
 
 
 def test_the_page_can_tell_the_worker_to_forget_a_job():

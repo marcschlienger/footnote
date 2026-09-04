@@ -34,11 +34,13 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import httpx
 
 PARALLEL_BASE = "https://api.parallel.ai/v1"
+# A run id goes into a URL path; keep it to what cannot change its shape.
+_RUN_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 FIRECRAWL_BASE = "https://api.firecrawl.dev/v2"
 
 # Task API processors, cheap/fast → expensive/deep, with a generous overall
@@ -102,6 +104,19 @@ def _as_list(value) -> list:
     return value if isinstance(value, list) else []
 
 
+_LONE_SURROGATE = re.compile("[\ud800-\udfff]")
+
+
+def has_lone_surrogate(text: str) -> bool:
+    """Whether this string cannot be written as UTF-8.
+
+    A lone surrogate survives JSON *decoding* — a client can send "\\ud800"
+    — but json.dump(ensure_ascii=False) then refuses to encode it, and the
+    store cannot be written again until the record is gone.
+    """
+    return bool(_LONE_SURROGATE.search(text))
+
+
 def _text(value, fallback: str = "") -> str:
     """A provider field that has to be a string, whatever arrived.
 
@@ -111,7 +126,9 @@ def _text(value, fallback: str = "") -> str:
     was recorded as a success.
     """
     if isinstance(value, str):
-        return value
+        # Providers relay text off the open web, which can carry unpaired
+        # surrogates; they would poison the job store on the next save.
+        return _LONE_SURROGATE.sub("\ufffd", value)
     if value is None or isinstance(value, (dict, list, tuple, set)):
         return fallback
     return str(value)
@@ -201,13 +218,16 @@ async def start_task_run(
         body = resp.json()
     except ValueError:
         body = None
-    run_id = _text((body or {}).get("run_id")) if isinstance(body, dict) else ""
-    if not run_id.strip():
+    raw = body.get("run_id") if isinstance(body, dict) else None
+    # Not coerced: 123 is not a run id, and _text would happily make it "123"
+    # and interpolate that into every later URL.
+    run_id = raw.strip() if isinstance(raw, str) else ""
+    if not run_id or not _RUN_ID.match(run_id):
         # Not retried: the POST may well have created a run, and asking again
         # would pay for a second one while the first goes unrecorded.
         raise PipelineError(
             "Parallel accepted the task but returned no usable run_id")
-    return run_id.strip()
+    return run_id
 
 
 async def fetch_task_result(
@@ -232,17 +252,24 @@ async def fetch_task_result(
                 f"{deadline_s // 60} minutes — giving up"
             )
         try:
-            resp = await client.get(
-                f"{PARALLEL_BASE}/tasks/runs/{run_id}/result",
-                headers={"x-api-key": api_key},
-                # Ask the provider to hold the connection for at most what is
-                # left; its own minimum is 10 s, which is why the client
-                # timeout below is the one that really enforces the bound.
-                params={"timeout": int(min(120, max(1, remaining)))},
-                timeout=httpx.Timeout(min(150.0, remaining),
-                                      connect=min(15.0, remaining)),
+            # httpx's timeouts bound individual operations — connect, and
+            # inactivity between reads — not the wall clock of the whole
+            # request. A slow response that keeps trickling can outlast them,
+            # so the call is wrapped in the deadline as well.
+            resp = await asyncio.wait_for(
+                client.get(
+                    f"{PARALLEL_BASE}/tasks/runs/{quote(run_id, safe='')}/result",
+                    headers={"x-api-key": api_key},
+                    # Ask the provider to hold the connection for at most what
+                    # is left; its own minimum is 10 s, which is why the
+                    # timeouts around it matter.
+                    params={"timeout": int(min(120, max(1, remaining)))},
+                    timeout=httpx.Timeout(min(150.0, remaining),
+                                          connect=min(15.0, remaining)),
+                ),
+                timeout=remaining,
             )
-        except httpx.TransportError:
+        except (httpx.TransportError, asyncio.TimeoutError):
             # A transient blip, or our own timeout firing. The run is
             # server-side and keeps going; the loop decides whether there is
             # time left to ask again.
@@ -591,14 +618,26 @@ async def _scrape_one(
 _UNSAFE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 
-def slug_for(question: str, max_len: int = 64) -> str:
-    """Filesystem- and Obsidian-safe slug that stays human-readable."""
-    text = unicodedata.normalize("NFKC", question).strip()
+def slug_for(question: str, max_bytes: int = 64) -> str:
+    """Filesystem- and Obsidian-safe slug that stays human-readable.
+
+    The budget is in *bytes*, because that is what filesystems limit: ext4
+    allows 255 bytes per component, and 64 emoji are 256. The date prefix and
+    a possible " (2)" have to fit alongside, hence the modest default.
+    """
+    text = unicodedata.normalize("NFKC", _LONE_SURROGATE.sub("", question)).strip()
     text = _UNSAFE.sub(" ", text)
     text = re.sub(r"\s+", " ", text).strip(" .")
-    if len(text) > max_len:
-        text = text[:max_len].rsplit(" ", 1)[0] or text[:max_len]
+    if len(text.encode("utf-8")) > max_bytes:
+        text = _truncate_bytes(text, max_bytes)
+        text = text.rsplit(" ", 1)[0] if " " in text.strip() else text
     return text.strip(" .") or "research"
+
+
+def _truncate_bytes(text: str, max_bytes: int) -> str:
+    """Cut to a byte budget without splitting a character."""
+    encoded = text.encode("utf-8")[:max_bytes]
+    return encoded.decode("utf-8", errors="ignore")
 
 
 def _claim_dir(base: Path, name: str, with_sources: bool) -> Path:
@@ -894,7 +933,13 @@ async def save_to_notion(
     if resp.status_code != 200:
         raise PipelineError(f"Notion save failed ({resp.status_code}): "
                             f"{resp.text[:200]}")
-    return resp.json().get("url", "")
+    try:
+        created = resp.json()
+    except ValueError:
+        created = None
+    if not isinstance(created, dict):
+        raise PipelineError("Notion returned an unreadable response")
+    return _text(created.get("url"))
 
 
 def _notion_block(kind: str, text: str, link: str | None = None) -> dict:
