@@ -127,6 +127,15 @@ button.ghost {
   color: var(--ink-soft);
   margin-left: .5rem;
 }
+#offline {
+  margin: 0 0 .7rem;
+  padding: .45rem .7rem;
+  border-left: 3px solid var(--rule-red);
+  background: var(--card);
+  border-radius: 0 8px 8px 0;
+  font-size: .84rem;
+  color: var(--ink-soft);
+}
 ul#jobs { list-style: none; margin: 0; padding: 0; }
 li.job {
   background: var(--card);

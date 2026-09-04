@@ -71,18 +71,26 @@ $("ask").addEventListener("submit", async (ev) => {
 
 async function refreshJobs() {
   clearTimeout(pollTimer);
-  let data;
-  try { data = await fetchJSON("/jobs"); }
-  catch (e) { pollTimer = setTimeout(refreshJobs, 15000); return; }
+  // Not fetchJSON: the service worker marks a list it served from cache
+  // because the network was gone, and that is worth saying out loud.
+  let data, fromCache = false;
+  try {
+    const res = await fetch("/jobs");
+    if (!res.ok) throw new Error(res.statusText);
+    fromCache = res.headers.get("X-Footnote-Cached") === "1";
+    data = await res.json();
+  } catch (e) { pollTimer = setTimeout(refreshJobs, 15000); return; }
 
   const list = $("jobs");
   $("jobs-section").hidden = data.jobs.length === 0;
+  $("offline").hidden = !fromCache;
   $("active-count").textContent =
     data.active ? `${data.active} running` : "";
   list.innerHTML = "";
   for (const job of data.jobs) list.appendChild(renderJob(job));
 
-  pollTimer = setTimeout(refreshJobs, data.active > 0 ? 5000 : 60000);
+  pollTimer = setTimeout(
+    refreshJobs, fromCache ? 30000 : data.active > 0 ? 5000 : 60000);
 }
 
 function renderJob(job) {

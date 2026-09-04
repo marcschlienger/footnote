@@ -462,7 +462,10 @@ Tailscale, WireGuard) and/or use the per-instance `FOOTNOTE_TOKEN`.
 - **The PWA** — open `http://YOUR-SERVER:8010/`: ask, pick a depth, watch
   status live, read finished reports, and open **Sources** on any finished
   dossier to read the archived pages in the browser, download one as
-  Markdown, or take the report and every source as a single zip. On
+  Markdown, or take the report and every source as a single zip. A dossier
+  you have opened once stays readable with no network at all — the service
+  worker keeps the report and its sources, and says so when the list it is
+  showing you is the last one it saw. On
   iPhone/iPad, Safari Share → **Add to Home Screen** installs it as a
   full-screen app with the Footnote icon (and enables push). With a token
   set, it prompts once on first launch.
