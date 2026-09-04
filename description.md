@@ -503,6 +503,14 @@ Behavior notes:
   and source pages carry `static/document.js`, which upgrades their own
   download links to the same behaviour and leaves them ordinary links when
   scripting is unavailable.
+- **Panels open where the control is.** The source list sits directly under
+  the links that open it; file and reader panels append below it, and
+  whatever was just opened is scrolled into view if it is not. Otherwise a
+  panel opened above the list pushes it a screenful down, and the control
+  that opened it appears to have done nothing — which is exactly what
+  happened when a file panel sat between the links and the sources. Buttons
+  keep their labels and carry `aria-expanded`, because two toggles in a row
+  both renaming themselves "close" say nothing about which panel they close.
 - **Reading in place**: both the dossier and any archived copy can be opened
   inside the card ("read here"), fetched as a sanitised fragment. Open
   readers are remembered by URL and their HTML is cached, so a poll — every
@@ -518,6 +526,13 @@ Behavior notes:
   the page is open — and falls back to the stale copy when offline. Each entry
   links to the rendered copy, its `.md`, and the original page; the ones
   that could not be archived say why.
+- **The app's own code is never served from a cache without asking.** Static
+  files carried only an ETag and a Last-Modified, which leaves a browser free
+  to apply heuristic freshness — roughly a tenth of the file's age — and
+  answer from its cache for hours without revalidating. A deployed fix then
+  appears not to have happened, on the device that most needs it.
+  `Cache-Control: no-cache` on the shell forbids that while still allowing a
+  304; dossier pages are content rather than code and are left alone.
 - **Service worker**: one policy per kind of response, because they age
   differently. The shell (`/`, CSS, JS, manifest, icons) is network-first
   with a cache fallback, so an upgrade arrives at once. A written report and

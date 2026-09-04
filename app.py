@@ -1118,11 +1118,23 @@ _SECURITY_HEADERS = {
 }
 
 
+# The app's own code, which must never be served from a cache without
+# asking. With only ETag and Last-Modified a browser applies heuristic
+# freshness — roughly a tenth of the file's age — and serves a stale app.js
+# for hours without revalidating, which is how a deployed fix can appear not
+# to have happened at all. "no-cache" still allows a 304; it forbids
+# answering from the cache without checking.
+_REVALIDATE_PATHS = {"/", "/service-worker.js", "/manifest.json"}
+
+
 @app.middleware("http")
 async def _security_headers(request: Request, call_next):
     response = await call_next(request)
     for header, value in _SECURITY_HEADERS.items():
         response.headers.setdefault(header, value)
+    path = request.url.path
+    if path in _REVALIDATE_PATHS or path.startswith("/static/"):
+        response.headers.setdefault("cache-control", "no-cache")
     return response
 
 

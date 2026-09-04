@@ -164,9 +164,9 @@ function renderJob(job) {
     } else {
       links.appendChild(link(`/jobs/${job.id}/report`, "Report"));
       links.appendChild(readInline(`/jobs/${job.id}/report?embed=1`, li,
-                                   "read here", "close", meta));
+                                   "read here", "close"));
       links.appendChild(fileButton(`/jobs/${job.id}/report.md`, ".md",
-                                   job.report_name, li, meta));
+                                   job.report_name, li));
       links.appendChild(sourcesToggle(job));
       links.appendChild(bundleButton(`/jobs/${job.id}/bundle.zip`,
                                      "Everything (.zip)"));
@@ -206,6 +206,8 @@ function renderJob(job) {
 
   li.appendChild(meta);
   if (job.status === "done") {
+    // Directly under the links that open it, and before any file or reader
+    // panel, which are appended to the end of the card.
     const panel = document.createElement("div");
     panel.className = "sources";
     panel.hidden = !openSources.has(job.id);
@@ -224,13 +226,32 @@ function sourcesToggle(job) {
   button.className = "linkish";
   const count = job.sources_cited;
   button.textContent = "Sources" + (count ? ` (${count})` : "");
+  button.setAttribute("aria-expanded", String(openSources.has(job.id)));
   button.onclick = () => {
     const panel = button.closest(".job").querySelector(".sources");
     panel.hidden = !panel.hidden;
-    if (panel.hidden) openSources.delete(job.id);
-    else { openSources.add(job.id); fillSources(job.id, panel); }
+    button.setAttribute("aria-expanded", String(!panel.hidden));
+    if (panel.hidden) {
+      openSources.delete(job.id);
+      return;
+    }
+    openSources.add(job.id);
+    fillSources(job.id, panel);
+    reveal(panel);
   };
   return button;
+}
+
+// Bring what was just opened into view. Without this, opening one panel
+// while another is already open puts the new one below a screenful of text,
+// and the control appears to have done nothing at all.
+function reveal(element) {
+  requestAnimationFrame(() => {
+    const box = element.getBoundingClientRect();
+    if (box.top < 0 || box.top > window.innerHeight - 60) {
+      element.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    }
+  });
 }
 
 async function fillSources(jobId, panel) {
@@ -311,15 +332,14 @@ function readInline(url, host, openLabel, _closeLabel, after) {
     openReaders.delete(url);
     button.setAttribute("aria-expanded", "false");
   };
-  const open = async () => {
+  const open = async (auto) => {
     openReaders.add(url);
     button.setAttribute("aria-expanded", "true");
     const panel = document.createElement("div");
     panel.className = "src-body";
     panel.textContent = readerCache.has(url) ? "" : "Loading…";
-    // After the row it belongs to, so an open reader does not push the
-    // source list away from the links that opened it.
     host.insertBefore(panel, (after && after.nextSibling) || null);
+    if (!auto) reveal(panel);
     if (readerCache.has(url)) {
       const html = readerCache.get(url);
       readerCache.delete(url);           // re-insert: least-recently-read goes
@@ -348,8 +368,9 @@ function readInline(url, host, openLabel, _closeLabel, after) {
   button.onclick = () =>
     host.querySelector(":scope > .src-body") ? close() : open();
   // Deferred: at this point the card is still being assembled, so the row
-  // this panel belongs after may not be in the DOM yet.
-  if (openReaders.has(url)) queueMicrotask(open);
+  // this panel belongs after may not be in the DOM yet. Reopening after a
+  // poll must not scroll: the reader did not ask for it this time.
+  if (openReaders.has(url)) queueMicrotask(() => open(true));
   return button;
 }
 
@@ -473,7 +494,10 @@ function fileButton(href, label, filename, host, after) {
     const panel = document.createElement("div");
     panel.className = "file-view";
     panel.textContent = "Loading…";
+    // After the row it belongs to, and after anything already open, so that
+    // opening one panel never pushes another control off the screen.
     host.insertBefore(panel, (after && after.nextSibling) || null);
+    reveal(panel);
     showFile(panel, href, filename).catch((e) => {
       panel.textContent = "Could not read that file: " + e.message;
     });

@@ -910,6 +910,39 @@ def test_the_standalone_pages_do_not_navigate_to_files_either(client, tmp_path):
     assert "navigator.canShare" in doc_js and "createObjectURL" in doc_js
 
 
+def test_the_apps_own_code_is_always_revalidated(client):
+    """Without this a browser serves a stale app.js for hours.
+
+    ETag and Last-Modified alone leave a browser free to apply heuristic
+    freshness and answer from its cache without asking, which is how a
+    deployed fix can appear not to have happened.
+    """
+    for url in ("/", "/static/app.js", "/static/document.js",
+                "/static/style.css", "/service-worker.js", "/manifest.json"):
+        assert client.get(url).headers.get("cache-control") == "no-cache", url
+    # Still cheap: revalidation, not re-download.
+    etag = client.get("/static/app.js").headers["etag"]
+    assert client.get("/static/app.js",
+                      headers={"If-None-Match": etag}).status_code == 304
+
+
+def test_opening_one_panel_does_not_hide_another_control(client, tmp_path):
+    """With the file panel between the links and the sources list, tapping
+    Sources opened it a screenful below and looked like nothing happened."""
+    app_js = (Path(__file__).resolve().parent.parent
+              / "static" / "app.js").read_text()
+    # The cause, not a proxy for it: a card-level panel given an anchor row
+    # is inserted straight after it, which is above the sources list. Both
+    # must be opened without one, so they append to the end of the card.
+    for call in re.finditer(r"(fileButton|readInline)\((?:[^()]|\([^()]*\))*\)",
+                            app_js):
+        if "job.id}/report" not in call.group(0):
+            continue                       # source-level panels do use a row
+        assert "meta" not in call.group(0), call.group(0)
+    assert "function reveal(" in app_js
+    assert app_js.count("reveal(panel)") >= 2      # sources and file panels
+
+
 def test_the_pwa_can_read_in_place():
     app_js = (Path(__file__).resolve().parent.parent
               / "static" / "app.js").read_text()
