@@ -42,6 +42,7 @@ import time
 import traceback
 import uuid
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from html import escape
@@ -147,7 +148,8 @@ FIRECRAWL_CONCURRENCY = _int_env("FIRECRAWL_CONCURRENCY",
 MAX_JOBS_KEPT = 200
 MAX_CITATIONS_KEPT = 100     # per job, so jobs.json stays small
 PUSH_CONCURRENCY = 4         # devices notified at once
-PUSH_TIMEOUT_S = 15          # per device; the library's default is no limit
+PUSH_CONNECT_TIMEOUT_S = 5   # per device; the library's default is no limit
+PUSH_READ_TIMEOUT_S = 15     # inactivity, not total — see _push_one
 MAX_SUBSCRIPTIONS = 50       # devices kept; a personal server has a handful
 MAX_ENDPOINT_CHARS = 2000
 
@@ -206,9 +208,13 @@ class JsonStore:
                 if not isinstance(value, dict):
                     continue
                 if not _storable_key(key):
-                    print(f"{path.name}: dropped a record whose key cannot be "
-                          f"used", flush=True)
-                    continue
+                    # Rekeyed rather than dropped: the history is worth
+                    # keeping, and _normalize_jobs would have rekeyed this
+                    # record anyway had it survived to be looked at.
+                    key = uuid.uuid4().hex[:12]
+                    print(f"{path.name}: rekeyed a record whose key could not "
+                          f"be used", flush=True)
+                    self.repaired.add(key)
                 cleaned = pipeline.clean_json(value)
                 self.data[key] = cleaned
                 # Cleaning makes a record storable; it does not make it
@@ -251,7 +257,7 @@ class JsonStore:
         # them came to collide.
         self.data = {key: pipeline.clean_json(value)
                      for key, value in self.data.items()
-                     if _storable_key(key)}
+                     if _storable_key(key)}   # keys are already normalized
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(self.data, fh, ensure_ascii=False, indent=1)
         os.replace(tmp, self.path)
@@ -501,7 +507,10 @@ def _push_session():
     if _requests is None:
         return None
     session = _requests.Session()
-    session.max_redirects = 0
+    # max_redirects is deliberately left alone: requests computes the "next"
+    # request even when it is not following one, and a limit of 0 makes that
+    # raise TooManyRedirects — a generic failure, which _push_one would read
+    # as "keep retrying" instead of "this endpoint has moved".
     original = session.request
 
     def no_redirects(*args, **kwargs):
@@ -514,6 +523,7 @@ def _push_session():
 
 def _push_one(sub: dict, payload: dict) -> bool:
     """Blocking pywebpush call; returns False if the subscription is dead."""
+    session = _push_session()
     try:
         webpush(
             subscription_info=sub,
@@ -522,15 +532,26 @@ def _push_one(sub: dict, payload: dict) -> bool:
             vapid_claims={"sub": f"mailto:{VAPID_CLAIM_EMAIL}"},
             # Without this the library waits forever, and one unreachable
             # device holds a slot against every other device's notification.
-            timeout=PUSH_TIMEOUT_S,
+            # A pair, not a scalar: requests reads it as connect and
+            # *inactivity* between reads, so a slow drip can outlast any
+            # single number. The pool above bounds what that can cost.
+            timeout=(PUSH_CONNECT_TIMEOUT_S, PUSH_READ_TIMEOUT_S),
             # A 307/308 preserves the POST, so following one would send the
             # payload to an address that was never checked.
-            requests_session=_push_session(),
+            requests_session=session,
         )
         return True
     except WebPushException as exc:
         code = getattr(getattr(exc, "response", None), "status_code", 0)
-        return code not in (404, 410)   # gone → forget this device
+        if code in (404, 410):
+            return False                # gone → forget this device
+        if 300 <= code < 400:
+            # We declined to follow it. An endpoint that has moved will keep
+            # answering this way, so keeping it means retrying for ever.
+            print("push endpoint redirected; dropping the subscription",
+                  flush=True)
+            return False
+        return True
     except Exception as exc:            # noqa: BLE001
         # /subscribe accepts whatever keys a browser sent, so a malformed
         # subscription surfaces here rather than as a WebPushException. Keep
@@ -540,6 +561,9 @@ def _push_one(sub: dict, payload: dict) -> bool:
         # the device — so it stays out of the log.
         print(f"push to a subscribed device failed: {exc}", flush=True)
         return True
+    finally:
+        if session is not None:
+            session.close()             # one per device, otherwise leaked
 
 
 async def notify_all(title: str, body: str, url: str = "/") -> None:
@@ -561,13 +585,17 @@ async def _notify_all(title: str, body: str, url: str) -> None:
         return
     payload = {"title": title, "body": body, "url": url,
                "icon": "/static/icon-192.png", "badge": "/static/icon-192.png"}
-    # Bounded concurrency: one unreachable endpoint should not hold up the
-    # notification to every other device.
-    gate = asyncio.Semaphore(PUSH_CONCURRENCY)
+    # A pool of its own, sized once for the process. A semaphore per call
+    # gave two jobs finishing together twice the slots, and asyncio.to_thread
+    # would put these on the default executor — the same one write_report
+    # uses, so a hung push would eventually stall saving a dossier.
+    loop = asyncio.get_event_loop()
+    pool = getattr(app.state, "push_pool", None)
 
     async def deliver(key, sub):
-        async with gate:
+        if pool is None:                       # outside the app's lifespan
             return key, await asyncio.to_thread(_push_one, sub, payload)
+        return key, await loop.run_in_executor(pool, _push_one, sub, payload)
 
     results = await asyncio.gather(
         *(deliver(k, v) for k, v in list(subs.data.items())))
@@ -888,6 +916,12 @@ async def lifespan(application: FastAPI):
     # and a restart can resume several jobs at once.
     application.state.limiter = pipeline.ScrapeLimiter(
         rate_limit=FIRECRAWL_RATE_LIMIT, concurrency=FIRECRAWL_CONCURRENCY)
+    # Isolated from the default executor: a push to an endpoint that dribbles
+    # a byte inside every read timeout holds its thread indefinitely, and the
+    # blast radius should be "no more notifications" rather than "no more
+    # dossiers written".
+    application.state.push_pool = ThreadPoolExecutor(
+        max_workers=PUSH_CONCURRENCY, thread_name_prefix="footnote-push")
     # Jobs interrupted by a restart: the Parallel run survives server-side,
     # so re-attach by run_id; jobs that never got a run_id start over.
     application.state.tasks = set()
@@ -903,6 +937,9 @@ async def lifespan(application: FastAPI):
     # Unwind before the client closes — a task cancelled mid-request would
     # otherwise wake up holding a closed transport.
     await asyncio.gather(*tasks, return_exceptions=True)
+    # Not waited on: a thread stuck in a push cannot be interrupted, and
+    # shutdown should not be held hostage to one.
+    application.state.push_pool.shutdown(wait=False)
     await application.state.client.aclose()
 
 
@@ -923,6 +960,29 @@ if CORS_ORIGINS:
         allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
         allow_headers=["Authorization", "Content-Type"],
     )
+
+
+MAX_BODY_BYTES = 64 * 1024       # a question is 4000 chars; keys are ~90
+
+
+@app.middleware("http")
+async def _limit_body(request: Request, call_next):
+    """Refuse an oversized body before it is read into memory.
+
+    Declared before the token check so it runs *inside* it: an oversized
+    request to a locked instance should be unauthorized rather than told its
+    body is too large, and the 413 has to carry the security headers like
+    every other response.
+
+    Content-Length only: a chunked upload has none, and bounding that means
+    reading the stream, which is more machinery than a personal server on a
+    private network needs.
+    """
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > MAX_BODY_BYTES:
+        return JSONResponse({"detail": "request body too large"},
+                            status_code=413)
+    return await call_next(request)
 
 
 # ---------------------------------------------------------------------------
@@ -1048,24 +1108,6 @@ async def _security_headers(request: Request, call_next):
     for header, value in _SECURITY_HEADERS.items():
         response.headers.setdefault(header, value)
     return response
-
-
-MAX_BODY_BYTES = 64 * 1024       # a question is 4000 chars; keys are ~90
-
-
-@app.middleware("http")
-async def _limit_body(request: Request, call_next):
-    """Refuse an oversized body before it is read into memory.
-
-    Content-Length only: a chunked upload has none, and bounding that means
-    reading the stream, which is more machinery than a personal server on a
-    private network needs.
-    """
-    declared = request.headers.get("content-length", "")
-    if declared.isdigit() and int(declared) > MAX_BODY_BYTES:
-        return JSONResponse({"detail": "request body too large"},
-                            status_code=413)
-    return await call_next(request)
 
 
 @app.exception_handler(RequestValidationError)

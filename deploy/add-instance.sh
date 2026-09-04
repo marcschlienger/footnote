@@ -30,6 +30,22 @@ OUT="${3:-/home/$USER_NAME/Research/inbox}"
 DATA="/var/lib/footnote/$USER_NAME"
 ENV_FILE="/etc/footnote/$USER_NAME.env"
 
+# Everything is checked here, before a single file is written. A relative
+# output directory used to be caught after the env file existed, which left a
+# poisoned /etc/footnote/<user>.env behind — and a corrected re-run keeps an
+# existing env file untouched, so the bad path survived into the service.
+case "$OUT" in
+  /*) ;;
+  *) echo "output-dir must be an absolute path, not: $OUT" >&2; exit 1 ;;
+esac
+case "$PORT" in
+  ''|*[!0-9]*) echo "port must be a number, not: $PORT" >&2; exit 1 ;;
+esac
+if [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
+  echo "port must be between 1 and 65535, not: $PORT" >&2
+  exit 1
+fi
+
 if [ "$(id -u)" -ne 0 ]; then
   echo "$USAGE  (must run as root)" >&2
   exit 1
@@ -65,14 +81,6 @@ fi
 # An existing env file is authoritative: a customized instance keeps its own
 # directories, and repairing the ones computed from this invocation's
 # arguments would tighten permissions on the wrong paths.
-# The output directory can also arrive as an argument, and that one was never
-# checked: a relative value is created next to wherever this was invoked and
-# then read by the service relative to /opt/footnote — two different places.
-case "$OUT" in
-  /*) ;;
-  *) echo "output-dir must be an absolute path, not: $OUT" >&2; exit 1 ;;
-esac
-
 # systemd's EnvironmentFile allows quoting, and sed strips only the literal
 # prefix — OUTPUT_DIR="/srv/My Notes" would otherwise come back with its
 # quotes attached and have install(1) create a relative directory of that
@@ -118,6 +126,18 @@ systemctl daemon-reload
 systemctl enable --now "footnote@$USER_NAME"
 sleep 2
 systemctl --no-pager status "footnote@$USER_NAME" || true
+
+# The status above is informational; this decides what the script claims. A
+# port collision or a delayed startup failure was being reported as a
+# successful install.
+if ! systemctl is-active --quiet "footnote@$USER_NAME"; then
+  echo
+  echo "Instance created, but footnote@$USER_NAME is not running." >&2
+  echo "  Config:  $ENV_FILE" >&2
+  echo "  Why:     journalctl -u footnote@$USER_NAME -n 30" >&2
+  echo "A port already in use is the usual cause." >&2
+  exit 1
+fi
 
 echo
 echo "Instance ready:"

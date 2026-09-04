@@ -159,8 +159,8 @@ are enumerated, and each has one rule.
 | Parallel: create-run, result, error bodies | `clean_text` on every scalar, `_as_list` on every collection; a wrong-shaped body is retried, not crashed on |
 | Firecrawl: markdown, title, **error** | same; the error path matters as much as the success path, since both reach the dossier |
 | Notion: response | checked as an object, URL through `clean_text` and `is_http_url` before it is stored |
-| HTTP request bodies | bounded by `MAX_BODY_BYTES` from the declared Content-Length, then validated by type and content (`_question_problem`, `_valid_subscription`); a 422 is rendered with `ensure_ascii` and **without** the echoed input, which is unbounded and attacker-supplied |
-| Push endpoints | a policy of their own (`is_push_endpoint`), because the server requests this address on a client's say-so: HTTPS, no credentials, and `is_global` on the address the host *denotes* — which means `inet_aton` first, since `127.1`, `2130706433` and `0x7f000001` all reach loopback through any resolver, and `is_global` rather than a list of exclusions, since carrier-grade NAT is neither private nor reserved. Redirects are refused, because a 307 preserves the POST. A *name* that resolves inward is still not caught — the library resolves it — which is the residual, and closing it means resolving and pinning the address here |
+| HTTP request bodies | bounded by `MAX_BODY_BYTES` from the declared Content-Length (checked *inside* the token middleware, so a locked instance answers 401 rather than 413 and the response still carries the security headers), then validated by type and content (`_question_problem`, `_valid_subscription`); a 422 is rendered with `ensure_ascii` and **without** the echoed input, which is unbounded and attacker-supplied |
+| Push endpoints | a policy of their own (`is_push_endpoint`), because the server requests this address on a client's say-so: HTTPS, no credentials, and `is_global` on the address the *canonical* host denotes — `ascii_host` produces that one string for both the validator and the classifier, since checking the IDNA form and classifying the original is how `127。0。0。1` and `ｌｏｃａｌｈｏｓｔ` reached loopback — which means `inet_aton` first, since `127.1`, `2130706433` and `0x7f000001` all reach loopback through any resolver, and `is_global` rather than a list of exclusions, since carrier-grade NAT is neither private nor reserved — with multicast and IPv6 site-local excluded by name, because Python calls those global too. Redirects are refused, because a 307 preserves the POST, and an endpoint that answers with one is dropped rather than retried for ever. A *name* that resolves inward is still not caught — the library resolves it — which is the residual, and closing it means resolving and pinning the address here |
 | Query and path parameters | `limit` is a bounded int; a source name is matched against the files on disk; the token is compared as **bytes**, since `compare_digest` raises `TypeError` on a non-ASCII string |
 | `jobs.json`, `subscriptions.json` | `clean_json` on load *and* on save; not valid UTF-8, not JSON, or not an object of records → quarantined under a fresh name. **Cleaning is recorded, not just done**, and the record is cleaned without its key — cleaning the outer dictionary let `"\ud800"` and the replacement character it becomes collide, so one record silently overwrote the other. A record cleaning had to change is not a valid record, and an active one is failed rather than resumed (the marker travels with it through rekeying, or the damaged job is rekeyed out from under its own flag) — eight surrogates become eight replacement characters, which would otherwise pass every later check and be sent to Parallel again |
 | Dossier files (report, sources) | read with `errors="replace"`; frontmatter values through `clean_text`. Written through it too: `clean_text` drops C0 controls apart from tab, newline and return, so a provider's NUL cannot make a Markdown file look binary to a notes app |
@@ -524,6 +524,14 @@ optionally hardened one notch.
   on a reachable instance and spend the Parallel key, which with
   `FOOTNOTE_TOKEN` unset is the default install. `FOOTNOTE_CORS_ORIGINS`
   names origins explicitly when a browser client of your own needs one.
+- Pushes run on a thread pool of their own, sized once for the process. A
+  semaphore per notification gave two jobs finishing together twice the
+  slots, and `asyncio.to_thread` would put them on the default executor —
+  the one `write_report` uses — so a push to an endpoint that dribbles a byte
+  inside every read timeout could eventually stall saving a dossier. The
+  timeout is a connect/read pair rather than a scalar, because `requests`
+  reads a scalar as *inactivity* and not total time; the pool is what bounds
+  what a slow drip can cost.
 - Push endpoints are subject to `is_push_endpoint`, not the general link
   policy: a subscription names an address the *server* then POSTs to, so
   accepting `http://127.0.0.1:8010/internal` made blind server-side request

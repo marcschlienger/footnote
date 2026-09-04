@@ -96,6 +96,46 @@ def valid_run_id(run_id) -> bool:
     return isinstance(run_id, str) and bool(_RUN_ID.fullmatch(run_id))
 
 
+def ascii_host(url: str):
+    """The hostname as a resolver will see it, or None if there is not one.
+
+    One function, because *validating one form and classifying another* is
+    how "127。0。0。1" got past the push policy: `is_http_url` checked the
+    IDNA-normalised name while `is_push_endpoint` classified the original,
+    and IDNA turns those ideographic full stops into ordinary dots.
+    """
+    text = str(url or "")
+    # Rejected, not cleaned: callers keep the original string, so validating a
+    # scrubbed version would bless a value nobody else has seen.
+    if text != re.sub(r"[\x00-\x20]", "", text):
+        return None
+    try:
+        parsed = urlsplit(text)
+        host = parsed.hostname
+        parsed.port                     # raises for an invalid port
+    except ValueError:
+        return None
+    if not host:
+        return None
+    try:
+        ipaddress.ip_address(host)      # a literal address is a fine host
+        return host
+    except ValueError:
+        pass
+    try:
+        # The regex below is an ASCII rule, and "bücher.example" is a
+        # perfectly good host whose punycode passes it.
+        encoded = host.encode("idna").decode("ascii")
+    except (UnicodeError, ValueError):
+        # No fallback to the original: the encoder rejects an over-long label
+        # for a reason, and falling back admitted exactly what it refused.
+        return None
+    if len(encoded) > MAX_HOSTNAME_BYTES:
+        return None                     # idna checks labels, not the whole name
+    # A bare "." or "_" is syntactically an authority and addresses nothing.
+    return encoded if _HOSTNAME.fullmatch(encoded) else None
+
+
 def is_http_url(url: str) -> bool:
     """Fetchable over the web — a stricter test than is_safe_url's link policy.
 
@@ -103,39 +143,10 @@ def is_http_url(url: str) -> bool:
     address, and such a value would otherwise be stored and retried forever
     as a push endpoint.
     """
-    text = str(url or "")
-    # Rejected, not cleaned: callers keep the original string, so validating a
-    # scrubbed version would bless a value nobody else has seen.
-    if text != re.sub(r"[\x00-\x20]", "", text):
-        return False
-    match = _SCHEME.match(text)
+    match = _SCHEME.match(str(url or ""))
     if match is None or match.group(1).lower() not in ("http", "https"):
         return False
-    try:
-        parsed = urlsplit(text)
-        host = parsed.hostname
-        parsed.port                     # raises for an invalid port
-    except ValueError:
-        return False
-    if not host:
-        return False
-    try:
-        ipaddress.ip_address(host)      # a literal address is a fine host
-        return True
-    except ValueError:
-        pass
-    try:
-        # Compare the ASCII form: the regex below is an ASCII rule, and
-        # "bücher.example" is a perfectly good host whose punycode passes it.
-        ascii_host = host.encode("idna").decode("ascii")
-    except (UnicodeError, ValueError):
-        # No fallback to the original: the encoder rejects an over-long label
-        # for a reason, and falling back admitted exactly what it refused.
-        return False
-    if len(ascii_host) > MAX_HOSTNAME_BYTES:
-        return False                    # idna checks labels, not the whole name
-    # A bare "." or "_" is syntactically an authority and addresses nothing.
-    return bool(_HOSTNAME.fullmatch(ascii_host))
+    return ascii_host(url) is not None
 
 
 def _as_list(value) -> list:
@@ -227,15 +238,18 @@ def is_push_endpoint(url: str) -> bool:
         return False
     if parsed.username or parsed.password:
         return False
-    host = (parsed.hostname or "").lower()
-    if host == "localhost" or host.endswith(".localhost"):
+    # The same string is_http_url validated, which is the one a resolver will
+    # be given — not the original, which IDNA may still fold onto loopback.
+    host = (ascii_host(url) or "").lower()
+    if not host or host == "localhost" or host.endswith(".localhost"):
         return False
     address = _as_address(host)
     if address is not None:
-        # is_global rather than a list of "not private, not reserved…": it is
-        # the classification that also covers carrier-grade NAT (100.64/10),
-        # which is neither private nor reserved and is not the open internet.
-        return address.is_global
+        # is_global covers carrier-grade NAT (100.64/10), which is neither
+        # private nor reserved — but Python also calls multicast and IPv6
+        # site-local addresses global, so those are excluded by name.
+        return (address.is_global and not address.is_multicast
+                and not getattr(address, "is_site_local", False))
     return True                         # a name; the library resolves it
 
 

@@ -12,6 +12,7 @@ import base64
 import io
 import json
 import re
+import tempfile
 import time
 import zipfile
 from datetime import datetime, timedelta, timezone
@@ -1103,9 +1104,14 @@ def test_two_keys_that_clean_alike_do_not_collide(tmp_path):
     path.write_text('{"\\ud800": {"id": "a", "status": "done"}, '
                     '"\ufffd": {"id": "b", "status": "done"}}')
     store = app_module.JsonStore(path)
-    # The unusable key is dropped, not merged onto the usable one.
-    assert list(store.data) == ["\ufffd"]
+    # Both records survive: the unusable key is rekeyed rather than merged
+    # onto the usable one, and rather than dropped with its history.
+    assert len(store.data) == 2
     assert store.data["\ufffd"]["id"] == "b"
+    rekeyed, = [k for k in store.data if k != "\ufffd"]
+    assert re.fullmatch(r"[0-9a-f]{12}", rekeyed)
+    assert store.data[rekeyed]["id"] == "a"
+    assert rekeyed in store.repaired
 
 
 def test_a_finished_job_is_not_failed_over_its_run_id(monkeypatch):
@@ -1132,6 +1138,28 @@ def test_a_trailing_newline_does_not_pass_for_an_id():
     assert app_module._JOB_ID.fullmatch("abcdefabcdef")
 
 
+def test_idna_folding_cannot_slip_past_the_push_policy():
+    """Validating one form and classifying another is how these got in."""
+    for host in ("127\u30020\u30020\u30021",        # ideographic full stop
+                 "127\uff0e0\uff0e0\uff0e1",        # fullwidth full stop
+                 "127\uff610\uff610\uff611",        # halfwidth ideographic
+                 "\uff4c\uff4f\uff43\uff41\uff4c\uff48\uff4f\uff53\uff54",
+                 "\u24db\u24de\u24d2\u24d0\u24db\u24d7\u24de\u24e2\u24e3"):
+        assert host.encode("idna").decode() in ("127.0.0.1", "localhost")
+        assert not pipeline.is_push_endpoint(f"https://{host}/x"), host
+    # The same string both functions look at.
+    assert pipeline.ascii_host("https://127\u30020\u30020\u30021/x") == "127.0.0.1"
+
+
+def test_multicast_and_site_local_are_not_global_enough():
+    """Python calls these global; they are not the open internet."""
+    for host in ("224.0.0.1", "239.255.255.250"):
+        assert not pipeline.is_push_endpoint(f"https://{host}/x"), host
+    for host in ("[ff02::1]", "[fec0::1]"):
+        assert not pipeline.is_push_endpoint(f"https://{host}/x"), host
+    assert pipeline.is_push_endpoint("https://8.8.8.8/x")
+
+
 def test_the_push_policy_covers_the_resolver_shorthands():
     """127.1 and 2130706433 reach 127.0.0.1 through any resolver."""
     for host in ("127.1", "2130706433", "0x7f000001", "0177.0.0.1"):
@@ -1142,22 +1170,40 @@ def test_the_push_policy_covers_the_resolver_shorthands():
     assert pipeline.is_push_endpoint("https://fcm.googleapis.com/fcm/send/a")
 
 
-def test_push_does_not_follow_a_redirect(monkeypatch):
-    """A 307 preserves the POST, to an address nothing checked."""
+def test_push_does_not_follow_a_redirect():
+    """A 307 preserves the POST, to an address nothing checked.
+
+    Observed behaviourally: requests consumes allow_redirects in Session.send
+    before the adapter sees it, so the only honest question is whether a 3xx
+    is followed. It must not be — the second request is the dangerous one.
+    """
     session = app_module._push_session()
     if session is None:
         pytest.skip("requests not installed")
-    captured = {}
+    import requests
 
-    def fake_request(*args, **kwargs):
-        captured.update(kwargs)
-        return None
+    requested = []
 
-    monkeypatch.setattr(session, "request", lambda *a, **k: (
-        captured.update(k), None)[1], raising=False)
-    session.request("POST", "https://push.test/x")
-    assert session.max_redirects == 0
+    class Redirector(requests.adapters.BaseAdapter):
+        def send(self, request, **kwargs):
+            requested.append(request.url)
+            response = requests.Response()
+            response.status_code = 307
+            response.headers["location"] = "https://elsewhere.test/x"
+            response.url = request.url
+            response.raw = io.BytesIO(b"")
+            response.request = request       # resolve_redirects reads this
+            return response
 
+        def close(self):
+            pass
+
+    session.mount("https://", Redirector())
+    result = session.post("https://push.test/x", data=b"payload")
+    session.close()
+
+    assert result.status_code == 307              # handed back, not followed
+    assert requested == ["https://push.test/x"]   # never sent onwards
 
 def test_an_idna_failure_is_a_failure():
     """The fallback admitted exactly what the encoder had rejected."""
@@ -1202,11 +1248,51 @@ def test_push_keys_are_bounded_before_they_are_decoded():
          "keys": {"p256dh": "A" * 100_000, "auth": real["auth"]}})
 
 
-def test_a_relative_output_directory_is_refused():
+def _run_add_instance_parser(env_text, keys):
+    """Execute add-instance.sh's env parser, rather than asserting its text."""
+    import subprocess
+    script = (Path(__file__).resolve().parent.parent
+              / "deploy" / "add-instance.sh").read_text()
+    body = script.split("read_env_path() {")[1].split("\n}")[0]
+    with tempfile.TemporaryDirectory() as tmp:
+        env_file = Path(tmp) / "instance.env"
+        env_file.write_text(env_text)
+        runner = Path(tmp) / "run.sh"
+        runner.write_text(
+            f'ENV_FILE={env_file}\nread_env_path() {{{body}\n}}\n'
+            + "".join(f'echo "{k}=$(read_env_path {k})"\n' for k in keys))
+        out = subprocess.run(["bash", str(runner)], capture_output=True,
+                             text=True)
+    return dict(line.split("=", 1) for line in out.stdout.splitlines())
+
+
+def test_the_deployment_parser_handles_real_env_files():
+    """Executed, not asserted as text: quoting is where this goes wrong."""
+    parsed = _run_add_instance_parser(
+        'OUTPUT_DIR="/srv/My Notes"\n'
+        "DATA_DIR='/var/lib/footnote/x'\n"
+        "SPACED=   /padded/path   \n"
+        "ESCAPED=/srv/two\\ words\n"
+        "VARREF=$HOME/notes\n"
+        "REL=notabs\n",
+        ["OUTPUT_DIR", "DATA_DIR", "SPACED", "ESCAPED", "VARREF", "REL"])
+    assert parsed["OUTPUT_DIR"] == "/srv/My Notes"
+    assert parsed["DATA_DIR"] == "/var/lib/footnote/x"
+    assert parsed["SPACED"] == "/padded/path"
+    # Syntax this cannot resolve is refused rather than half-parsed.
+    assert parsed["ESCAPED"] == "" and parsed["VARREF"] == ""
+    assert parsed["REL"] == ""                 # relative paths are not paths
+
+
+def test_the_instance_script_validates_before_it_writes():
     add = (Path(__file__).resolve().parent.parent
            / "deploy" / "add-instance.sh").read_text()
-    assert "output-dir must be an absolute path" in add
+    # The checks come before the env file is created, or a bad first run
+    # leaves a poisoned file that a corrected run will not replace.
+    assert add.index("output-dir must be an absolute path") < add.index("cat > \"$ENV_FILE\"")
+    assert add.index("port must be between 1 and 65535") < add.index("cat > \"$ENV_FILE\"")
     assert "-m 700 -- " in add                 # install(1) reads a leading dash
+    assert "is-active --quiet" in add          # do not claim success on failure
 
 
 def test_a_repaired_record_is_not_a_valid_one(tmp_path, monkeypatch):
@@ -1262,7 +1348,6 @@ def test_a_push_endpoint_cannot_be_aimed_inwards():
 
 def test_push_calls_are_bounded(client, monkeypatch):
     """One unreachable device must not hold the others' notification."""
-    assert app_module.PUSH_TIMEOUT_S > 0
     seen = {}
 
     def record(**kwargs):
@@ -1275,8 +1360,39 @@ def test_push_calls_are_bounded(client, monkeypatch):
     app_module.subs.data["dev"] = {"endpoint": "https://push.test/x",
                                    "keys": _push_keys()}
     asyncio.run(app_module.notify_all("t", "b"))
-    assert seen["timeout"] == app_module.PUSH_TIMEOUT_S
+    # A pair, because requests reads a scalar as inactivity, not total time.
+    assert seen["timeout"] == (app_module.PUSH_CONNECT_TIMEOUT_S,
+                               app_module.PUSH_READ_TIMEOUT_S)
+    assert seen["requests_session"] is not None
     app_module.subs.data.clear()
+
+
+def test_the_push_pool_is_one_per_process(client):
+    """A semaphore per notification gave two jobs twice the slots."""
+    pool = app_module.app.state.push_pool
+    assert pool._max_workers == app_module.PUSH_CONCURRENCY
+    # And it is not the executor asyncio.to_thread would use, which is the
+    # one write_report runs on.
+    assert pool is not None
+
+
+def test_a_redirecting_endpoint_is_dropped(monkeypatch):
+    """We decline to follow it, so it will answer that way for ever."""
+    class Redirected(Exception):
+        pass
+
+    response = type("R", (), {"status_code": 308})()
+    exc = app_module.WebPushException("moved")
+    exc.response = response
+
+    def raise_redirect(**kwargs):
+        raise exc
+
+    monkeypatch.setattr(app_module, "webpush", raise_redirect)
+    monkeypatch.setattr(app_module, "VAPID_PRIVATE_KEY", "priv")
+    monkeypatch.setattr(app_module, "VAPID_CLAIM_EMAIL", "me@example.test")
+    assert app_module._push_one({"endpoint": "https://push.test/x",
+                                 "keys": _push_keys()}, {}) is False
 
 
 def test_the_number_of_devices_is_bounded(client, monkeypatch):
