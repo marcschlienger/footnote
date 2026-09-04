@@ -89,6 +89,13 @@ VAPID_CLAIM_EMAIL = os.getenv("VAPID_CLAIM_EMAIL", "").strip()
 
 DEFAULT_PROCESSOR = os.getenv("DEFAULT_PROCESSOR", "core").strip()
 MAX_SOURCES = int(os.getenv("MAX_SOURCES", "12"))
+# Firecrawl's free plan allows 10 /scrape requests a minute and 2 concurrent
+# browsers; those are the defaults, so an unconfigured install stays inside
+# them. Raise on a paid plan, or set the rate limit to 0 to stop pacing.
+FIRECRAWL_RATE_LIMIT = int(os.getenv("FIRECRAWL_RATE_LIMIT",
+                                     pipeline.FREE_RATE_LIMIT))
+FIRECRAWL_CONCURRENCY = int(os.getenv("FIRECRAWL_CONCURRENCY",
+                                      pipeline.FREE_CONCURRENCY))
 MAX_JOBS_KEPT = 200
 MAX_CITATIONS_KEPT = 100     # per job, so jobs.json stays small
 
@@ -221,8 +228,15 @@ async def run_research(job_id: str) -> None:
             n = min(len(result.citations), MAX_SOURCES)
             _update_job(job_id, status="archiving",
                         progress=f"Archiving {n} cited source{'s' * (n != 1)}…")
+            # Pacing makes this the slow step on a free plan — say where it is.
+            def archived_so_far(done: int, total: int) -> None:
+                _update_job(job_id, progress=f"Archiving sources… {done}/{total}")
+
             sources = await pipeline.scrape_sources(
-                client, FIRECRAWL_API_KEY, result.citations, MAX_SOURCES)
+                client, FIRECRAWL_API_KEY, result.citations, MAX_SOURCES,
+                concurrency=FIRECRAWL_CONCURRENCY,
+                rate_limit=FIRECRAWL_RATE_LIMIT,
+                on_progress=archived_so_far)
 
         # 3. Write the dossier into the synced folder
         _update_job(job_id, status="saving", progress="Writing report…")
@@ -242,6 +256,10 @@ async def run_research(job_id: str) -> None:
         archived = sum(1 for s in sources if s.ok)
         summary = (f"{len(result.citations)} sources cited"
                    + (f", {archived} archived" if archived else ""))
+        # Worth saying plainly: it is a billing state, not a flaky website,
+        # and every unarchived source in this dossier has the same cause.
+        if any(s.error == pipeline.OUT_OF_CREDITS for s in sources):
+            summary += " — Firecrawl credits exhausted"
         _update_job(job_id, status="done", progress=f"Done — {summary}",
                     report_path=str(written.path), notion_url=notion_url,
                     finished_at=_now(), sources_cited=len(result.citations),

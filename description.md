@@ -164,11 +164,31 @@ schema, but tolerated) is flattened to `## key` sections.
 
 → `{"success": true, "data": {"markdown": "…", "metadata": {"title": "…"}}}`.
 
-Scraping is **best-effort by design**: up to `MAX_SOURCES` pages, 4
-concurrent, 90 s timeout each; any failure (HTTP error, `success: false`,
-empty extraction) demotes that source to the "could not be archived" list
-with its reason. A scrape failure can never fail the job — the dossier's
-claims and links don't depend on it.
+Scraping is **best-effort by design**: up to `MAX_SOURCES` pages, 90 s
+timeout each; any failure (HTTP error, `success: false`, empty extraction)
+demotes that source to the "could not be archived" list with its reason. A
+scrape failure can never fail the job — the dossier's claims and links don't
+depend on it.
+
+**Pacing is built for the free plan**, whose published limits are 10
+`/scrape` requests a minute and 2 concurrent browsers; `FIRECRAWL_RATE_LIMIT`
+and `FIRECRAWL_CONCURRENCY` default to exactly those, so an unconfigured
+install stays inside them and a paid key just raises two numbers (a rate
+limit of 0 turns pacing off). `_Pacer` admits a request only once the oldest
+start in the 60-second window has aged out, holding its lock across the
+sleep so waiters take turns instead of waking together and bursting.
+
+Failures are then sorted by whether asking again could help:
+
+| response | what Footnote does |
+|---|---|
+| 408, 429, 500, 502, 503, 504 | retry, up to `MAX_ATTEMPTS`, honouring `Retry-After` when the server sends it and otherwise backing off exponentially with jitter (capped at `MAX_BACKOFF_S`) |
+| 402 | stop the batch. Credits are gone and pay-as-you-go is unavailable on the free plan, so every further request would fail identically; the remaining sources are marked with the same reason and the job summary says so once |
+| anything else (403 bot wall, paywall, empty extraction) | final — record the reason and move on |
+
+Under the free-plan defaults a 12-source dossier archives in about a minute
+rather than a few seconds, so `scrape_sources` reports `archived k/n` into
+the job's progress as copies land.
 
 ### Notion (optional mirror)
 

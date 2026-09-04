@@ -123,8 +123,8 @@ def test_fetch_task_result_deadline():
 def test_scrape_sources_mixed_success():
     def handler(request: httpx.Request) -> httpx.Response:
         url = json.loads(request.content)["url"]
-        if "bad" in url:
-            return httpx.Response(500, json={"success": False, "error": "nope"})
+        if "bad" in url:                      # a bot wall: final, not retryable
+            return httpx.Response(403, json={"success": False, "error": "nope"})
         return httpx.Response(200, json={
             "success": True,
             "data": {"markdown": "# Hi", "metadata": {"title": "Good page"}},
@@ -160,6 +160,153 @@ def test_scrape_sources_respects_cap():
                 max_sources=3)
 
     assert len(asyncio.run(run())) == 3 and len(seen) == 3
+
+
+# ---------------------------------------------------------------------------
+# Living inside Firecrawl's free plan: 10 requests/min, 2 concurrent, 402 hard
+# ---------------------------------------------------------------------------
+
+def _ok_scrape(_request):
+    return httpx.Response(200, json={"success": True,
+                                     "data": {"markdown": "body",
+                                              "metadata": {"title": "T"}}})
+
+
+def _run_scrape(handler, count, **kw):
+    async def run():
+        async with httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)) as client:
+            return await pipeline.scrape_sources(
+                client, "k", [Citation(f"https://s.test/{i}") for i in range(count)],
+                max_sources=count, **kw)
+
+    return asyncio.run(run())
+
+
+def test_scrape_never_exceeds_the_concurrency_limit():
+    live = {"now": 0, "peak": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        live["now"] += 1
+        live["peak"] = max(live["peak"], live["now"])
+        await asyncio.sleep(0.02)
+        live["now"] -= 1
+        return _ok_scrape(request)
+
+    copies = _run_scrape(handler, 6, concurrency=2, rate_limit=0)
+    assert all(c.ok for c in copies)
+    assert live["peak"] == 2          # the free plan's two browsers, no more
+
+
+def test_pacer_holds_requests_inside_the_window():
+    """Two per window: the third waits for the first to age out."""
+    async def run():
+        pacer = pipeline._Pacer(per_minute=2, window_s=0.3)
+        started = []
+        started.append(0.0)
+        clock = asyncio.get_event_loop().time
+        t0 = clock()
+        for _ in range(4):
+            await pacer.take()
+            started.append(clock() - t0)
+        return started[1:]
+
+    marks = asyncio.run(run())
+    assert marks[0] < 0.1 and marks[1] < 0.1     # first two go straight through
+    assert marks[2] >= 0.25                      # third waits out the window
+    assert marks[3] >= 0.25
+
+
+def test_pacer_disabled_by_zero():
+    async def run():
+        pacer = pipeline._Pacer(per_minute=0, window_s=30)
+        for _ in range(50):
+            await pacer.take()
+        return True
+
+    assert asyncio.run(run())
+
+
+def test_scrape_retries_a_rate_limit_and_honours_retry_after():
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(429, headers={"Retry-After": "0"},
+                                  json={"success": False, "error": "slow down"})
+        return _ok_scrape(request)
+
+    copy, = _run_scrape(handler, 1, rate_limit=0)
+    assert copy.ok and copy.markdown == "body" and calls["n"] == 2
+
+
+def test_scrape_gives_up_after_max_attempts_and_says_why():
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(429, headers={"Retry-After": "0"},
+                              json={"success": False, "error": "slow down"})
+
+    copy, = _run_scrape(handler, 1, rate_limit=0)
+    assert not copy.ok and "slow down" in copy.error
+    assert calls["n"] == pipeline.MAX_ATTEMPTS
+
+
+def test_scrape_retries_a_transient_server_error(monkeypatch):
+    monkeypatch.setattr(pipeline, "BASE_BACKOFF_S", 0.01)
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(503, json={"success": False, "error": "busy"})
+        return _ok_scrape(request)
+
+    copy, = _run_scrape(handler, 1, rate_limit=0)
+    assert copy.ok and calls["n"] == 2
+
+
+def test_scrape_does_not_retry_a_plain_refusal():
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(403, json={"success": False, "error": "blocked"})
+
+    copy, = _run_scrape(handler, 1, rate_limit=0)
+    assert not copy.ok and "blocked" in copy.error
+    assert calls["n"] == 1            # 403 will not become a 200 by asking again
+
+
+def test_exhausted_credits_stop_the_batch():
+    """402 means every further request fails the same way — don't spend them."""
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(402, json={"success": False,
+                                         "error": "Insufficient credits"})
+
+    copies = _run_scrape(handler, 8, concurrency=1, rate_limit=0)
+    assert len(copies) == 8
+    assert all(c.error == pipeline.OUT_OF_CREDITS for c in copies)
+    assert calls["n"] == 1            # asked once, then stopped asking
+
+
+def test_scrape_reports_progress_as_copies_land():
+    seen = []
+    copies = _run_scrape(_ok_scrape, 3, rate_limit=0,
+                         on_progress=lambda done, total: seen.append((done, total)))
+    assert len(copies) == 3
+    assert seen == [(1, 3), (2, 3), (3, 3)]
+
+
+def test_free_plan_defaults_match_the_published_limits():
+    assert pipeline.FREE_RATE_LIMIT == 10 and pipeline.FREE_CONCURRENCY == 2
+    assert app_module.FIRECRAWL_RATE_LIMIT == 10
+    assert app_module.FIRECRAWL_CONCURRENCY == 2
 
 
 # ---------------------------------------------------------------------------

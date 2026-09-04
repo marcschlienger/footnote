@@ -306,6 +306,8 @@ Details worth knowing:
 | Bind address / port | `--host` / `--port` flags, or `HOST` / `PORT` | `0.0.0.0` / `8010` |
 | Default depth | `DEFAULT_PROCESSOR` | `core` |
 | Sources archived per dossier | `MAX_SOURCES` | `12` |
+| Firecrawl requests per minute | `FIRECRAWL_RATE_LIMIT` (`0` disables pacing) | `10` — the free plan's limit |
+| Firecrawl requests in flight | `FIRECRAWL_CONCURRENCY` | `2` — the free plan's limit |
 | API token | `FOOTNOTE_TOKEN` | unset — no authentication |
 | Push keys | `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `VAPID_CLAIM_EMAIL` | unset — push disabled |
 | Notion mirror | `NOTION_API_KEY`, `NOTION_DATABASE_ID` | unset — mirror disabled |
@@ -495,6 +497,16 @@ Tailscale, WireGuard) and/or use the per-instance `FOOTNOTE_TOKEN`.
   has no budget cap (yet). Watch your Parallel dashboard early on.
 - Sources behind aggressive bot protection or paywalls can't be archived;
   the dossier lists them with the reason instead.
+- **Archiving is paced for Firecrawl's free plan** (10 requests/minute, 2
+  concurrent browsers, 1 credit per page), which is what the defaults
+  encode — so a 12-source dossier takes about a minute to archive rather
+  than a few seconds, and the job's progress counts the copies as they land.
+  Rate-limited and transient failures are retried, honouring `Retry-After`;
+  a bot wall or paywall is recorded as final without a retry. If credits run
+  out the batch stops on the first `402` instead of spending the rest of the
+  job on requests that cannot succeed, and the dossier and the job summary
+  both say so. On a paid plan, raise `FIRECRAWL_RATE_LIMIT` and
+  `FIRECRAWL_CONCURRENCY`.
 - Authentication is optional and coarse — one shared token per instance, no
   rate limiting. Keep the server on a private network regardless.
 - **The bundle zip is built in memory** and holds the report plus the

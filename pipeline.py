@@ -25,9 +25,11 @@ Verified API contracts (August 2026):
 from __future__ import annotations
 
 import asyncio
+import random
 import re
 import time
 import unicodedata
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -217,44 +219,155 @@ def _err_detail(resp: httpx.Response) -> str:
 # Firecrawl
 # ---------------------------------------------------------------------------
 
+# The free plan's published limits, which are also the safe defaults: 10
+# /scrape requests per minute and 2 concurrent browsers. A paid plan raises
+# both (FIRECRAWL_RATE_LIMIT / FIRECRAWL_CONCURRENCY); 0 disables pacing.
+FREE_RATE_LIMIT = 10
+FREE_CONCURRENCY = 2
+
+# Retry these rather than losing the citation; 402 is not among them, because
+# exhausted credits do not come back by asking again.
+RETRYABLE_STATUS = frozenset({408, 429, 500, 502, 503, 504})
+MAX_ATTEMPTS = 3
+BASE_BACKOFF_S = 2.0
+MAX_BACKOFF_S = 120.0
+OUT_OF_CREDITS = "Firecrawl credits exhausted (HTTP 402)"
+
+
+class _Pacer:
+    """Holds request starts inside a fixed per-minute budget.
+
+    Firecrawl counts requests, not successes, so the cheapest way to stay
+    inside the limit is never to exceed it: a waiter takes its turn only once
+    the oldest start in the window has aged out. The lock is held across the
+    sleep on purpose — waiters then re-check one at a time instead of waking
+    together and bursting.
+    """
+
+    def __init__(self, per_minute: int, window_s: float = 60.0):
+        self.per_minute = per_minute
+        self.window_s = window_s
+        self.starts: deque = deque()
+        self.lock = asyncio.Lock()
+
+    async def take(self) -> None:
+        if self.per_minute <= 0:            # pacing disabled
+            return
+        async with self.lock:
+            self._expire()
+            if len(self.starts) >= self.per_minute:
+                await asyncio.sleep(self.window_s - (time.monotonic()
+                                                     - self.starts[0]))
+                self._expire()
+            self.starts.append(time.monotonic())
+
+    def _expire(self) -> None:
+        now = time.monotonic()
+        while self.starts and now - self.starts[0] >= self.window_s:
+            self.starts.popleft()
+
+
+def _retry_after(resp: httpx.Response, fallback_s: float) -> float:
+    """Seconds to wait before retrying — the server's answer wins."""
+    header = resp.headers.get("retry-after", "").strip()
+    if header:
+        try:
+            return min(max(float(header), 0.0), MAX_BACKOFF_S)
+        except ValueError:                  # HTTP-date form: back off instead
+            pass
+    return min(fallback_s * random.uniform(0.5, 1.5), MAX_BACKOFF_S)
+
+
 async def scrape_sources(
     client: httpx.AsyncClient,
     api_key: str,
     citations: list[Citation],
     max_sources: int,
-    concurrency: int = 4,
+    concurrency: int = FREE_CONCURRENCY,
+    rate_limit: int = FREE_RATE_LIMIT,
+    on_progress=None,
 ) -> list[SourceCopy]:
-    """Fetch local Markdown copies of the cited pages (best-effort)."""
+    """Fetch local Markdown copies of the cited pages (best-effort).
+
+    Paced and retried to survive a free-plan key: requests are kept inside
+    `rate_limit` per minute and `concurrency` in flight, a rate-limited or
+    transient failure is retried honouring Retry-After, and the first 402
+    stops the batch — once the credits are gone every further request would
+    fail identically, and the dossier says so once instead of N times.
+
+    `on_progress(done, total)` is called as copies land; archiving is slow
+    enough under pacing to be worth reporting.
+    """
     todo = citations[:max_sources]
-    sem = asyncio.Semaphore(concurrency)
+    sem = asyncio.Semaphore(max(1, concurrency))
+    pacer = _Pacer(rate_limit)
+    state = {"out_of_credits": False, "done": 0}
 
     async def one(cit: Citation) -> SourceCopy:
         async with sem:
-            try:
-                resp = await client.post(
-                    f"{FIRECRAWL_BASE}/scrape",
-                    headers={"Authorization": f"Bearer {api_key}"},
-                    json={
-                        "url": cit.url,
-                        "formats": ["markdown"],
-                        "onlyMainContent": True,
-                    },
-                    timeout=httpx.Timeout(90.0, connect=15.0),
-                )
-                data = resp.json() if resp.content else {}
-                if resp.status_code != 200 or not data.get("success", False):
-                    detail = (data.get("error") or f"HTTP {resp.status_code}")
-                    return SourceCopy(cit.url, cit.title, "", False, str(detail)[:200])
-                page = data.get("data") or {}
-                md = page.get("markdown") or ""
-                title = (page.get("metadata") or {}).get("title") or cit.title
-                if not md.strip():
-                    return SourceCopy(cit.url, title, "", False, "empty extraction")
-                return SourceCopy(cit.url, title or cit.url, md, True)
-            except Exception as exc:                       # noqa: BLE001
-                return SourceCopy(cit.url, cit.title, "", False, str(exc)[:200])
+            if state["out_of_credits"]:
+                copy = SourceCopy(cit.url, cit.title, "", False, OUT_OF_CREDITS)
+            else:
+                copy = await _scrape_one(client, api_key, cit, pacer, state)
+        state["done"] += 1
+        if on_progress:
+            on_progress(state["done"], len(todo))
+        return copy
 
     return list(await asyncio.gather(*(one(c) for c in todo)))
+
+
+async def _scrape_one(
+    client: httpx.AsyncClient,
+    api_key: str,
+    cit: Citation,
+    pacer: _Pacer,
+    state: dict,
+) -> SourceCopy:
+    backoff = BASE_BACKOFF_S
+    error = "no attempt made"
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        await pacer.take()
+        try:
+            resp = await client.post(
+                f"{FIRECRAWL_BASE}/scrape",
+                headers={"Authorization": f"Bearer {api_key}"},
+                json={
+                    "url": cit.url,
+                    "formats": ["markdown"],
+                    "onlyMainContent": True,
+                },
+                timeout=httpx.Timeout(90.0, connect=15.0),
+            )
+        except Exception as exc:                           # noqa: BLE001
+            error = str(exc)[:200]
+            if attempt == MAX_ATTEMPTS:
+                break
+            await asyncio.sleep(min(backoff * random.uniform(0.5, 1.5),
+                                    MAX_BACKOFF_S))
+            backoff *= 2
+            continue
+
+        if resp.status_code == 402:
+            state["out_of_credits"] = True
+            return SourceCopy(cit.url, cit.title, "", False, OUT_OF_CREDITS)
+
+        data = resp.json() if resp.content else {}
+        if resp.status_code == 200 and data.get("success", False):
+            page = data.get("data") or {}
+            md = page.get("markdown") or ""
+            title = (page.get("metadata") or {}).get("title") or cit.title
+            if not md.strip():
+                return SourceCopy(cit.url, title, "", False, "empty extraction")
+            return SourceCopy(cit.url, title or cit.url, md, True)
+
+        error = str(data.get("error") or f"HTTP {resp.status_code}")[:200]
+        if resp.status_code not in RETRYABLE_STATUS or attempt == MAX_ATTEMPTS:
+            break
+        await asyncio.sleep(_retry_after(resp, backoff))
+        backoff *= 2
+
+    return SourceCopy(cit.url, cit.title, "", False, error)
 
 
 # ---------------------------------------------------------------------------

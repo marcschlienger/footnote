@@ -42,7 +42,10 @@ folder). Web Push notifies on completion; Notion mirroring is optional.
   citations live in `output.basis[].citations[]` (url/title/excerpts).
 - Firecrawl: `POST https://api.firecrawl.dev/v2/scrape` (Bearer),
   `{url, formats:["markdown"], onlyMainContent:true}` →
-  `{success, data:{markdown, metadata:{title}}}`.
+  `{success, data:{markdown, metadata:{title}}}`. Free plan: 10 requests/min,
+  2 concurrent browsers, 1 credit per page; 429 on breach (honour
+  `Retry-After`), 402 when credits are gone — and pay-as-you-go is not
+  available on the free plan, so 402 is terminal, not transient.
 
 ## Conventions
 
