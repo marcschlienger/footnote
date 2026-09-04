@@ -145,6 +145,11 @@ FIRECRAWL_RATE_LIMIT = _int_env("FIRECRAWL_RATE_LIMIT",
                                 pipeline.FREE_RATE_LIMIT, minimum=0)
 FIRECRAWL_CONCURRENCY = _int_env("FIRECRAWL_CONCURRENCY",
                                  pipeline.FREE_CONCURRENCY, minimum=1)
+# Whether a site's robots.txt is consulted before its page is archived. On by
+# default: it is the only machine-readable way a site says "not by machine",
+# and the citation is kept either way — only the local copy is skipped.
+RESPECT_ROBOTS = os.getenv("RESPECT_ROBOTS", "true").strip().lower() not in (
+    "0", "false", "no", "off")
 MAX_JOBS_KEPT = 200
 MAX_CITATIONS_KEPT = 100     # per job, so jobs.json stays small
 PUSH_CONCURRENCY = 4         # devices notified at once
@@ -670,8 +675,9 @@ async def run_research(job_id: str) -> None:
                 _update_job(job_id, progress=f"Archiving sources… {done}/{total}")
 
             sources = await pipeline.scrape_sources(
-                client, FIRECRAWL_API_KEY, todo,
-                app.state.limiter, on_progress=archived_so_far)
+                client, FIRECRAWL_API_KEY, todo, app.state.limiter,
+                on_progress=archived_so_far,
+                robots=getattr(app.state, "robots", None))
 
         # 3. Write the dossier into the synced folder
         if resumed is None:
@@ -927,6 +933,8 @@ async def lifespan(application: FastAPI):
     # a byte inside every read timeout holds its thread indefinitely, and the
     # blast radius should be "no more notifications" rather than "no more
     # dossiers written".
+    application.state.robots = (pipeline.RobotsCache()
+                               if RESPECT_ROBOTS else None)
     application.state.push_pool = ThreadPoolExecutor(
         max_workers=PUSH_CONCURRENCY, thread_name_prefix="footnote-push")
     # Jobs interrupted by a restart: the Parallel run survives server-side,
@@ -1517,6 +1525,7 @@ async def health():
         "output_dir_writable": _output_dir_writable(),
         "parallel_configured": bool(PARALLEL_API_KEY),
         "firecrawl_configured": bool(FIRECRAWL_API_KEY),
+        "respects_robots": RESPECT_ROBOTS,
         "notion_configured": bool(NOTION_API_KEY and NOTION_DATABASE_ID),
         # The claim email is not optional: pywebpush signs with a
         # "mailto:{...}" subject, and push services reject an empty one.

@@ -16,6 +16,9 @@ const sourcesCache = new Map();
 // because a timer fired.
 const openReaders = new Set();
 const readerCache = new Map();
+// An archived page can be a few hundred kB of HTML, and a long session can
+// open a lot of them. Keep the most recent handful.
+const READER_CACHE_MAX = 12;
 const SOURCES_TTL_MS = 60000;   // a copy can be moved or deleted in the notes
 
 // --------------------------------------------------------------------
@@ -315,7 +318,10 @@ function readInline(url, host, openLabel, closeLabel, after) {
     // source list away from the links that opened it.
     host.insertBefore(panel, (after && after.nextSibling) || null);
     if (readerCache.has(url)) {
-      panel.innerHTML = readerCache.get(url);
+      const html = readerCache.get(url);
+      readerCache.delete(url);           // re-insert: least-recently-read goes
+      readerCache.set(url, html);
+      panel.innerHTML = html;
       return;
     }
     try {
@@ -323,6 +329,9 @@ function readInline(url, host, openLabel, closeLabel, after) {
       if (!res.ok) throw new Error(res.statusText);
       const html = await res.text();
       readerCache.set(url, html);
+      while (readerCache.size > READER_CACHE_MAX) {
+        readerCache.delete(readerCache.keys().next().value);
+      }
       // Sanitised server-side, by the same allowlist the standalone page uses.
       panel.innerHTML = html;
     } catch (e) {

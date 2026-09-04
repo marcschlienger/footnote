@@ -38,6 +38,7 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import quote, urlsplit
+from urllib.robotparser import RobotFileParser
 
 import httpx
 
@@ -220,23 +221,15 @@ def clean_text(value, fallback: str = "") -> str:
     return str(value)
 
 
-def is_push_endpoint(url: str) -> bool:
-    """A push endpoint we are willing to have the server POST to.
+def is_public_http_url(url: str) -> bool:
+    """An http(s) URL that points at the open internet.
 
-    Stricter than is_http_url on purpose: this address is supplied by a
-    client and then requested by the server, which is a server-side request
-    forgery primitive if it can be aimed inwards. HTTPS only (push services
-    are), no embedded credentials, and no address inside the machine or its
-    network. Names are resolved by the push library, not here, so a name that
-    resolves inward is not caught — the loopback and private *literals* are,
-    which is what an attacker reaches for first.
+    Anything the *server* is going to request on someone else's say-so has to
+    pass this. Citations come from Parallel and robots.txt is fetched by
+    Footnote itself, so a citation of "http://127.0.0.1:8010/admin" would
+    otherwise be a server-side request forgery with extra steps.
     """
     if not is_http_url(url):
-        return False
-    parsed = urlsplit(url)
-    if parsed.scheme.lower() != "https":
-        return False
-    if parsed.username or parsed.password:
         return False
     # The same string is_http_url validated, which is the one a resolver will
     # be given — not the original, which IDNA may still fold onto loopback.
@@ -244,13 +237,25 @@ def is_push_endpoint(url: str) -> bool:
     if not host or host == "localhost" or host.endswith(".localhost"):
         return False
     address = _as_address(host)
-    if address is not None:
-        # is_global covers carrier-grade NAT (100.64/10), which is neither
-        # private nor reserved — but Python also calls multicast and IPv6
-        # site-local addresses global, so those are excluded by name.
-        return (address.is_global and not address.is_multicast
-                and not getattr(address, "is_site_local", False))
-    return True                         # a name; the library resolves it
+    if address is None:
+        return True                     # a name; the resolver decides
+    # is_global covers carrier-grade NAT (100.64/10), which is neither
+    # private nor reserved — but Python also calls multicast and IPv6
+    # site-local addresses global, so those are excluded by name.
+    return (address.is_global and not address.is_multicast
+            and not getattr(address, "is_site_local", False))
+
+
+def is_push_endpoint(url: str) -> bool:
+    """A push endpoint we are willing to have the server POST to.
+
+    Everything is_public_http_url requires, and then some: a push service
+    speaks HTTPS, and an endpoint carrying credentials is not one.
+    """
+    parsed = urlsplit(str(url or ""))
+    if parsed.scheme.lower() != "https" or parsed.username or parsed.password:
+        return False
+    return is_public_http_url(url)
 
 
 def _as_address(host: str):
@@ -275,8 +280,13 @@ def scrapable(citations: list, max_sources: int) -> list:
     mailto: and the like are legitimate citations but not scrape targets;
     spending a request and a credit to be told so helps nobody. The caller
     counts these too, so the progress it announces matches what happens.
+
+    Addresses inside this machine or its network are excluded as well:
+    Firecrawl could not reach them anyway, and Footnote fetches robots.txt
+    itself, which would make a citation of "http://127.0.0.1:8010/admin" a
+    request the server makes on a provider's say-so.
     """
-    return [c for c in citations if is_http_url(c.url)][:max_sources]
+    return [c for c in citations if is_public_http_url(c.url)][:max_sources]
 
 
 def is_safe_url(url: str, relative_ok: bool = True) -> bool:
@@ -526,6 +536,105 @@ OUT_OF_CREDITS = "Firecrawl credits exhausted (HTTP 402)"
 CREDIT_COOLDOWN_S = 15 * 60
 
 
+# The agent that actually fetches the page is Firecrawl's, so its rules are
+# the ones that apply; RobotFileParser falls back to "*" when a site has no
+# line for it.
+ROBOTS_AGENT = "FirecrawlAgent"
+ROBOTS_TTL_S = 3600          # re-read a site's rules occasionally
+ROBOTS_TIMEOUT_S = 10.0
+ROBOTS_MAX_BYTES = 512 * 1024
+ROBOTS_MAX_SITES = 500       # remembered rule sets, oldest dropped first
+ROBOTS_DISALLOWED = "the site's robots.txt asks agents not to fetch this"
+ROBOTS_UNAVAILABLE = "the site's robots.txt could not be read"
+ROBOTS_NOT_PUBLIC = "not a public web address"
+
+
+class RobotsCache:
+    """robots.txt for the hosts a dossier cites, remembered for a while.
+
+    Footnote fetches pages that were already cited, one at a time, into a
+    private folder — which is closer to a reader saving a copy than to
+    crawling. But robots.txt is how a site says "not by machine", it is the
+    only such signal that is machine-readable, and honouring it costs a
+    request rather than a credit. RESPECT_ROBOTS turns it off for anyone who
+    judges their own use differently.
+    """
+
+    def __init__(self, agent: str = ROBOTS_AGENT, ttl_s: float = ROBOTS_TTL_S,
+                 max_sites: int = ROBOTS_MAX_SITES):
+        self.agent = agent
+        self.ttl_s = ttl_s
+        self.max_sites = max_sites
+        self._rules: dict = {}          # origin → (parser | None, fetched_at)
+        self._locks: dict = {}
+
+    async def allows(self, client: httpx.AsyncClient, url: str) -> tuple:
+        """(allowed, reason). The reason is empty when it is allowed."""
+        # Checked here rather than only at the call site: this method makes a
+        # request to whatever it is handed, so a citation aimed inside the
+        # network would be a server-side request forgery in a helper that
+        # looks like a policy check.
+        if not is_public_http_url(url):
+            return False, ROBOTS_NOT_PUBLIC
+        parts = urlsplit(url)
+        origin = f"{parts.scheme}://{parts.netloc}"
+        if origin not in self._locks:
+            self._locks[origin] = asyncio.Lock()
+        async with self._locks[origin]:
+            parser = await self._parser(client, origin)
+        if parser is None:
+            # RFC 9309: a robots.txt that cannot be read means "assume
+            # complete disallow". Erring the other way would archive exactly
+            # the pages whose rules we failed to learn.
+            return False, ROBOTS_UNAVAILABLE
+        if parser is _ALLOW_ALL:
+            return True, ""
+        return ((True, "") if parser.can_fetch(self.agent, url)
+                else (False, ROBOTS_DISALLOWED))
+
+    async def _parser(self, client: httpx.AsyncClient, origin: str):
+        cached = self._rules.get(origin)
+        if cached and time.monotonic() - cached[1] < self.ttl_s:
+            return cached[0]
+        parser = await self._fetch(client, origin)
+        self._rules[origin] = (parser, time.monotonic())
+        # A server that runs for months meets a lot of hosts; keep the most
+        # recently learned rules and let the rest be fetched again if needed.
+        while len(self._rules) > self.max_sites:
+            self._rules.pop(next(iter(self._rules)))
+        for origin_key in [k for k in self._locks if k not in self._rules]:
+            if not self._locks[origin_key].locked():
+                del self._locks[origin_key]
+        return parser
+
+    async def _fetch(self, client: httpx.AsyncClient, origin: str):
+        try:
+            resp = await client.get(f"{origin}/robots.txt",
+                                    timeout=httpx.Timeout(ROBOTS_TIMEOUT_S),
+                                    follow_redirects=True)
+        except Exception:                                  # noqa: BLE001
+            return None                                    # unreadable
+        if resp.status_code in (401, 403):
+            # Access to the rules themselves is restricted: RFC 9309 says
+            # that means the whole site is disallowed.
+            return None
+        if 400 <= resp.status_code < 500:
+            return _ALLOW_ALL             # no rules published: everything goes
+        if resp.status_code >= 500:
+            return None
+        body = resp.text[:ROBOTS_MAX_BYTES]
+        parser = RobotFileParser()
+        parser.parse(body.splitlines())
+        return parser
+
+
+class _AllowAll:
+    """Sentinel for "this site publishes no rules"."""
+
+
+_ALLOW_ALL = _AllowAll()
+
+
 class ScrapeLimiter:
     """One API key's budget, shared by every job that spends it.
 
@@ -622,6 +731,7 @@ async def scrape_sources(
     todo: list[Citation],
     limiter: ScrapeLimiter,
     on_progress=None,
+    robots: RobotsCache = None,
 ) -> list[SourceCopy]:
     """Fetch local Markdown copies of the cited pages (best-effort).
 
@@ -633,6 +743,10 @@ async def scrape_sources(
     job and for the ones queued behind it, since the credits belong to the
     key. Requests already in flight when that 402 lands still complete, so up
     to `limiter.concurrency` are spent, not one.
+
+    When `robots` is given, a page its site asks agents not to fetch is not
+    fetched: the citation stays in the dossier with the reason recorded, and
+    no credit is spent on it.
 
     Archiving is best-effort and can never fail the job: every path out of
     here is a SourceCopy, including the ones that had no business happening.
@@ -648,7 +762,14 @@ async def scrape_sources(
 
     async def one(cit: Citation) -> SourceCopy:
         try:
-            if limiter.out_of_credits():
+            allowed, why = (True, "")
+            if robots is not None:
+                # Before the semaphore and before the credit: this is a
+                # request to the site, not to Firecrawl.
+                allowed, why = await robots.allows(client, cit.url)
+            if not allowed:
+                copy = SourceCopy(cit.url, cit.title, "", False, why)
+            elif limiter.out_of_credits():
                 copy = SourceCopy(cit.url, cit.title, "", False, OUT_OF_CREDITS)
             else:
                 copy = await _scrape_one(client, api_key, cit, limiter)

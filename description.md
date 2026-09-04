@@ -236,6 +236,35 @@ first non-empty `reasoning` becomes the Method note, the first `confidence`
 goes into the frontmatter. A JSON-type output (shouldn't happen with a text
 schema, but tolerated) is flattened to `## key` sections.
 
+### robots.txt
+
+Footnote fetches pages that were already cited, one at a time, into a private
+folder — closer to a reader saving a copy than to crawling, which is what
+robots.txt is aimed at. But it is the only machine-readable way a site says
+"not by machine", and honouring it costs a request rather than a credit, so
+`RESPECT_ROBOTS` is on by default and the operator can decide otherwise.
+
+`RobotsCache` reads a site's rules once per hour, at most `ROBOTS_MAX_SITES`
+sites remembered, under a per-origin lock so a dossier citing six pages of
+one site fetches its rules once. The agent matched is `FirecrawlAgent`,
+because Firecrawl is what actually fetches the page; `RobotFileParser` falls
+back to `*` when a site has no line for it. Following RFC 9309: a 4xx means
+no rules and everything is allowed, while a 5xx — or a 401/403 on robots.txt
+itself — means assume complete disallow, since erring the other way archives
+exactly the pages whose rules could not be read.
+
+A refused page keeps its citation and its excerpt in the dossier, with the
+reason in the "could not be archived" list. Nothing is hidden; only the local
+copy is skipped, and no credit is spent on it.
+
+**This is also the one place Footnote itself requests a third-party URL** —
+everything else goes through Firecrawl. That makes a citation a server-side
+request forgery primitive if it is not checked, so `is_public_http_url` gates
+both the robots fetch and the scrape: loopback, private, carrier-grade NAT,
+link-local, multicast and site-local addresses are refused, and the check
+lives inside `RobotsCache.allows` rather than only at the call site, because
+that method makes a request to whatever it is handed.
+
 ### Firecrawl
 
 `POST https://api.firecrawl.dev/v2/scrape`, `Authorization: Bearer …`:

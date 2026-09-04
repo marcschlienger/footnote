@@ -316,6 +316,7 @@ Details worth knowing:
 | Firecrawl requests per minute | `FIRECRAWL_RATE_LIMIT` (`0` disables pacing) | `10` — the free plan's limit |
 | Firecrawl requests in flight | `FIRECRAWL_CONCURRENCY` | `2` — the free plan's limit |
 | Cross-origin browser clients | `FOOTNOTE_CORS_ORIGINS` (comma-separated) | none — the PWA is same-origin |
+| Honour a site's robots.txt | `RESPECT_ROBOTS` | `true` |
 | API token | `FOOTNOTE_TOKEN` | unset — no authentication |
 | Push keys | `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `VAPID_CLAIM_EMAIL` | unset — push disabled |
 | Notion mirror | `NOTION_API_KEY`, `NOTION_DATABASE_ID` | unset — mirror disabled |
@@ -541,6 +542,15 @@ Tailscale, WireGuard) and/or use the per-instance `FOOTNOTE_TOKEN`.
   has no budget cap (yet). Watch your Parallel dashboard early on.
 - Sources behind aggressive bot protection or paywalls can't be archived;
   the dossier lists them with the reason instead.
+- **A site's robots.txt is honoured before a page is archived.** Footnote
+  fetches pages that were already cited, one at a time, into a folder only
+  you read — closer to saving a page than to crawling — but robots.txt is the
+  only machine-readable way a site says "not by machine". A refused page
+  keeps its citation and its excerpt; only the local copy is skipped, the
+  reason is recorded in the dossier, and no Firecrawl credit is spent on it.
+  Set `RESPECT_ROBOTS=false` if you judge your own use differently. What this
+  cannot see is everything that is not written down: licence terms, or
+  whether a particular operator would mind.
 - **Archiving is paced for Firecrawl's free plan** (10 requests/minute, 2
   concurrent browsers, 1 credit per page), which is what the defaults
   encode — so a 12-source dossier takes about a minute to archive rather

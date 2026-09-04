@@ -14,6 +14,7 @@ import json
 import re
 import tempfile
 import time
+import uuid
 import zipfile
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
@@ -168,6 +169,178 @@ def test_scrape_sources_respects_cap():
                 pipeline.ScrapeLimiter(rate_limit=0))
 
     assert len(asyncio.run(run())) == 3 and len(seen) == 3
+
+
+# ---------------------------------------------------------------------------
+# robots.txt: what a site asks not to be fetched by machine
+# ---------------------------------------------------------------------------
+
+def _robots_run(handler, urls, **kw):
+    """Drive scrape_sources with a robots check in front of it."""
+    async def run():
+        limiter = pipeline.ScrapeLimiter(rate_limit=0, concurrency=2)
+        robots = pipeline.RobotsCache(**kw)
+        async with httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)) as client:
+            return await pipeline.scrape_sources(
+                client, "k", [Citation(u) for u in urls], limiter,
+                robots=robots)
+
+    return asyncio.run(run())
+
+
+def _robots_handler(rules, scraped):
+    """A site serving robots.txt, and Firecrawl serving pages."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/robots.txt":
+            body = rules.get(request.url.host)
+            if body is None:
+                return httpx.Response(404)
+            if isinstance(body, int):
+                return httpx.Response(body)
+            return httpx.Response(200, text=body)
+        scraped.append(json.loads(request.content)["url"])
+        return _ok_scrape(request)
+
+    return handler
+
+
+def test_a_disallowed_page_is_cited_but_not_archived():
+    """The citation stays; only the copy is skipped, and no credit is spent."""
+    scraped = []
+    copies = _robots_run(
+        _robots_handler({"closed.test": "User-agent: *\nDisallow: /\n",
+                         "open.test": "User-agent: *\nAllow: /\n"}, scraped),
+        ["https://closed.test/a", "https://open.test/b"])
+
+    blocked = next(c for c in copies if "closed" in c.url)
+    assert not blocked.ok and blocked.error == pipeline.ROBOTS_DISALLOWED
+    assert scraped == ["https://open.test/b"]      # the other was never fetched
+
+
+def test_the_rules_are_read_once_per_site():
+    """One robots.txt fetch, however many of a site's pages are cited."""
+    fetches = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/robots.txt":
+            fetches.append(str(request.url))
+            return httpx.Response(200, text="User-agent: *\nAllow: /\n")
+        return _ok_scrape(request)
+
+    copies = _robots_run(handler, [f"https://one.test/{n}" for n in range(4)])
+    assert all(c.ok for c in copies)
+    assert fetches == ["https://one.test/robots.txt"]
+
+
+def test_no_robots_file_means_no_rules():
+    """404 is the ordinary case and allows everything (RFC 9309)."""
+    scraped = []
+    copies = _robots_run(_robots_handler({}, scraped),
+                         ["https://nofile.test/a"])
+    assert copies[0].ok and scraped == ["https://nofile.test/a"]
+
+
+def test_unreadable_rules_are_treated_as_a_refusal():
+    """RFC 9309: a 5xx on robots.txt means assume complete disallow."""
+    scraped = []
+    copies = _robots_run(_robots_handler({"broken.test": 503}, scraped),
+                         ["https://broken.test/a"])
+    assert not copies[0].ok
+    assert copies[0].error == pipeline.ROBOTS_UNAVAILABLE
+    assert scraped == []                           # nothing was fetched
+
+    # And 401/403 on the rules themselves means the same.
+    for status in (401, 403):
+        copies = _robots_run(_robots_handler({"shut.test": status}, []),
+                             ["https://shut.test/a"])
+        assert copies[0].error == pipeline.ROBOTS_UNAVAILABLE, status
+
+
+def test_a_rule_for_the_fetching_agent_wins():
+    """Firecrawl fetches the page, so its rules are the ones that apply."""
+    scraped = []
+    rules = ("User-agent: *\nAllow: /\n\n"
+             "User-agent: FirecrawlAgent\nDisallow: /private/\n")
+    handler = _robots_handler({"mixed.test": rules}, scraped)
+    copies = _robots_run(handler, ["https://mixed.test/private/x",
+                                   "https://mixed.test/public/y"])
+    assert copies[0].error == pipeline.ROBOTS_DISALLOWED
+    assert copies[1].ok
+    assert scraped == ["https://mixed.test/public/y"]
+
+
+def test_the_check_can_be_turned_off():
+    """RESPECT_ROBOTS=false: no robots parameter, no robots request."""
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        if request.url.path == "/robots.txt":
+            return httpx.Response(200, text="User-agent: *\nDisallow: /\n")
+        return _ok_scrape(request)
+
+    async def run():
+        limiter = pipeline.ScrapeLimiter(rate_limit=0, concurrency=2)
+        async with httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)) as client:
+            return await pipeline.scrape_sources(
+                client, "k", [Citation("https://closed.test/a")], limiter)
+
+    copies = asyncio.run(run())
+    assert copies[0].ok
+    assert "/robots.txt" not in seen
+
+
+def test_a_skipped_source_is_recorded_in_the_dossier(tmp_path):
+    """A reader should see why a copy is missing, not just that it is."""
+    result = ResearchResult(
+        content="b", citations=[Citation("https://closed.test/a", "Closed")],
+        confidence="", reasoning="")
+    written = pipeline.write_report(
+        tmp_path, "Robots question here", "core", result,
+        [SourceCopy("https://closed.test/a", "Closed", "", False,
+                    pipeline.ROBOTS_DISALLOWED)])
+    text = written.path.read_text()
+    assert "could not be archived" in text
+    assert pipeline.ROBOTS_DISALLOWED in text
+    assert "[Closed](https://closed.test/a)" in text      # still cited
+
+
+def test_the_robots_fetch_cannot_be_aimed_inwards():
+    """This helper makes a request to whatever it is handed."""
+    reached = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        reached.append(str(request.url))
+        return httpx.Response(404)
+
+    async def run():
+        robots = pipeline.RobotsCache()
+        async with httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)) as client:
+            return [await robots.allows(client, u) for u in (
+                "http://127.0.0.1:8010/admin",
+                "http://169.254.169.254/latest/meta-data/",
+                "https://10.0.0.5/x", "https://localhost/x")]
+
+    for allowed, why in asyncio.run(run()):
+        assert not allowed and why == pipeline.ROBOTS_NOT_PUBLIC
+    assert reached == []                  # nothing was requested at all
+
+
+def test_internal_citations_are_never_archived():
+    """Firecrawl could not reach them, and we should not try either."""
+    citations = [Citation("http://127.0.0.1:8010/admin"),
+                 Citation("http://169.254.169.254/x"),
+                 Citation("http://10.0.0.5/x"),
+                 Citation("https://a.test/ok")]
+    assert [c.url for c in pipeline.scrapable(citations, 10)] == \
+        ["https://a.test/ok"]
+
+
+def test_health_says_whether_robots_are_respected(client):
+    assert client.get("/health").json()["respects_robots"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -2386,6 +2559,98 @@ def test_legacy_subscriptions_are_dropped_on_load(monkeypatch):
     app_module._drop_unusable_subscriptions()
     assert list(app_module.subs.data) == ["keep"]
     app_module.subs.data.clear()
+
+
+# ---------------------------------------------------------------------------
+# One whole job, end to end
+# ---------------------------------------------------------------------------
+
+def test_a_whole_job_from_question_to_dossier(client, tmp_path, monkeypatch):
+    """Submit, research, archive, write, serve — with the providers mocked.
+
+    Most of the suite is unit-level; this is the one that would notice the
+    pieces no longer fitting together.
+    """
+    monkeypatch.setattr(app_module, "PARALLEL_API_KEY", "k")
+    monkeypatch.setattr(app_module, "FIRECRAWL_API_KEY", "fc")
+    monkeypatch.setattr(app_module, "OUTPUT_DIR", tmp_path)
+    monkeypatch.setattr(pipeline, "BASE_BACKOFF_S", 0.01)
+    app_module.jobs.data.clear()
+
+    result = ResearchResult(
+        content="**The answer.**\n\n## Evidence\n\nStuff.",
+        citations=[Citation("https://open.test/a", "Open source"),
+                   Citation("https://closed.test/b", "Closed source"),
+                   Citation("https://blocked.test/c", "Bot-walled source"),
+                   Citation("mailto:someone@example.test", "A person")],
+        confidence="high", reasoning="triangulated")
+
+    async def fake_result(*a, **kw):
+        return result
+
+    monkeypatch.setattr(pipeline, "start_task_run",
+                        lambda *a, **kw: _immediately("trun_lifecycle"))
+    monkeypatch.setattr(pipeline, "fetch_task_result", fake_result)
+
+    def provider(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/robots.txt":
+            if request.url.host == "closed.test":
+                return httpx.Response(200, text="User-agent: *\nDisallow: /\n")
+            return httpx.Response(404)
+        target = json.loads(request.content)["url"]
+        if "blocked.test" in target:
+            return httpx.Response(403, json={"success": False,
+                                             "error": "bot wall"})
+        return httpx.Response(200, json={
+            "success": True,
+            "data": {"markdown": "# Open\n\nThe archived text.",
+                     "metadata": {"title": "Open source"}}})
+
+    async def drive():
+        app_module.app.state.limiter = pipeline.ScrapeLimiter(
+            rate_limit=0, concurrency=2)
+        app_module.app.state.robots = pipeline.RobotsCache()
+        async with httpx.AsyncClient(
+                transport=httpx.MockTransport(provider)) as http:
+            app_module.app.state.client = http
+            job_id = uuid.uuid4().hex[:12]
+            app_module._put_job(job_id, {
+                "id": job_id, "question": "A perfectly fine question",
+                "processor": "core", "status": "queued", "progress": "Queued",
+                "created_at": "2026-01-01T00:00:00Z", "run_id": "",
+                "report_path": "", "notion_url": "", "error": ""})
+            await app_module.run_research(job_id)
+            return job_id
+
+    job_id = asyncio.run(drive())
+    job = app_module.jobs.data[job_id]
+    assert job["status"] == "done", job.get("error")
+    assert job["sources_cited"] == 4 and job["sources_archived"] == 1
+
+    # The dossier on disk: one archived copy, numbered by its citation.
+    report = Path(job["report_path"])
+    assert report.exists()
+    text = report.read_text()
+    assert "[Open source](https://open.test/a)" in text
+    assert pipeline.ROBOTS_DISALLOWED in text          # why, not just that
+    assert "bot wall" in text
+    assert "A person — not a web link" not in text     # mailto is still linked
+    assert [f.name for f in (report.parent / "sources").glob("*.md")] == \
+        ["01 Open source.md"]
+
+    # And what the app serves from it.
+    listing = client.get(f"/jobs/{job_id}/sources").json()
+    assert listing["cited"] == 4 and listing["archived"] == 1
+    by_url = {s["url"]: s for s in listing["sources"]}
+    assert by_url["https://open.test/a"]["archived"]
+    assert by_url["https://closed.test/b"]["note"] == pipeline.ROBOTS_DISALLOWED
+    assert by_url["mailto:someone@example.test"]["url"].startswith("mailto:")
+
+    assert client.get(f"/jobs/{job_id}/report").status_code == 200
+    with zipfile.ZipFile(io.BytesIO(
+            client.get(f"/jobs/{job_id}/bundle.zip").content)) as archive:
+        assert any(n.endswith("01 Open source.md") for n in archive.namelist())
+    app_module.jobs.data.clear()
 
 
 # ---------------------------------------------------------------------------
