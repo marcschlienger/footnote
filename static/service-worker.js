@@ -84,12 +84,14 @@ self.addEventListener("fetch", (event) => {
 });
 
 async function networkFirst(request, cacheName, markFallback = false) {
+  const url = new URL(request.url);
   try {
     const res = await fetch(request);
     // Only successful responses: an unauthorized page must never be cached
     // as though it were the app.
     if (res.ok) (await caches.open(cacheName)).put(request, res.clone());
     else if (res.status === 401) await forgetEverything();
+    else if (res.status === 404 || res.status === 410) await forgetJob(url);
     return res;
   } catch (err) {
     const cached = await (await caches.open(cacheName)).match(request);
@@ -109,14 +111,31 @@ async function cacheThenRefresh(event) {
       await forgetEverything();
     } else if (res.status === 404 || res.status === 410) {
       // The job was deleted. Reports resolve only through the job store, so
-      // the cache must not keep answering for one that is gone.
-      await cache.delete(event.request);
+      // the cache must not keep answering for one that is gone — and not for
+      // its siblings either, or an offline visit resurrects them one by one.
+      await forgetJob(new URL(event.request.url));
     }
     return res;
   });
   if (!cached) return fresh;
   event.waitUntil(fresh.catch(() => {}));   // a server-side re-render, next time
   return cached;
+}
+
+// One job is gone: drop every page and index cached under it, not just the
+// entry that happened to be asked for.
+async function forgetJob(url) {
+  const job = url.pathname.match(/^\/jobs\/([^/]+)\//);
+  if (!job) return;
+  const prefix = `/jobs/${job[1]}/`;
+  for (const name of [DOSSIER_CACHE, SHELL_CACHE]) {
+    const cache = await caches.open(name);
+    for (const request of await cache.keys()) {
+      if (new URL(request.url).pathname.startsWith(prefix)) {
+        await cache.delete(request);
+      }
+    }
+  }
 }
 
 // The token was changed or revoked: drop what was read under the old one.

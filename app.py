@@ -36,6 +36,7 @@ import re
 import secrets
 import sys
 import tempfile
+import time
 import traceback
 import uuid
 import zipfile
@@ -117,6 +118,7 @@ FIRECRAWL_CONCURRENCY = _int_env("FIRECRAWL_CONCURRENCY",
                                  pipeline.FREE_CONCURRENCY, minimum=1)
 MAX_JOBS_KEPT = 200
 MAX_CITATIONS_KEPT = 100     # per job, so jobs.json stays small
+PUSH_CONCURRENCY = 4         # devices notified at once
 
 # Optional API token, same contract as Margin's: unset → open server for
 # private-network use; set → everything but /health and the PWA shell assets
@@ -146,11 +148,24 @@ class JsonStore:
     def __init__(self, path: Path):
         self.path = path
         self.data: dict = {}
-        if path.exists():
+        if not path.exists():
+            return
+        try:
+            self.data = json.loads(path.read_text(encoding="utf-8"))
+        except OSError as exc:
+            print(f"could not read {path.name}: {exc}", flush=True)
+        except json.JSONDecodeError as exc:
+            # Starting empty would silently drop the history; the file is kept
+            # under a new name so it can be looked at, since the next save
+            # would otherwise overwrite the evidence.
+            spoiled = path.with_suffix(f".corrupt-{int(time.time())}.json")
             try:
-                self.data = json.loads(path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
-                self.data = {}
+                path.rename(spoiled)
+                print(f"{path.name} is not valid JSON ({exc}); kept as "
+                      f"{spoiled.name} and starting empty", flush=True)
+            except OSError:
+                print(f"{path.name} is not valid JSON ({exc}); starting empty",
+                      flush=True)
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -162,6 +177,33 @@ class JsonStore:
 
 jobs = JsonStore(DATA_DIR / "jobs.json")
 subs = JsonStore(DATA_DIR / "subscriptions.json")
+
+
+def _valid_subscription(sub) -> bool:
+    """What _push_one needs to exist before it tries."""
+    return (isinstance(sub, dict)
+            and pipeline.is_safe_url(sub.get("endpoint", ""), relative_ok=False)
+            and isinstance(sub.get("keys"), dict)
+            and all(isinstance(sub["keys"].get(k), str) and sub["keys"][k]
+                    for k in ("p256dh", "auth")))
+
+
+def _drop_unusable_subscriptions() -> None:
+    """Subscriptions stored before they were checked on the way in.
+
+    A malformed one cannot be pushed to, so keeping it means failing and
+    logging once per job, forever.
+    """
+    bad = [key for key, sub in subs.data.items() if not _valid_subscription(sub)]
+    for key in bad:
+        del subs.data[key]
+    if bad:
+        subs.save()
+        print(f"dropped {len(bad)} unusable push subscription"
+              f"{'s' * (len(bad) != 1)}", flush=True)
+
+
+_drop_unusable_subscriptions()
 
 
 def _trim_jobs() -> None:
@@ -234,11 +276,17 @@ async def _notify_all(title: str, body: str, url: str) -> None:
         return
     payload = {"title": title, "body": body, "url": url,
                "icon": "/static/icon-192.png", "badge": "/static/icon-192.png"}
-    dead = []
-    for key, sub in list(subs.data.items()):
-        alive = await asyncio.to_thread(_push_one, sub, payload)
-        if not alive:
-            dead.append(key)
+    # Bounded concurrency: one unreachable endpoint should not hold up the
+    # notification to every other device.
+    gate = asyncio.Semaphore(PUSH_CONCURRENCY)
+
+    async def deliver(key, sub):
+        async with gate:
+            return key, await asyncio.to_thread(_push_one, sub, payload)
+
+    results = await asyncio.gather(
+        *(deliver(k, v) for k, v in list(subs.data.items())))
+    dead = [key for key, alive in results if not alive]
     for key in dead:
         subs.data.pop(key, None)
     if dead:
@@ -253,10 +301,14 @@ async def run_research(job_id: str) -> None:
     job = jobs.data.get(job_id)
     if not job:
         return
+    if job.get("status") == "done":
+        return
     client: httpx.AsyncClient = app.state.client
     question, processor = job["question"], job["processor"]
-    if _finish_if_already_written(job_id, job):
-        return
+    # A dossier already on disk from an interrupted run: the research is paid
+    # for and filed, so it is adopted rather than repeated.
+    resumed = Path(job.get("report_path") or "")
+    resumed = resumed if job.get("report_path") and resumed.exists() else None
     try:
         # 1. Deep research on Parallel (created once; resumable by run_id)
         _update_job(job_id, status="researching",
@@ -273,10 +325,22 @@ async def run_research(job_id: str) -> None:
 
         # 2. Archive cited sources locally (optional, best-effort)
         sources = []
-        if FIRECRAWL_API_KEY and result.citations and MAX_SOURCES > 0:
+        if resumed is not None:
+            # The copies are on disk; what did not survive is the record of
+            # which citation each belongs to. Read it back off the folder.
+            written = pipeline.WrittenReport(
+                path=resumed,
+                source_files=await asyncio.to_thread(
+                    pipeline.archived_source_files, resumed))
+            archived = len(written.source_files)
+            print(f"[{job_id}] adopting the dossier written before the restart",
+                  flush=True)
+        elif FIRECRAWL_API_KEY and result.citations and MAX_SOURCES > 0:
             n = min(len(result.citations), MAX_SOURCES)
             _update_job(job_id, status="archiving",
                         progress=f"Archiving {n} cited source{'s' * (n != 1)}…")
+
+
             # Pacing makes this the slow step on a free plan — say where it is.
             def archived_so_far(done: int, total: int) -> None:
                 _update_job(job_id, progress=f"Archiving sources… {done}/{total}")
@@ -285,40 +349,45 @@ async def run_research(job_id: str) -> None:
                 client, FIRECRAWL_API_KEY, result.citations, MAX_SOURCES,
                 app.state.limiter, on_progress=archived_so_far)
 
-        # 3. Write the dossier into the synced folder. The path is stored
-        # the moment it exists: a restart between here and the final update
-        # would otherwise re-scrape (spending credits again) and write a
-        # second folder for research already filed.
-        _update_job(job_id, status="saving", progress="Writing report…")
-        written = await asyncio.to_thread(
-            pipeline.write_report, OUTPUT_DIR, question, processor,
-            result, sources)
-        _update_job(job_id, report_path=str(written.path))
+        # 3. Write the dossier into the synced folder
+        if resumed is None:
+            _update_job(job_id, status="saving", progress="Writing report…")
+            written = await asyncio.to_thread(
+                pipeline.write_report, OUTPUT_DIR, question, processor,
+                result, sources, job_id)
+            archived = sum(1 for s in sources if s.ok)
+            # Stored before anything else can fail: from here the job is
+            # finished, and a restart adopts this dossier instead of paying
+            # for the research a second time.
+            _update_job(job_id, report_path=str(written.path))
 
-        # 4. Optional Notion mirror
-        notion_url = ""
-        if NOTION_API_KEY and NOTION_DATABASE_ID:
-            try:
-                notion_url = await pipeline.save_to_notion(
-                    client, NOTION_API_KEY, NOTION_DATABASE_ID, question, result)
-            except Exception as exc:                       # noqa: BLE001
-                # Everything, not just PipelineError: a DNS failure or an HTML
-                # body where JSON was promised would otherwise escape and
-                # rewrite a dossier that is already on disk as failed.
-                print(f"[{job_id}] notion mirror failed: {_scrub(exc)}", flush=True)
-
-        archived = sum(1 for s in sources if s.ok)
         summary = (f"{len(result.citations)} sources cited"
                    + (f", {archived} archived" if archived else ""))
         # Worth saying plainly: it is a billing state, not a flaky website,
         # and every unarchived source in this dossier has the same cause.
         if any(s.error == pipeline.OUT_OF_CREDITS for s in sources):
             summary += " — Firecrawl credits exhausted"
+
+        # 4. The complete outcome, in one write. Notion and push follow it,
+        # so neither can leave a job looking unfinished.
         _update_job(job_id, status="done", progress=f"Done — {summary}",
-                    report_path=str(written.path), notion_url=notion_url,
-                    finished_at=_now(), sources_cited=len(result.citations),
+                    report_path=str(written.path), finished_at=_now(),
+                    sources_cited=len(result.citations),
                     sources_archived=archived,
                     citations=_citation_records(result, sources, written))
+
+        # 5. Post-processing: an optional mirror, then the notification.
+        if NOTION_API_KEY and NOTION_DATABASE_ID:
+            try:
+                notion_url = await pipeline.save_to_notion(
+                    client, NOTION_API_KEY, NOTION_DATABASE_ID, question, result)
+                _update_job(job_id, notion_url=notion_url)
+            except Exception as exc:                       # noqa: BLE001
+                # Everything, not just PipelineError: a DNS failure or an HTML
+                # body where JSON was promised would otherwise escape and
+                # rewrite a dossier that is already on disk as failed.
+                print(f"[{job_id}] notion mirror failed: {_scrub(exc)}", flush=True)
+
         await notify_all("Research complete",
                          f"“{_ellipsize(question)}” — {summary}",
                          url=f"/jobs/{job_id}/report")
@@ -335,30 +404,13 @@ async def run_research(job_id: str) -> None:
         await notify_all("Research failed", f"“{_ellipsize(question)}”: {reason}")
 
 
-def _finish_if_already_written(job_id: str, job: dict) -> bool:
-    """Close out a job whose dossier survived the restart that interrupted it.
-
-    Resuming means re-running the whole pipeline, and steps 2 and 3 are not
-    free or idempotent — Firecrawl charges again and write_report claims a
-    new folder. If the report is already on disk, the work is done; say so
-    rather than paying for a duplicate.
-    """
-    path = job.get("report_path") or ""
-    if not path or not Path(path).exists():
-        return False
-    if job.get("status") == "done":
-        return True
-    print(f"[{job_id}] dossier already written; not repeating it", flush=True)
-    _update_job(job_id, status="done", finished_at=job.get("finished_at") or _now(),
-                progress=job.get("progress") or "Done — recovered after a restart")
-    return True
-
-
 def _citation_records(result, sources: list, written) -> list:
     """The job's source apparatus, as the /sources endpoint serves it.
 
     Kept on the job rather than re-derived from the report text: it is the
-    only place that knows which citations *failed* to archive and why.
+    only place that knows which citations *failed* to archive and why. On a
+    dossier adopted after a restart `sources` is empty — the files on disk
+    say what was archived, but why the rest were not is gone with the run.
     """
     errors = {src.url: src.error for src in sources if not src.ok}
     return [
@@ -641,7 +693,11 @@ async def _require_token(request: Request, call_next):
             response = await call_next(request)
         response.set_cookie(
             _TOKEN_COOKIE, FOOTNOTE_TOKEN, max_age=365 * 24 * 3600,
-            httponly=True, samesite="strict")
+            httponly=True, samesite="strict",
+            # Secure when the request came over TLS — behind Tailscale serve
+            # or a reverse proxy that is always; on a plain-HTTP LAN setting
+            # it would stop the cookie being sent at all.
+            secure=request.url.scheme == "https")
         return response
     return await call_next(request)
 
@@ -928,12 +984,10 @@ async def subscribe(req: SubscribeRequest):
                                  "VAPID_CLAIM_EMAIL missing)")
     # Checked on the way in: a subscription that cannot be pushed to is
     # otherwise kept forever and fails once per job, for every job.
-    if not pipeline.is_safe_url(req.endpoint, relative_ok=False):
-        raise HTTPException(422, "endpoint must be an http(s) URL")
-    missing = [k for k in ("p256dh", "auth")
-               if not isinstance(req.keys.get(k), str) or not req.keys[k]]
-    if missing:
-        raise HTTPException(422, f"keys is missing {', '.join(missing)}")
+    if not _valid_subscription({"endpoint": req.endpoint, "keys": req.keys}):
+        raise HTTPException(
+            422, "a subscription needs an http(s) endpoint and string "
+                 "p256dh and auth keys")
     key = uuid.uuid5(uuid.NAMESPACE_URL, req.endpoint).hex
     subs.data[key] = {"endpoint": req.endpoint, "keys": req.keys}
     subs.save()

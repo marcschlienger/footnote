@@ -872,25 +872,56 @@ def _immediately(value):
     return done()
 
 
-def test_a_restart_does_not_buy_the_research_twice(client, tmp_path, monkeypatch):
-    """Resuming a job whose dossier is on disk must not re-scrape or re-write."""
-    written = pipeline.write_report(tmp_path, "Interrupted question", "core",
-                                    _sample_result(), [])
+def test_a_restart_adopts_the_dossier_and_records_the_real_outcome(
+        client, tmp_path, monkeypatch):
+    """Resuming must not re-scrape or re-write, and must not invent a record.
+
+    Re-fetching the finished Parallel result is allowed — the run is complete
+    server-side, so it costs nothing and it is how the citation list comes
+    back.
+    """
+    written = pipeline.write_report(
+        tmp_path, "Interrupted question", "core", _sample_result(),
+        [SourceCopy("https://a.test/1", "Paper A", "# A body", True)],
+        job_id="res1")
     app_module.jobs.data["res1"] = {
         "id": "res1", "question": "Interrupted question", "processor": "core",
-        "status": "saving", "created_at": "2026-01-01T00:00:00Z",
+        "status": "saving", "progress": "Writing report…",
+        "created_at": "2026-01-01T00:00:00Z",
         "run_id": "trun_x", "report_path": str(written.path)}
 
     def refuse(*a, **kw):
-        raise AssertionError("the pipeline was run again")
+        raise AssertionError("paid work was repeated")
 
-    monkeypatch.setattr(pipeline, "fetch_task_result", refuse)
+    async def finished_result(*a, **kw):
+        return _sample_result()
+
+    monkeypatch.setattr(pipeline, "fetch_task_result", finished_result)
     monkeypatch.setattr(pipeline, "scrape_sources", refuse)
     monkeypatch.setattr(pipeline, "write_report", refuse)
+    monkeypatch.setattr(app_module, "OUTPUT_DIR", tmp_path)
 
     asyncio.run(app_module.run_research("res1"))
-    assert app_module.jobs.data["res1"]["status"] == "done"
+
+    job = app_module.jobs.data["res1"]
+    assert job["status"] == "done"
     assert len(list(tmp_path.iterdir())) == 1        # no duplicate folder
+    # The record has to describe the dossier, not merely claim to be finished.
+    assert job["progress"] == "Done — 2 sources cited, 1 archived"
+    assert job["sources_cited"] == 2 and job["sources_archived"] == 1
+    assert job["finished_at"]
+    archived = {c["url"]: c["file"] for c in job["citations"]}
+    assert archived == {"https://a.test/1": "01 Paper A.md",
+                        "https://b.test/2": ""}      # read back off the folder
+
+
+def test_the_dossier_records_which_job_wrote_it(tmp_path):
+    """The marker a recovery would need to recognise its own work."""
+    written = pipeline.write_report(tmp_path, "Marked question", "core",
+                                    _sample_result(), [], job_id="abc123")
+    meta, _ = pipeline.split_front_matter(written.path.read_text())
+    assert meta["job"] == "abc123"
+    assert pipeline.archived_source_files(written.path) == {}
 
 
 def test_zero_max_sources_skips_archiving_entirely(client, monkeypatch, tmp_path):
@@ -993,6 +1024,95 @@ def test_source_frontmatter_survives_a_hostile_url(tmp_path):
     assert meta["source"] == "https://a.test/1 malicious: yes"
 
 
+def test_hostile_text_cannot_escape_a_code_span(tmp_path):
+    """A backtick in a provider URL must not end the span it is written in."""
+    result = ResearchResult(
+        content="b",
+        citations=[Citation("javascript:x`\n## Injected heading", "Click")],
+        confidence="", reasoning="")
+    text = pipeline.write_report(tmp_path, "Backtick question", "core",
+                                 result, []).path.read_text()
+    line = [l for l in text.splitlines() if "not a web link" in l][0]
+    assert line.endswith("``")                  # fenced longer than its content
+    assert "## Injected heading" not in text.replace(line, "")
+    # The fence outgrows the longest run inside; padding only where a
+    # leading or trailing backtick would otherwise be swallowed.
+    assert pipeline._md_code("a ``b`` c") == "```a ``b`` c```"
+    assert pipeline._md_code("`x`") == "`` `x` ``"
+
+
+def test_a_multiline_method_note_stays_in_its_block_quote(tmp_path):
+    result = ResearchResult(
+        content="b", citations=[], confidence="",
+        reasoning="First line.\n\n## Not a heading, surely")
+    text = pipeline.write_report(tmp_path, "Reasoning question", "core",
+                                 result, []).path.read_text()
+    note = text.split("## Method note")[1].strip()
+    assert note == "> First line.\n>\n> ## Not a heading, surely"
+
+
+def test_only_http_citations_are_sent_to_firecrawl():
+    """mailto: is a fine citation and a pointless scrape."""
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content)["url"])
+        return _ok_scrape(request)
+
+    async def run():
+        limiter = pipeline.ScrapeLimiter(rate_limit=0, concurrency=2)
+        async with httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)) as client:
+            return await pipeline.scrape_sources(
+                client, "k",
+                [Citation("https://a.test/1"), Citation("mailto:x@example.test"),
+                 Citation("javascript:alert(1)")],
+                max_sources=10, limiter=limiter)
+
+    copies = asyncio.run(run())
+    assert seen == ["https://a.test/1"]
+    assert len(copies) == 1
+
+
+def test_an_unreadable_response_body_is_retried_and_named(monkeypatch):
+    monkeypatch.setattr(pipeline, "BASE_BACKOFF_S", 0.01)
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(200, text="<html>not json</html>")
+
+    copy, = _run_scrape(handler, 1)
+    assert calls["n"] == pipeline.MAX_ATTEMPTS      # a broken hop, worth retrying
+    assert copy.error == "HTTP 200 with an unreadable body"
+
+
+def test_a_corrupt_state_file_is_kept_for_inspection(tmp_path):
+    path = tmp_path / "jobs.json"
+    path.write_text("{ this is not json")
+    store = app_module.JsonStore(path)
+    assert store.data == {}
+    assert not path.exists()                        # moved aside, not overwritten
+    spoiled = list(tmp_path.glob("jobs.corrupt-*.json"))
+    assert len(spoiled) == 1
+    assert spoiled[0].read_text() == "{ this is not json"
+
+
+def test_legacy_subscriptions_are_dropped_on_load(monkeypatch):
+    good = {"endpoint": "https://push.test/x", "keys": {"p256dh": "a", "auth": "b"}}
+    app_module.subs.data.clear()
+    app_module.subs.data.update({
+        "keep": good,
+        "no-keys": {"endpoint": "https://push.test/y", "keys": {}},
+        "bad-endpoint": {"endpoint": "ftp://push.test/z",
+                         "keys": {"p256dh": "a", "auth": "b"}},
+    })
+    monkeypatch.setattr(app_module.subs, "save", lambda: None)
+    app_module._drop_unusable_subscriptions()
+    assert list(app_module.subs.data) == ["keep"]
+    app_module.subs.data.clear()
+
+
 # ---------------------------------------------------------------------------
 # Service worker routing (the patterns it actually ships, not a copy of them)
 # ---------------------------------------------------------------------------
@@ -1004,6 +1124,17 @@ def _sw_pattern(name):
     literal = re.search(rf"const {name} = \(url\) =>\s*/(.+?)/\.test",
                         source, re.S).group(1)
     return re.compile(literal.replace("\\/", "/"))   # JS escapes its delimiter
+
+
+def test_deleting_a_job_clears_every_entry_it_owns():
+    """forgetJob works on the whole job prefix, not one URL."""
+    source = (Path(__file__).resolve().parent.parent
+              / "static" / "service-worker.js").read_text()
+    assert "async function forgetJob(url)" in source
+    # Both handlers must reach for it, or an offline visit resurrects the job.
+    assert source.count("forgetJob(") >= 3
+    prefix = re.search(r"const prefix = `(/jobs/\$\{job\[1\]\}/)`", source)
+    assert prefix, "forgetJob should match on the job prefix"
 
 
 def test_the_worker_caches_pages_but_not_the_index_or_downloads():

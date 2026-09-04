@@ -36,7 +36,10 @@ const SOURCES_TTL_MS = 60000;   // a copy can be moved or deleted in the notes
             "fail when it tries to save. See README.", true);
     }
   } catch (e) { /* offline shell — the list will populate when back online */ }
-  selectServerDefault();
+  // Settle the depth picker before the form can be used, so an immediate
+  // submission cannot go out under the hard-coded default.
+  await selectServerDefault();
+  $("go").disabled = false;
   offerPush();
   refreshJobs();
 })();
@@ -162,7 +165,13 @@ function renderJob(job) {
     del.className = "del";
     del.textContent = "remove";
     del.onclick = async () => {
-      await fetchJSON(`/jobs/${job.id}`, { method: "DELETE" }).catch(() => {});
+      try {
+        await fetchJSON(`/jobs/${job.id}`, { method: "DELETE" });
+      } catch (e) {
+        // Swallowing this left the row sitting there with no explanation.
+        flash("Could not remove that job: " + e.message, true);
+        return;
+      }
       openSources.delete(job.id);
       sourcesCache.delete(job.id);
       refreshJobs();

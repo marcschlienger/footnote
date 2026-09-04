@@ -74,6 +74,11 @@ SAFE_SCHEMES = frozenset({"http", "https", "mailto"})
 _SCHEME = re.compile(r"^([a-zA-Z][a-zA-Z0-9+.-]*):")
 
 
+def _is_http_url(url: str) -> bool:
+    match = _SCHEME.match(re.sub(r"[\x00-\x20]", "", str(url or "")))
+    return match is not None and match.group(1).lower() in ("http", "https")
+
+
 def is_safe_url(url: str, relative_ok: bool = True) -> bool:
     """True for the schemes above, and for relative URLs when allowed."""
     if not url:
@@ -372,7 +377,9 @@ async def scrape_sources(
     `on_progress(done, total)` is called as copies land; archiving is slow
     enough under pacing to be worth reporting.
     """
-    todo = citations[:max_sources]
+    # mailto: and the like are legitimate citations but not scrape targets;
+    # spending a request and a credit to be told so helps nobody.
+    todo = [c for c in citations if _is_http_url(c.url)][:max_sources]
     state = {"done": 0}
 
     async def one(cit: Citation) -> SourceCopy:
@@ -444,10 +451,11 @@ async def _scrape_one(
             limiter.note_out_of_credits()
             return SourceCopy(cit.url, cit.title, "", False, OUT_OF_CREDITS)
 
+        malformed = False
         try:
             data = resp.json() if resp.content else {}
         except ValueError:      # an HTML 502 from a proxy, say — not our JSON
-            data = {}
+            data, malformed = {}, True
         if resp.status_code == 200 and data.get("success", False):
             page = data.get("data") or {}
             md = page.get("markdown") or ""
@@ -456,8 +464,14 @@ async def _scrape_one(
                 return SourceCopy(cit.url, title, "", False, "empty extraction")
             return SourceCopy(cit.url, title or cit.url, md, True)
 
-        error = str(data.get("error") or f"HTTP {resp.status_code}")[:200]
-        if resp.status_code not in RETRYABLE_STATUS or attempt == MAX_ATTEMPTS:
+        if malformed:
+            # A 200 that is not the documented JSON is a broken hop, not an
+            # answer: say so, and treat it like the other transient faults.
+            error = f"HTTP {resp.status_code} with an unreadable body"
+        else:
+            error = str(data.get("error") or f"HTTP {resp.status_code}")[:200]
+        retryable = malformed or resp.status_code in RETRYABLE_STATUS
+        if not retryable or attempt == MAX_ATTEMPTS:
             break
         await asyncio.sleep(_retry_after(resp, backoff))
         backoff *= 2
@@ -514,6 +528,27 @@ def _md_label(text: str) -> str:
     return re.sub(r"([\\\[\]])", r"\\\1", _one_line(text))
 
 
+def _md_code(text: str) -> str:
+    """A code span that its own content cannot end.
+
+    CommonMark closes a span with the same run of backticks that opened it,
+    so the fence has to be longer than the longest run inside — a provider
+    URL with a backtick in it would otherwise close the span and let the
+    rest through as Markdown.
+    """
+    body = _one_line(text)
+    longest = max((len(run) for run in re.findall(r"`+", body)), default=0)
+    fence = "`" * (longest + 1)
+    pad = " " if body.startswith("`") or body.endswith("`") else ""
+    return f"{fence}{pad}{body}{pad}{fence}"
+
+
+def _md_quote(text: str) -> str:
+    """Every line of a block quote needs its own marker, not just the first."""
+    lines = [line.strip() for line in str(text).strip().splitlines()]
+    return "\n".join(f"> {line}" if line else ">" for line in lines)
+
+
 def _md_url(url: str) -> str:
     """Link destination, in the angle-bracket form when it needs one."""
     cleaned = _CONTROL.sub("", str(url)).replace("<", "").replace(">", "")
@@ -526,6 +561,7 @@ def write_report(
     processor: str,
     result: ResearchResult,
     sources: list[SourceCopy],
+    job_id: str = "",
 ) -> WrittenReport:
     """Write the report folder; returns the report path and its source files.
 
@@ -564,7 +600,10 @@ def write_report(
     ]
     if result.confidence:
         lines.append(f'confidence: "{_yaml_escape(result.confidence)}"')
-    lines += [f"sources: {len(result.citations)}", "app: Footnote", "---", ""]
+    lines += [f"sources: {len(result.citations)}"]
+    if job_id:
+        lines.append(f"job: {job_id}")     # so a restart can find its own work
+    lines += ["app: Footnote", "---", ""]
     lines += [f"# {_one_line(question)}", "", result.content, ""]
 
     if result.citations:
@@ -577,7 +616,7 @@ def write_report(
                 # Written as text: the dossier is portable, and the app that
                 # opens it next may follow links without asking.
                 entry = (f"{i}. {_md_label(label)} — not a web link: "
-                         f"`{_one_line(cit.url)}`")
+                         f"{_md_code(cit.url)}")
             if cit.url in saved:
                 entry += f" — [local copy](<sources/{saved[cit.url]}>)"
             lines.append(entry)
@@ -593,11 +632,32 @@ def write_report(
         lines.append("")
 
     if result.reasoning:
-        lines += ["## Method note", "", f"> {result.reasoning}", ""]
+        lines += ["## Method note", "", _md_quote(result.reasoning), ""]
 
     report = folder / f"{slug}.md"
     report.write_text("\n".join(lines), encoding="utf-8")
     return WrittenReport(path=report, source_files=saved)
+
+
+def archived_source_files(report: Path) -> dict:
+    """Map each archived source's URL to its file name, read off the disk.
+
+    Used when a job is recovering: the copies are there, but the record of
+    which citation each belongs to did not survive.
+    """
+    found: dict = {}
+    folder = report.parent / "sources"
+    if not folder.is_dir():
+        return found
+    for path in sorted(folder.glob("*.md")):
+        try:
+            with path.open(encoding="utf-8", errors="replace") as handle:
+                meta, _ = split_front_matter(handle.read(2048))
+        except OSError:
+            continue
+        if meta.get("source"):
+            found[meta["source"]] = path.name
+    return found
 
 
 def split_front_matter(text: str) -> tuple:

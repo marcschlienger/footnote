@@ -61,11 +61,13 @@ queued ──► researching ──► archiving ──► saving ──► done
   safety (below). Footnote long-polls the result endpoint.
 - **archiving** — only entered when a Firecrawl key is configured and the
   result cites sources; scrapes up to `MAX_SOURCES` pages concurrently.
-- **saving** — dossier being written; the path is stored the moment the file
-  exists, so a restart in the next instant finishes the job instead of paying
-  Firecrawl again and writing a second folder. Then the optional Notion
-  mirror, whose failure is logged and never fatal — *any* failure, not only a
-  PipelineError, since the dossier is already on disk by then.
+- **saving** — the dossier is written, then the whole outcome is recorded in
+  one store write: status, summary, citation records, counts, `finished_at`.
+  That write is the job's durable checkpoint. Everything after it — the
+  optional Notion mirror, the push notification — is post-processing that
+  updates `notion_url` at most and cannot leave a job looking unfinished. The
+  mirror's failures are logged and never fatal, *any* failure and not only a
+  PipelineError, because the dossier is already on disk by then.
 - **done / failed** — terminal. Push notifications fire for both. A done
   job also keeps its citation list (URL, title, the file its copy went to,
   and the archiving error if there wasn't one) — capped at
@@ -95,6 +97,23 @@ The one deliberate gap: if the process dies *after* `start_task_run`
 returns but *before* the `run_id` lands in `jobs.json` (a window of
 milliseconds), the run is orphaned on Parallel's side and a duplicate is
 created on resume — accepted as the cheapest correct-enough behavior.
+
+
+**A dossier is adopted, never rewritten.** `report_path` is stored as soon as
+the file exists — before the outcome write — so a restart in that interval
+finds the folder and takes it: the Parallel result is fetched again (the run
+is complete server-side, so this costs nothing), the archived copies are read
+back off the folder to rebuild which citation got which file, and the job
+finishes with real counts, a real summary, Notion and push. It does **not**
+re-scrape, and it does not write a second folder.
+
+What that recovery cannot restore is why a source failed to archive: those
+reasons lived only in the `SourceCopy` list of the run that died, so an
+adopted dossier shows unarchived citations without a reason. The remaining
+window is narrow and honest: a crash between `write_report` returning and the
+`report_path` store write leaves an orphan folder, and the restarted job
+writes its own. The dossier's frontmatter carries `job:` so such an orphan can
+be recognised by hand.
 
 ### Deadlines
 
@@ -264,7 +283,13 @@ point:
 - **Only web links are written as links.** A citation URL whose scheme is not
   http, https or mailto is listed as text in a code span instead: the dossier
   is a portable Markdown file, and the next app to open it may follow a link
-  without asking.
+  without asking. The span is fenced with a backtick run longer than any
+  inside it, so a URL containing backticks cannot close it and continue in
+  Markdown. Only http(s) citations are handed to Firecrawl at all — a
+  `mailto:` is a fine citation and a pointless scrape.
+- **Every line of the method note carries its own `>`**; reasoning arrives as
+  prose and a paragraph break would otherwise drop the rest of it back into
+  the report body, where a `##` becomes a heading.
 - **Escaping** assumes hostile text, because most of it came off the web:
   every frontmatter value (the question, a source URL, a title, the
   confidence) is collapsed to one line and quoted (a question typed
@@ -368,6 +393,9 @@ Behavior notes:
   they are files to save, not pages to read. Only successful responses are
   stored, so an unauthorized page cannot poison the cache. Push and
   notification-click handlers complete the notification loop.
+- **Deleting a job clears everything cached under it.** A 404 or 410 for any
+  URL beneath `/jobs/{id}/` drops every entry with that prefix, so an offline
+  visit cannot resurrect a deleted dossier one page at a time.
 - **Offline**: the app opens, shows the last job list it saw under a notice
   saying so, and any dossier already read stays readable — report, source
   pages and the source index all come from the cache. What is *not* cached
@@ -403,7 +431,17 @@ optionally hardened one notch.
   names origins explicitly when a browser client of your own needs one.
 - Push is isolated from job outcome: `notify_all` swallows everything, since
   it is called from inside `run_research`'s `try` and a malformed
-  subscription would otherwise rewrite a finished job as failed.
+  subscription would otherwise rewrite a finished job as failed. Devices are
+  notified `PUSH_CONCURRENCY` at a time, so one unreachable endpoint does not
+  hold up the rest; subscriptions are checked when registered, and any stored
+  before that check are dropped at startup rather than failing once per job
+  forever.
+- The token cookie is marked `Secure` when the request arrived over TLS, and
+  not when it did not — setting it unconditionally would stop the cookie
+  being sent at all on a plain-HTTP LAN.
+- A state file that is not valid JSON is renamed aside rather than silently
+  treated as empty, so the history can be looked at instead of being
+  overwritten by the next save.
 - **Response headers back the sanitizer up.** Every response carries a CSP
   (`script-src 'self'`, `connect-src 'self'`, `frame-ancestors 'none'`,
   `base-uri 'none'`), `X-Content-Type-Options: nosniff` and

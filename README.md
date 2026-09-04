@@ -58,7 +58,9 @@ design decisions are documented in [description.md](description.md).
 Jobs are persistent: state lives in `data/jobs.json`, and because the
 research run executes on Parallel's side, a Footnote restart doesn't lose
 work — on boot it re-attaches to every unfinished run by its `run_id` and
-carries on.
+carries on. A dossier that was already written is adopted rather than
+repeated, so a restart mid-save costs neither Firecrawl credits nor a
+duplicate folder.
 
 ## Research depth: processors
 
