@@ -3,7 +3,9 @@
 # Licensed under the GNU AGPL v3.0 or later; see the LICENSE file for details.
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-cd "$(dirname "$0")"
+# Everything below is relative to the app directory; carrying on from the
+# caller's would rotate an unrelated log and exec an unrelated venv.
+cd "$(dirname "$0")" || exit 1
 
 # Rotate the log if it has grown past ~5 MB — keep only the last 1000 lines.
 LOG="$(pwd)/server.log"

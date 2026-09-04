@@ -34,6 +34,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -75,9 +76,35 @@ _SCHEME = re.compile(r"^([a-zA-Z][a-zA-Z0-9+.-]*):")
 
 
 def is_http_url(url: str) -> bool:
-    """Fetchable over the web — a stricter test than is_safe_url's link policy."""
-    match = _SCHEME.match(re.sub(r"[\x00-\x20]", "", str(url or "")))
-    return match is not None and match.group(1).lower() in ("http", "https")
+    """Fetchable over the web — a stricter test than is_safe_url's link policy.
+
+    A host is required: "https:" satisfies a scheme check and is not an
+    address, and such a value would otherwise be stored and retried forever
+    as a push endpoint.
+    """
+    cleaned = re.sub(r"[\x00-\x20]", "", str(url or ""))
+    match = _SCHEME.match(cleaned)
+    if match is None or match.group(1).lower() not in ("http", "https"):
+        return False
+    try:
+        return bool(urlsplit(cleaned).netloc)
+    except ValueError:
+        return False
+
+
+def _text(value, fallback: str = "") -> str:
+    """A provider field that has to be a string, whatever arrived.
+
+    Everything here crossed a network from someone else's JSON. A title that
+    is a list reaches slug_for and takes the whole dossier down with a
+    TypeError from unicodedata.normalize, long after the scrape it came from
+    was recorded as a success.
+    """
+    if isinstance(value, str):
+        return value
+    if value is None or isinstance(value, (dict, list, tuple, set)):
+        return fallback
+    return str(value)
 
 
 def scrapable(citations: list, max_sources: int) -> list:
@@ -195,47 +222,71 @@ async def fetch_task_result(
             continue
         if resp.status_code == 408:   # still running
             continue
+        if resp.status_code in RETRYABLE_STATUS:
+            # The run is finished and paid for; a rate limit or a bad gateway
+            # in front of the result is no reason to throw it away. The
+            # deadline above still bounds this.
+            await asyncio.sleep(_retry_after(resp, RESULT_RETRY_S))
+            continue
         if resp.status_code != 200:
             raise PipelineError(
                 f"Parallel run {run_id} failed ({resp.status_code}): "
                 f"{_err_detail(resp)}"
             )
-        return _parse_task_result(resp.json(), run_id)
+        try:
+            payload = resp.json()
+        except ValueError:
+            payload = None
+        if not isinstance(payload, dict):
+            await asyncio.sleep(RESULT_RETRY_S)   # a broken hop, not an answer
+            continue
+        return _parse_task_result(payload, run_id)
 
 
 def _parse_task_result(data: dict, run_id: str) -> ResearchResult:
-    status = (data.get("run") or {}).get("status", "completed")
+    run = data.get("run")
+    run = run if isinstance(run, dict) else {}
+    status = _text(run.get("status"), fallback="completed") or "completed"
     if status != "completed":
-        err = ((data.get("run") or {}).get("error") or {}).get("message", status)
+        error = run.get("error")
+        err = _text((error if isinstance(error, dict) else {}).get("message"),
+                    fallback=status)
         raise PipelineError(f"Parallel run {run_id} ended as {status}: {err}")
 
-    output = data.get("output") or {}
+    output = data.get("output")
+    output = output if isinstance(output, dict) else {}
     content = output.get("content", "")
     if isinstance(content, dict):     # json output type — flatten to text
         content = "\n\n".join(f"## {k}\n\n{v}" for k, v in content.items())
-    if not str(content).strip():
+    content = _text(content)
+    if not content.strip():
         raise PipelineError(f"Parallel run {run_id} returned an empty report")
 
     citations: list[Citation] = []
     seen: set[str] = set()
     confidence = reasoning = ""
     for basis in output.get("basis") or []:
-        confidence = confidence or (basis.get("confidence") or "")
-        reasoning = reasoning or (basis.get("reasoning") or "")
+        if not isinstance(basis, dict):
+            continue
+        confidence = confidence or _text(basis.get("confidence"))
+        reasoning = reasoning or _text(basis.get("reasoning"))
         for cit in basis.get("citations") or []:
-            url = (cit.get("url") or "").strip()
+            if not isinstance(cit, dict):
+                continue
+            url = _text(cit.get("url")).strip()
             if not url or url in seen:
                 continue
             seen.add(url)
             citations.append(
                 Citation(
                     url=url,
-                    title=(cit.get("title") or "").strip(),
-                    excerpts=[e for e in (cit.get("excerpts") or []) if e],
+                    title=_text(cit.get("title")).strip(),
+                    excerpts=[_text(e) for e in (cit.get("excerpts") or [])
+                              if _text(e)],
                 )
             )
     return ResearchResult(
-        content=str(content).strip(),
+        content=content.strip(),
         citations=citations,
         confidence=confidence,
         reasoning=reasoning.strip(),
@@ -266,6 +317,7 @@ RETRYABLE_STATUS = frozenset({408, 429, 500, 502, 503, 504})
 MAX_ATTEMPTS = 3
 BASE_BACKOFF_S = 2.0
 MAX_BACKOFF_S = 120.0
+RESULT_RETRY_S = 5.0         # between attempts at a finished run's result
 OUT_OF_CREDITS = "Firecrawl credits exhausted (HTTP 402)"
 # How long a 402 speaks for the whole key. Long enough that the jobs behind
 # it don't each rediscover the same wall, short enough that a top-up or the
@@ -465,18 +517,19 @@ async def _scrape_one(
             data = resp.json() if resp.content else {}
         except ValueError:      # an HTML 502 from a proxy, say — not our JSON
             data, malformed = {}, True
-        if not isinstance(data, dict):
-            # Valid JSON, wrong shape — a list or a bare null. Same fault as
-            # unparseable text, and it must take the same retry path rather
-            # than an AttributeError from the first .get().
+        if not isinstance(data, dict) or (
+                "data" in data and not isinstance(data["data"], dict)):
+            # Valid JSON, wrong shape — a list, a bare null, or a "data" that
+            # is not an object. Same fault as unparseable text, and it takes
+            # the same retry path rather than an AttributeError from the first
+            # .get() or a misleading "empty extraction".
             data, malformed = {}, True
         if resp.status_code == 200 and data.get("success", False):
-            page = data.get("data")
-            page = page if isinstance(page, dict) else {}
-            md = page.get("markdown") or ""
+            page = data.get("data") or {}
+            md = _text(page.get("markdown"))
             metadata = page.get("metadata")
-            title = (metadata if isinstance(metadata, dict) else {}).get(
-                "title") or cit.title
+            title = _text((metadata if isinstance(metadata, dict) else {}).get(
+                "title"), fallback=cit.title)
             if not md.strip():
                 return SourceCopy(cit.url, title, "", False, "empty extraction")
             return SourceCopy(cit.url, title or cit.url, md, True)
@@ -667,14 +720,44 @@ def archived_source_files(report: Path) -> dict:
     if not folder.is_dir():
         return found
     for path in sorted(folder.glob("*.md")):
+        # Same boundary the read endpoint applies: a link out of the folder
+        # is not an archived source, and must not be credited to a citation.
+        if not path.is_file() or not _inside(path, report.parent):
+            continue
         try:
-            with path.open(encoding="utf-8", errors="replace") as handle:
-                meta, _ = split_front_matter(handle.read(2048))
+            meta, _ = split_front_matter(_read_front_matter(path))
         except OSError:
             continue
         if meta.get("source"):
             found[meta["source"]] = path.name
     return found
+
+
+def _inside(path: Path, folder: Path) -> bool:
+    try:
+        path.resolve().relative_to(folder.resolve())
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _read_front_matter(path: Path, cap: int = 64 * 1024) -> str:
+    """Read as far as the closing delimiter rather than a fixed guess.
+
+    A long source URL or title can push the block past any fixed prefix; the
+    cap is only there so a file without a closing delimiter cannot be read
+    whole.
+    """
+    chunks: list = []
+    with path.open(encoding="utf-8", errors="replace") as handle:
+        while sum(len(c) for c in chunks) < cap:
+            chunk = handle.read(4096)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            if "\n---" in "".join(chunks)[3:]:
+                break
+    return "".join(chunks)
 
 
 def split_front_matter(text: str) -> tuple:

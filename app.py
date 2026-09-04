@@ -167,7 +167,8 @@ class JsonStore:
             # Starting empty would silently drop the history; the file is kept
             # under a new name so it can be looked at, since the next save
             # would otherwise overwrite the evidence.
-            spoiled = path.with_suffix(f".corrupt-{int(time.time())}.json")
+            spoiled = path.with_suffix(
+                f".corrupt-{int(time.time())}-{uuid.uuid4().hex[:6]}.json")
             try:
                 path.rename(spoiled)
                 print(f"{path.name} is not valid JSON ({exc}); kept as "
@@ -186,6 +187,39 @@ class JsonStore:
 
 jobs = JsonStore(DATA_DIR / "jobs.json")
 subs = JsonStore(DATA_DIR / "subscriptions.json")
+
+_JOB_TEXT_FIELDS = ("id", "question", "processor", "status", "created_at",
+                    "progress", "error", "report_path", "notion_url")
+
+
+def _normalize_jobs() -> None:
+    """Make every stored record usable, or terminal.
+
+    A record is read by the orchestrator, the poll endpoint, the trimmer and
+    the deleter, all of which assumed fields that a hand-edited or truncated
+    file need not have. An active job missing its question cannot be resumed
+    at all — the alternative to failing it here is a task that dies on a
+    KeyError while the record says "researching" for ever.
+    """
+    changed = False
+    for job_id, job in list(jobs.data.items()):
+        for field in _JOB_TEXT_FIELDS:
+            if field in job and not isinstance(job[field], str):
+                job[field] = str(job[field])      # sorting compares strings
+                changed = True
+        job.setdefault("id", job_id)
+        if not job.get("status"):
+            job["status"] = "failed"
+            changed = True
+        if job["status"] in ACTIVE_STATUSES and not (job.get("question")
+                                                     and job.get("processor")):
+            job.update(status="failed", finished_at=_now(),
+                       error="Incomplete job record; cannot be resumed",
+                       progress="Failed: incomplete job record")
+            changed = True
+    if changed:
+        jobs.save()
+        print("job history repaired on load", flush=True)
 
 
 def _valid_subscription(sub) -> bool:
@@ -222,7 +256,8 @@ def _trim_jobs() -> None:
     running job among the oldest is skipped, and the next finished one has to
     take its place or the cap is not a cap.
     """
-    by_age = sorted(jobs.data.items(), key=lambda kv: kv[1].get("created_at", ""))
+    by_age = sorted(jobs.data.items(),
+                    key=lambda kv: str(kv[1].get("created_at", "")))
     for job_id, job in by_age:
         if len(jobs.data) <= MAX_JOBS_KEPT:
             return
@@ -312,12 +347,21 @@ async def run_research(job_id: str) -> None:
         return
     if job.get("status") == "done":
         return
+    # Normalization at load should have caught this; checked again because the
+    # cost of being wrong is a task that dies here while the record says
+    # "researching" for ever.
+    question, processor = job.get("question"), job.get("processor")
+    if not (question and processor):
+        _update_job(job_id, status="failed", finished_at=_now(),
+                    error="Incomplete job record; cannot be resumed",
+                    progress="Failed: incomplete job record")
+        return
     client: httpx.AsyncClient = app.state.client
-    question, processor = job["question"], job["processor"]
     # A dossier already on disk from an interrupted run: the research is paid
-    # for and filed, so it is adopted rather than repeated.
-    resumed = Path(job.get("report_path") or "")
-    resumed = resumed if job.get("report_path") and resumed.exists() else None
+    # for and filed, so it is adopted rather than repeated. The same test the
+    # endpoints apply — adopting something they would refuse to serve would
+    # mark a job done whose every report URL then answers 404.
+    resumed = _servable_report(job.get("report_path") or "")
     try:
         # 1. Deep research on Parallel (created once; resumable by run_id)
         _update_job(job_id, status="researching",
@@ -344,9 +388,9 @@ async def run_research(job_id: str) -> None:
             archived = len(written.source_files)
             print(f"[{job_id}] adopting the dossier written before the restart",
                   flush=True)
-        elif FIRECRAWL_API_KEY and MAX_SOURCES > 0 and pipeline.scrapable(
-                result.citations, MAX_SOURCES):
-            n = len(pipeline.scrapable(result.citations, MAX_SOURCES))
+        elif FIRECRAWL_API_KEY and MAX_SOURCES > 0 and _to_archive(result):
+            todo = _to_archive(result)
+            n = len(todo)
             _update_job(job_id, status="archiving",
                         progress=f"Archiving {n} cited source{'s' * (n != 1)}…")
 
@@ -356,7 +400,7 @@ async def run_research(job_id: str) -> None:
                 _update_job(job_id, progress=f"Archiving sources… {done}/{total}")
 
             sources = await pipeline.scrape_sources(
-                client, FIRECRAWL_API_KEY, result.citations, MAX_SOURCES,
+                client, FIRECRAWL_API_KEY, todo, len(todo),
                 app.state.limiter, on_progress=archived_so_far)
 
         # 3. Write the dossier into the synced folder
@@ -387,6 +431,11 @@ async def run_research(job_id: str) -> None:
                     citations=_citation_records(result, sources, written))
 
         # 5. Post-processing: an optional mirror, then the notification.
+        # Both are skipped if the job has since been removed — a notification
+        # for a deleted job opens a 404, and a mirror of it would be a page
+        # nothing points at.
+        if job_id not in jobs.data:
+            return
         if NOTION_API_KEY and NOTION_DATABASE_ID:
             try:
                 notion_url = await pipeline.save_to_notion(
@@ -398,9 +447,10 @@ async def run_research(job_id: str) -> None:
                 # rewrite a dossier that is already on disk as failed.
                 print(f"[{job_id}] notion mirror failed: {_scrub(exc)}", flush=True)
 
-        await notify_all("Research complete",
-                         f"“{_ellipsize(question)}” — {summary}",
-                         url=f"/jobs/{job_id}/report")
+        if job_id in jobs.data:
+            await notify_all("Research complete",
+                             f"“{_ellipsize(question)}” — {summary}",
+                             url=f"/jobs/{job_id}/report")
     except PipelineError as exc:
         reason = _scrub(exc)
         _update_job(job_id, status="failed", error=reason,
@@ -412,6 +462,11 @@ async def run_research(job_id: str) -> None:
         _update_job(job_id, status="failed", error=f"Unexpected error: {reason}",
                     progress=f"Failed: {reason}", finished_at=_now())
         await notify_all("Research failed", f"“{_ellipsize(question)}”: {reason}")
+
+
+def _to_archive(result) -> list:
+    """The citations archiving will attempt — the same list it announces."""
+    return pipeline.scrapable(result.citations, MAX_SOURCES)
 
 
 def _citation_records(result, sources: list, written) -> list:
@@ -460,6 +515,9 @@ def _output_dir_writable() -> bool:
 
 def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+_normalize_jobs()
 
 
 def _ellipsize(text: str, n: int = 60) -> str:
@@ -813,7 +871,7 @@ async def list_jobs(limit: int = Query(50, ge=1, le=MAX_JOBS_KEPT)):
     ordered = sorted(jobs.data.values(),
                      key=lambda j: j.get("created_at", ""), reverse=True)
     return {"jobs": [_job_public(j) for j in ordered[:limit]],
-            "active": sum(j["status"] in ACTIVE_STATUSES for j in ordered)}
+            "active": sum(j.get("status") in ACTIVE_STATUSES for j in ordered)}
 
 
 @app.delete("/jobs/{job_id}")
@@ -821,7 +879,7 @@ async def delete_job(job_id: str):
     job = jobs.data.get(job_id)
     if not job:
         raise HTTPException(404, "Job not found")
-    if job["status"] in ACTIVE_STATUSES:
+    if job.get("status") in ACTIVE_STATUSES:
         raise HTTPException(409, "Job is still running")
     del jobs.data[job_id]
     jobs.save()
@@ -841,16 +899,25 @@ def _inside(path: Path, folder: Path) -> bool:
         return False
 
 
+def _servable_report(report_path: str):
+    """The report at this path, if it is one Footnote is willing to hand out.
+
+    A regular file inside the output directory, resolved. The dossier lives
+    in a synced notes folder: the name Footnote recorded can since have
+    become a directory, or a link to anything the service account can read.
+    """
+    if not report_path:
+        return None
+    path = Path(report_path)
+    return path if path.is_file() and _inside(path, OUTPUT_DIR) else None
+
+
 def _report_file(job_id: str) -> Path:
     job = jobs.data.get(job_id)
     if not job:
         raise HTTPException(404, "Job not found")
-    path = Path(job.get("report_path") or "")
-    # A regular file inside the output directory, resolved. The dossier lives
-    # in a synced notes folder: the name Footnote recorded can since have
-    # become a link to anything the service account can read.
-    if (not job.get("report_path") or not path.is_file()
-            or not _inside(path, OUTPUT_DIR)):
+    path = _servable_report(job.get("report_path") or "")
+    if path is None:
         raise HTTPException(404, "No report for this job (yet)")
     return path
 
@@ -1047,7 +1114,7 @@ async def health():
         "push_configured": bool(VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY
                                 and VAPID_CLAIM_EMAIL and webpush is not None),
         "auth_required": bool(FOOTNOTE_TOKEN),
-        "active_jobs": sum(j["status"] in ACTIVE_STATUSES
+        "active_jobs": sum(j.get("status") in ACTIVE_STATUSES
                            for j in jobs.data.values()),
     }
 

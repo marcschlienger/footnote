@@ -131,6 +131,24 @@ connectivity.
 
 ---
 
+### Nothing arrives trusted
+
+Both providers' payloads cross a network as someone else's JSON, and the
+places that hurt are not the obvious ones. A title that comes back as a list
+passes every truthiness check, is recorded as a successful scrape, and then
+takes the whole dossier down inside `unicodedata.normalize` — long after the
+step that produced it. So every scalar is coerced where it enters (`_text`),
+every container is type-checked before it is indexed, and a response whose
+shape is wrong — a list where an object belongs, a `data` that is not an
+object — is treated exactly like a body that would not parse: named as
+unreadable and retried, rather than becoming a misleading "empty extraction"
+or an `AttributeError` from the first `.get()`.
+
+The result endpoint gets the same treatment for a different reason. The run
+behind it is finished and paid for, so a 429 or a bad gateway *in front of*
+the result is not a reason to throw it away: those are retried inside the
+existing deadline instead of failing the job.
+
 ## External API contracts
 
 Verified against the providers' documentation in August 2026. These are
@@ -440,7 +458,9 @@ optionally hardened one notch.
   against `/`, `\` and leading dots).
 - **One containment rule, applied everywhere.** The report and every source
   copy must be a regular file that resolves inside `OUTPUT_DIR`, checked when
-  serving, when zipping, and when listing. The dossier lives in a synced
+  serving, when zipping, when listing — and when a restart decides whether to
+  adopt a dossier, since adopting something the endpoints would refuse marks
+  a job done whose every report URL then answers 404. The dossier lives in a synced
   notes folder that people and sync clients write to, so a name Footnote
   recorded can since have become a link to anything the service account can
   read; the index lists only what the read endpoint would actually serve, so
@@ -469,10 +489,14 @@ optionally hardened one notch.
   not when it did not — setting it unconditionally would stop the cookie
   being sent at all on a plain-HTTP LAN.
 - A state file that is not valid JSON — or valid JSON that is not an object
-  of records — is renamed aside rather than silently treated as empty, so the
-  history can be looked at instead of being overwritten by the next save. A
-  single damaged record is dropped with a note instead of costing the rest of
-  the history.
+  of records — is renamed aside (under a name that cannot collide) rather
+  than silently treated as empty, so the history can be looked at instead of
+  being overwritten by the next save. A single damaged record is dropped with
+  a note instead of costing the rest of the history, and what survives is
+  normalized on load: fields that must be strings are coerced so sorting
+  cannot mix types, and an *active* record with no question is failed rather
+  than left to a task that dies on it while the record says "researching" for
+  ever.
 - **Response headers back the sanitizer up.** Every response carries a CSP
   (`script-src 'self'`, `connect-src 'self'`, `frame-ancestors 'none'`,
   `base-uri 'none'`), `X-Content-Type-Options: nosniff` and

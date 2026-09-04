@@ -999,6 +999,211 @@ def test_a_symlink_out_of_the_dossier_is_not_served(client, tmp_path):
         assert not any("sneaky" in n for n in z.namelist())
 
 
+def test_an_unusable_job_record_does_not_stay_running(monkeypatch):
+    """A record the orchestrator cannot read must not sit as 'researching'."""
+    app_module.jobs.data.clear()
+    monkeypatch.setattr(app_module.jobs, "save", lambda: None)
+    app_module.jobs.data.update({
+        "noq": {"id": "noq", "status": "researching",      # no question
+                "created_at": "2026-01-01T00:00:00Z"},
+        "nostatus": {"id": "nostatus", "question": "q", "processor": "core",
+                     "created_at": "2026-01-01T00:00:01Z"},
+        "numeric": {"id": "numeric", "question": "q", "processor": "core",
+                    "status": "done", "created_at": 20260101},
+    })
+    app_module._normalize_jobs()
+
+    assert app_module.jobs.data["noq"]["status"] == "failed"
+    assert "cannot be resumed" in app_module.jobs.data["noq"]["error"]
+    assert app_module.jobs.data["nostatus"]["status"] == "failed"
+    assert app_module.jobs.data["numeric"]["created_at"] == "20260101"
+    app_module._trim_jobs()                       # sorting no longer mixes types
+
+    # And the orchestrator refuses such a record directly, not only via load.
+    app_module.jobs.data["raw"] = {"id": "raw", "status": "researching",
+                                   "created_at": "2026-01-01T00:00:00Z"}
+    asyncio.run(app_module.run_research("raw"))
+    assert app_module.jobs.data["raw"]["status"] == "failed"
+    app_module.jobs.data.clear()
+
+
+def test_a_repaired_history_still_serves(client, monkeypatch):
+    monkeypatch.setattr(app_module.jobs, "save", lambda: None)
+    app_module.jobs.data["broken"] = {"id": "broken", "question": "q",
+                                      "created_at": "2026-01-01T00:00:00Z"}
+    app_module._normalize_jobs()
+    listing = client.get("/jobs")
+    assert listing.status_code == 200
+    assert listing.json()["active"] == 0
+    assert client.get("/health").status_code == 200
+    assert client.delete("/jobs/broken").status_code == 200
+
+
+def test_recovery_refuses_a_report_it_could_not_serve(client, tmp_path,
+                                                      monkeypatch):
+    """Adopting an unservable path would mark a job done that answers 404."""
+    out = tmp_path / "out"
+    out.mkdir()
+    monkeypatch.setattr(app_module, "OUTPUT_DIR", out)
+    outside = tmp_path / "elsewhere.md"
+    outside.write_text("not in the output directory")
+    folder = out / "2026-01-01 q"
+    folder.mkdir()
+    link = folder / "report.md"
+    try:
+        link.symlink_to(outside)
+    except OSError:
+        pytest.skip("symlinks unavailable")
+
+    assert app_module._servable_report(str(link)) is None
+    assert app_module._servable_report(str(folder)) is None      # a directory
+    real = folder / "real.md"
+    real.write_text("# real")
+    assert app_module._servable_report(str(real)) == real
+
+
+def test_recovery_ignores_source_links_out_of_the_folder(tmp_path):
+    written = pipeline.write_report(
+        tmp_path, "Recovery question", "core", _sample_result(),
+        [SourceCopy("https://a.test/1", "Paper A", "# A", True)])
+    outside = tmp_path / "outside.md"
+    outside.write_text('---\nsource: "https://evil.test/x"\n---\n\nbody\n')
+    try:
+        (written.path.parent / "sources" / "09 escape.md").symlink_to(outside)
+    except OSError:
+        pytest.skip("symlinks unavailable")
+    found = pipeline.archived_source_files(written.path)
+    assert found == {"https://a.test/1": "01 Paper A.md"}
+
+
+def test_a_long_frontmatter_block_is_still_read(tmp_path):
+    """The block is read to its delimiter, not to a fixed guess."""
+    long_url = "https://a.test/" + "x" * 4000
+    written = pipeline.write_report(
+        tmp_path, "Long url question", "core",
+        ResearchResult("b", [Citation(long_url, "Long")], "", ""),
+        [SourceCopy(long_url, "Long", "# body", True)])
+    assert pipeline.archived_source_files(written.path) == {
+        long_url: "01 Long.md"}
+
+
+def test_provider_scalars_are_coerced(monkeypatch):
+    """A title that is a list must not reach slug_for."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"success": True, "data": {
+            "markdown": "# body", "metadata": {"title": ["a", "list"]}}})
+
+    copy, = _run_scrape(handler, 1)
+    assert copy.ok and isinstance(copy.title, str)
+    assert copy.title == "https://s.test/0"        # fell back to the citation
+
+
+def test_a_hostile_provider_payload_cannot_fail_the_dossier(tmp_path):
+    """Whatever arrives, write_report gets strings."""
+    payload = {
+        "run": {"status": "completed"},
+        "output": {"content": "The answer.", "basis": [
+            {"confidence": ["high"], "reasoning": {"a": 1}, "citations": [
+                {"url": "https://a.test/1", "title": ["listy"],
+                 "excerpts": [None, "kept"]},
+                "not a citation at all",
+            ]},
+            "not a basis either",
+        ]},
+    }
+    result = pipeline._parse_task_result(payload, "trun_x")
+    assert result.confidence == "" and result.reasoning == ""
+    assert [c.title for c in result.citations] == [""]
+    assert result.citations[0].excerpts == ["kept"]
+    written = pipeline.write_report(tmp_path, "Hostile payload", "core",
+                                    result, [])
+    assert written.path.exists()
+
+
+def test_data_of_the_wrong_shape_is_retried_like_any_broken_body(monkeypatch):
+    monkeypatch.setattr(pipeline, "BASE_BACKOFF_S", 0.01)
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(200, json={"success": True, "data": []})
+
+    copy, = _run_scrape(handler, 1)
+    assert calls["n"] == pipeline.MAX_ATTEMPTS      # not "empty extraction"
+    assert copy.error == "HTTP 200 with an unreadable body"
+
+
+def test_a_finished_parallel_run_survives_a_bad_gateway(monkeypatch):
+    """The run is paid for; a 502 in front of the result is not a failure."""
+    monkeypatch.setattr(pipeline, "RESULT_RETRY_S", 0.01)
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(502, text="<html>bad gateway</html>")
+        if calls["n"] == 2:
+            return httpx.Response(429, headers={"Retry-After": "0"})
+        if calls["n"] == 3:
+            return httpx.Response(200, text="not json at all")
+        return httpx.Response(200, json=_result_payload("done"))
+
+    async def run():
+        async with httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)) as client:
+            return await pipeline.fetch_task_result(client, "k", "trun_x", 60)
+
+    res = asyncio.run(run())
+    assert res.content == "done" and calls["n"] == 4
+
+
+def test_a_push_endpoint_needs_a_host():
+    assert not pipeline.is_http_url("https:")
+    assert not pipeline.is_http_url("http://")
+    assert pipeline.is_http_url("https://push.test/x")
+    assert not app_module._valid_subscription(
+        {"endpoint": "https:", "keys": {"p256dh": "a", "auth": "b"}})
+
+
+def test_post_processing_stops_when_the_job_is_deleted(client, tmp_path,
+                                                       monkeypatch):
+    """A notification for a deleted job would open a 404."""
+    monkeypatch.setattr(app_module, "OUTPUT_DIR", tmp_path)
+    monkeypatch.setattr(app_module, "NOTION_API_KEY", "n")
+    monkeypatch.setattr(app_module, "NOTION_DATABASE_ID", "d")
+    called = {"notion": 0, "push": 0}
+
+    async def note_notion(*a, **kw):
+        called["notion"] += 1
+        return "https://notion.test/p"
+
+    async def note_push(*a, **kw):
+        called["push"] += 1
+
+    monkeypatch.setattr(pipeline, "save_to_notion", note_notion)
+    monkeypatch.setattr(app_module, "notify_all", note_push)
+    monkeypatch.setattr(pipeline, "fetch_task_result",
+                        lambda *a, **kw: _immediately(_sample_result()))
+
+    written = pipeline.write_report(tmp_path, "Deleted question", "core",
+                                    _sample_result(), [], job_id="del1")
+    app_module.jobs.data["del1"] = {
+        "id": "del1", "question": "Deleted question", "processor": "core",
+        "status": "saving", "created_at": "2026-01-01T00:00:00Z",
+        "run_id": "trun_x", "report_path": str(written.path)}
+
+    original_update = app_module._update_job
+
+    def delete_once_done(job_id, **fields):
+        original_update(job_id, **fields)
+        if fields.get("status") == "done":
+            app_module.jobs.data.pop(job_id, None)   # the user hit "remove"
+
+    monkeypatch.setattr(app_module, "_update_job", delete_once_done)
+    asyncio.run(app_module.run_research("del1"))
+    assert called == {"notion": 0, "push": 0}
+
+
 def test_a_symlinked_report_is_not_served(client, tmp_path):
     """The report is inside the same boundary as the sources beside it."""
     secret = tmp_path / "secret.txt"

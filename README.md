@@ -504,6 +504,10 @@ Tailscale, WireGuard) and/or use the per-instance `FOOTNOTE_TOKEN`.
 
 ## Limitations & roadmap
 
+- **Post-processing is not resumed.** A crash after a job is marked done
+  leaves the dossier complete but skips the Notion copy and the notification
+  permanently; deleting a job that has just finished suppresses both for the
+  same reason.
 - **Answer quality is Parallel's** — Footnote orchestrates and files; it
   doesn't verify claims itself. The dossier's excerpts and archived copies
   exist precisely so *you* can. Confidence ratings come from Parallel and
