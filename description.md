@@ -539,13 +539,36 @@ Behavior notes:
   source pages carry `static/document.js`, which upgrades their own download
   links to the same behaviour and leaves them ordinary links when scripting
   is unavailable.
-- **One way in per thing.** A finished job offers `Report` (the standalone
-  page), `Read` (here), `Sources (n)` and `Everything (.zip)`. Reading and
-  the file were once separate controls sitting side by side — "read here" and
-  ".md" — which asked the reader to choose between two spellings of the same
-  document before seeing either. The file is not a third destination; it is
-  something you do with what is open, so Copy text, Save .md and, on a source,
-  `Open as page ↗` live in a row at the top of the panel.
+- **One way in per thing.** A finished job offers `Read`, `Sources (n)` and
+  `Everything (.zip)`, and a source's title opens that source. Reading, the
+  file and the standalone page were once three controls side by side — "read
+  here", ".md" and "Report" — which asked the reader to choose between three
+  spellings of one document before seeing any of them. Only the first is a
+  destination; the rest are things you do with what is open, so `Copy text`,
+  `Save .md` and `Open as page ↗` live in a row at the top of the panel. The
+  card and a source row now behave identically, which they did not while the
+  dossier had a second control and a source did not.
+- **Reading in place is not narrower than the page.** Inside the card's
+  padding the measure was 276px against the standalone page's 337 on a 375px
+  screen — about eight characters a line, and most of why the page "read
+  better". Both readers now break out of the padding they sit in (a source
+  out of the list's indent as well) for a 323px measure, and lose the rounded
+  border and left rule that said "this is nested inside something" — which is
+  the impression that made two controls feel like two documents.
+- **A job is labelled with the depth that was asked for.** The picker offers
+  "Quick look", "Standard", "Deep"; the card printed the processor id, so a
+  job asked for as "Exhaustive" came back "ultra". The picker's own options
+  are where those names are written down, so they are what answers. The API
+  takes eighteen processors to the picker's five, but the other thirteen are
+  those same depths with a multiplier or the fast variant and are said in the
+  same words — `ultra4x-fast` is "Heroic (fast)", `core2x` is "Standard ×2".
+  `lite` is below the shallowest depth on offer, so it has no name to borrow
+  and keeps its own, as does anything unrecognised. The processor id stays as
+  the `title`.
+- **A job carries a date.** The list is read weeks later, and a bare "11:12"
+  answers a question nobody was asking. `toLocaleString` with month, day and
+  time — one call rather than two glued together, so the order is the
+  reader's — and the year as well once it is not this one.
 - **Two panels, two independent switches.** "Read" and "Sources" open and
   close separately, and both are remembered by what they show, so a poll
   rebuilding the list closes neither and refetches nothing.

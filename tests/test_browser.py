@@ -200,6 +200,122 @@ def test_every_open_panel_survives_a_poll(page, server):
 
 
 # ---------------------------------------------------------------------------
+# Saying the same thing in both directions
+# ---------------------------------------------------------------------------
+
+def test_a_job_is_labelled_with_the_depth_that_was_asked_for(page, server):
+    """The picker offers "Quick look", "Standard", "Deep"; the card printed
+    the processor id, so a job asked for as "Exhaustive" came back "ultra"."""
+    _card_ready(page, server)
+    offered = page.eval_on_selector_all(
+        "#processor option",
+        "opts => opts.map((o) => o.textContent.split('\u00b7')[0].trim())")
+    shown = page.eval_on_selector_all(
+        ".job .meta > .depth", "spans => spans.map((s) => "
+        "({label: s.textContent, id: s.title}))")
+    assert shown, "no job on the page to check"
+    for entry in shown:
+        assert entry["label"] in offered, entry
+        assert entry["label"] != entry["id"]      # not the raw processor id
+
+
+def test_every_processor_the_api_takes_is_said_in_the_pickers_words(page, server):
+    """The picker offers five of the eighteen the API accepts, and the other
+    thirteen are those same depths with a multiplier or the fast variant. A
+    job started with curl should not be the one card labelled "ultra2x"."""
+    _card_ready(page, server)
+    processors = page.evaluate(
+        "() => fetch('/processors').then((r) => r.json())")["processors"]
+    labels = page.evaluate(
+        "(list) => Object.fromEntries(list.map((p) => [p, depthLabel(p)]))",
+        processors)
+    # "lite" is below the shallowest depth the picker offers, so it has no
+    # name to borrow and keeps its own. Everything else has one.
+    unlabelled = sorted(p for p, label in labels.items() if label == p)
+    assert unlabelled == ["lite", "lite-fast"], unlabelled
+    assert labels["ultra4x"] == "Heroic"
+    assert labels["ultra4x-fast"] == "Heroic (fast)"    # not "Exhaustive ×4"
+    assert labels["core2x"] == "Standard ×2"
+
+
+def test_a_job_carries_a_date_and_not_only_a_clock(page, server):
+    """A dossier is read weeks later, and "11:12" answers a question nobody
+    was asking."""
+    import re as regex
+    _card_ready(page, server)
+    stamps = page.eval_on_selector_all(
+        ".job .meta > .when", "spans => spans.map((s) => s.textContent)")
+    assert stamps, "no timestamp on the card at all"
+    for stamp in stamps:
+        assert regex.search(r"\d{1,2}[:.]\d{2}", stamp), stamp
+        # A month name or a numeric date beside the clock, whatever the locale.
+        assert regex.search(r"[A-Za-z]{3}|\d{1,2}[./-]\d{1,2}", stamp), stamp
+
+
+def test_one_control_opens_the_dossier(page, server):
+    """"Report" and "Read" were two controls onto one document, which reads
+    as two documents. The page is a thing you can do with what is open, like
+    the file — and like a source, whose title has always worked this way."""
+    _card_ready(page, server)
+    labels = page.eval_on_selector_all(
+        ".job .links a, .job .links button",
+        "els => els.map((e) => e.textContent)")
+    assert labels == ["Read", "Sources (2)", "Everything (.zip)"], labels
+
+    page.get_by_role("button", name="Read").click()
+    page.wait_for_selector(".job > .src-body .src-content")
+    inside = page.eval_on_selector_all(
+        ".job > .src-body .src-actions a, .job > .src-body .src-actions button",
+        "els => els.map((e) => e.textContent)")
+    assert "Open as page ↗" in inside, inside
+
+
+def test_reading_in_place_is_not_narrower_than_the_page(page, server):
+    """The measure inside the card was 276px against the standalone page's
+    337 on a 375px screen — eight characters a line, which is most of why
+    the page "reads better" and why two controls felt like two documents."""
+    page.goto(f"{server}/jobs/{JOB_ID}/report")
+    page.wait_for_selector(".report-body")
+    on_the_page = page.evaluate(
+        """() => [...document.querySelectorAll('.report-body p')]
+                 .filter((p) => !p.className)[0].getBoundingClientRect().width""")
+
+    _card_ready(page, server)
+    page.get_by_role("button", name="Read").click()
+    page.wait_for_selector(".job > .src-body .src-content p")
+    in_the_card = page.evaluate(
+        """() => document.querySelector('.job > .src-body .src-content p')
+                 .getBoundingClientRect().width""")
+    assert on_the_page - in_the_card < 25, (on_the_page, in_the_card)
+
+    # And a source, which sits one level deeper again, inside the list indent.
+    page.get_by_role("button", name="Sources").click()
+    page.locator(".sources ol li button.src-title").first.click()
+    page.wait_for_selector(".sources li > .src-body .src-content p")
+    in_a_source = page.evaluate(
+        """() => document.querySelector(
+                   '.sources li > .src-body .src-content p')
+                 .getBoundingClientRect().width""")
+    assert on_the_page - in_a_source < 25, (on_the_page, in_a_source)
+
+
+def test_the_header_icon_lines_up_with_the_heading(page, server):
+    """Centred against the whole two-line block, it sat beside the gap
+    between the title and the tagline and lined up with neither."""
+    _card_ready(page, server)
+    boxes = page.evaluate(
+        """() => {
+             const box = (sel) => {
+               const r = document.querySelector(sel).getBoundingClientRect();
+               return {top: r.top, height: r.height};
+             };
+             return {icon: box('header img'), title: box('header h1')};
+           }""")
+    assert abs(boxes["icon"]["top"] - boxes["title"]["top"]) <= 2, boxes
+    assert abs(boxes["icon"]["height"] - boxes["title"]["height"]) <= 2, boxes
+
+
+# ---------------------------------------------------------------------------
 # Taking a file away without leaving the page
 # ---------------------------------------------------------------------------
 

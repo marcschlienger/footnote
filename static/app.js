@@ -154,8 +154,14 @@ function renderJob(job) {
   badge.textContent = job.status;
   meta.appendChild(badge);
 
-  meta.appendChild(text("span", job.processor));
-  meta.appendChild(text("span", when(job.created_at)));
+  if (job.processor) {
+    const depth = text("span", depthLabel(job.processor));
+    depth.className = "depth";
+    depth.title = job.processor;        // the name the API uses, on hover
+    meta.appendChild(depth);
+  }
+  const stamp = when(job.created_at);
+  if (stamp) meta.appendChild(stamp);
 
   if (ACTIVE.has(job.status)) {
     const p = document.createElement("span");
@@ -178,14 +184,15 @@ function renderJob(job) {
       gone.style.color = "var(--rule-red)";
       links.appendChild(gone);
     } else {
-      links.appendChild(link(`/jobs/${job.id}/report`, "Report"));
-      // Reading happens here; the file itself is an action inside the panel,
-      // not a third way of looking at the same dossier.
+      // One way in, as with a source: the title of the thing opens it here,
+      // and the page, the text and the file are things you can then do with
+      // what is open. Two controls onto one dossier read as two documents.
       links.appendChild(reader({
         label: "Read",
         embedUrl: `/jobs/${job.id}/report?embed=1`,
         rawUrl: `/jobs/${job.id}/report.md`,
         filename: job.report_name,
+        pageUrl: `/jobs/${job.id}/report`,
         host: li,
       }));
       links.appendChild(sourcesToggle(job));
@@ -513,6 +520,32 @@ function action(label, run) {
   return button;
 }
 
+// The card used to print the processor id — a job asked for as "Exhaustive"
+// came back labelled "ultra". The picker is where these names are written
+// down, so it is what answers.
+//
+// The API takes eighteen processors and the picker offers five of them, but
+// the other thirteen are those same depths with a multiplier or the fast
+// variant, so they can be said in the same words. A name that fits neither
+// keeps its own, which is the honest answer.
+function depthLabel(processor) {
+  const named = (value) => {
+    const option = [...$("processor").options].find((o) => o.value === value);
+    return option ? option.textContent.split("·")[0].trim() : "";
+  };
+  const exact = named(processor);
+  if (exact) return exact;
+  // The fast variant of a depth the picker does name: ultra4x is "Heroic",
+  // so ultra4x-fast is "Heroic (fast)" rather than "Exhaustive ×4 (fast)".
+  const slower = named(String(processor || "").replace(/-fast$/, ""));
+  if (slower) return `${slower} (fast)`;
+  const parts = /^([a-z]+?)(\d+x)?(-fast)?$/.exec(processor || "");
+  const base = parts && named(parts[1]);
+  if (!base) return processor;
+  return base + (parts[2] ? ` ×${parts[2].slice(0, -1)}` : "")
+              + (parts[3] ? " (fast)" : "");
+}
+
 function size(bytes) {
   if (!bytes) return "";
   return bytes < 1024 ? `${bytes} B` : `${Math.round(bytes / 1024)} KB`;
@@ -697,10 +730,18 @@ function text(tag, content) {
   return el;
 }
 
+// A dossier is worth keeping, and a list of them is read weeks later: "11:12"
+// alone answers a question nobody was asking. toLocaleString rather than two
+// calls glued together, so the order is the reader's, not this file's.
 function when(iso) {
   if (!iso) return "";
   const d = new Date(iso);
-  const days = (Date.now() - d.getTime()) / 86400000;
-  if (days < 1) return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-  return d.toLocaleDateString([], { month: "short", day: "numeric" });
+  if (isNaN(d.getTime())) return "";
+  const parts = { month: "short", day: "numeric",
+                  hour: "2-digit", minute: "2-digit" };
+  if (d.getFullYear() !== new Date().getFullYear()) parts.year = "numeric";
+  const stamp = text("span", d.toLocaleString([], parts));
+  stamp.className = "when";
+  stamp.title = d.toLocaleString();     // seconds and weekday, on hover
+  return stamp;
 }

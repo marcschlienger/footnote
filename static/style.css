@@ -36,11 +36,21 @@ main {
 /* Header ------------------------------------------------------------- */
 header {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: .8rem;
   margin-bottom: 1.4rem;
 }
-header img { border-radius: 10px; }
+/* Centred against the whole two-line block, the icon sat beside the gap
+   between the title and the tagline and lined up with neither. It is sized
+   to the h1's line box and set flush with its top instead, so the two read
+   as one heading. */
+header img {
+  border-radius: 8px;
+  width: 1.87rem;
+  height: 1.87rem;
+  margin-top: .06rem;
+  flex: none;
+}
 h1 {
   margin: 0;
   font: 700 1.7rem/1.1 var(--serif);
@@ -282,6 +292,8 @@ li.job {
 .src-body {
   margin: .6rem 0 .3rem;
   padding: .8rem .9rem;
+  /* see .job > .src-body: on a phone the card's own padding is what makes
+     this read worse than the standalone page */
   background: var(--paper);
   border: 1px solid #E2D8BE;
   border-left: 3px solid var(--pen-blue);
@@ -298,6 +310,25 @@ li.job {
 }
 .src-body h1:first-child, .src-body h2:first-child { margin-top: 0; }
 .src-body p { margin: .6rem 0; }
+
+/* The dossier reader takes the card's whole width. Inside the card's padding
+   the measure was 276px against the standalone page's 337px on a 375px
+   screen — about eight characters a line, which is most of why the page
+   "reads better" than reading in place. The left rule and the rounded corners
+   go with it: they said "this is nested inside something", which is exactly
+   the impression that made two controls feel like two documents. */
+.job > .src-body,
+.sources li > .src-body {
+  padding: .9rem .45rem 1rem;
+  border-radius: 0;
+  border-left: none;
+  border-right: none;
+}
+.job > .src-body { margin-inline: -.9rem; }
+/* A source sits one level deeper, inside the list's own indent. What you are
+   reading should not be narrower for that: the row keeps its number, and the
+   text lines up with the dossier's. */
+.sources li > .src-body { margin-inline: calc(-1.5rem - .9rem) -.9rem; }
 
 .src-foot {
   margin: .8rem 0 0;

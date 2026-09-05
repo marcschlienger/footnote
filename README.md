@@ -516,11 +516,11 @@ Tailscale, WireGuard) and/or use the per-instance `FOOTNOTE_TOKEN`.
 
 - **The PWA** — open `http://YOUR-SERVER:8010/`: ask, pick a depth, watch
   status live, and read finished dossiers without leaving the page. A
-  finished job offers **Report** (the standalone page), **Read** (here),
-  **Sources (n)** and **Everything (.zip)**; in the source list, a title
-  opens that archived page in the card. Inside whatever you are reading sit
-  **Copy text** and **Save .md**, so the file is something you do with the
-  document rather than a second way of opening it. Nothing in the app
+  finished job offers **Read**, **Sources (n)** and **Everything (.zip)**;
+  in the source list, a title opens that archived page in the card. Inside
+  whatever you are reading sit **Copy text**, **Save .md** and **Open as
+  page ↗**, so the file and the standalone page are things you do with the
+  document rather than other ways of opening it. Nothing in the app
   navigates to a file: iOS Safari answers that with a view-or-download sheet
   you cannot get back from. Every standalone page has a link back to the app.
   A dossier
