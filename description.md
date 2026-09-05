@@ -572,6 +572,12 @@ Behavior notes:
   out of the list's indent as well) for a 323px measure, and lose the rounded
   border and left rule that said "this is nested inside something" — which is
   the impression that made two controls feel like two documents.
+- **The depth is said in one voice.** The card labels it from the picker,
+  and so does the flash that confirms a submission — the API answers in
+  processor ids, which is right for curl and the Shortcut and wrong here.
+  The running job's progress line named the processor too, which put "ultra"
+  next to "Exhaustive" in a single row; it does not any more, because the
+  record already carries the field the card is labelling.
 - **A job is labelled with the depth that was asked for.** The picker offers
   "Quick look", "Standard", "Deep"; the card printed the processor id, so a
   job asked for as "Exhaustive" came back "ultra". The picker's own options
@@ -636,9 +642,13 @@ Behavior notes:
   the folder it describes, since a copy can be moved in the notes app while
   the page is open — and falls back to the stale copy when offline. An
   archived entry's title opens the local copy in place; beside it sit the
-  original page and the file's size. An entry that could not be archived says
-  why, and its title is a plain link to the live page, since that is all
-  there is.
+  original page and the file's size. An entry with no local copy says why,
+  and its title is a plain link to the live page, since that is all there is.
+  Two different things produce that state and they are told apart: a page
+  that refused to be archived carries the reason Firecrawl gave, and a copy
+  that was written and has since been moved or deleted in the notes folder
+  says so — "not archived" was the wrong story about the second, and the same
+  story as the first.
 - **The app's own code is never served from a cache without asking.** Static
   files carried only an ETag and a Last-Modified, which leaves a browser free
   to apply heuristic freshness — roughly a tenth of the file's age — and

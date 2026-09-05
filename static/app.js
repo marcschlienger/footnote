@@ -82,14 +82,18 @@ $("ask").addEventListener("submit", async (ev) => {
   const question = $("question").value.trim();
   if (question.length < 8) return;
   $("go").disabled = true;
+  const asked = $("processor").value;   // before an await; the picker can move
   try {
-    const res = await fetchJSON("/research", {
+    await fetchJSON("/research", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ question, processor: $("processor").value }),
+      body: JSON.stringify({ question, processor: asked }),
     });
     $("question").value = "";
-    flash(res.message + " — you can close this page; results land in your notes.");
+    // The server answers in processor ids, which is right for curl and the
+    // Shortcut and wrong here: the picker said "Exhaustive", so does this.
+    flash(`Started: ${depthLabel(asked)}. You can close this page; ` +
+          `results land in your notes.`);
     offerPush();
     refreshJobs();
   } catch (e) {
@@ -212,6 +216,7 @@ function renderJob(job) {
     const del = document.createElement("button");
     del.className = "del";
     del.textContent = "remove";
+    del.title = "Remove this job from the list. The dossier stays in your notes.";
     del.onclick = async () => {
       try {
         await fetchJSON(`/jobs/${job.id}`, { method: "DELETE" });
@@ -347,8 +352,10 @@ function renderSource(src) {
     if (src.url) row.appendChild(link(src.url, "original ↗"));
     row.appendChild(text("span", size(src.bytes)));
   } else {
+    // "no local copy" rather than "not archived": it is true both of a page
+    // that refused to be saved and of a copy that has since left the folder.
     row.appendChild(text("span",
-      src.note ? `not archived — ${src.note}` : "not archived"));
+      src.note ? `no local copy — ${src.note}` : "no local copy"));
   }
   li.appendChild(row);
   return li;

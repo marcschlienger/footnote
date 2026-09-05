@@ -1113,6 +1113,27 @@ def test_sources_index_survives_a_copy_deleted_in_the_notes_folder(client, tmp_p
     assert body["archived"] == 0
     assert body["sources"][0]["read_url"] == ""      # citation, no local copy
     assert client.get("/jobs/abcdefabcdef/sources/01 Paper A.md").status_code == 404
+    # And it says which of the two things happened. A page that refused to be
+    # saved and a copy that has since left the folder both had no local copy
+    # and no explanation, which told the wrong story about one of them.
+    assert body["sources"][0]["note"] == app_module.SOURCE_COPY_GONE
+    assert body["sources"][1]["note"] == "blocked"   # never archived at all
+
+
+def test_a_present_copy_carries_no_explanation(client, tmp_path):
+    """The note is for what went wrong, so nothing goes in it when nothing did."""
+    _finished_job(tmp_path)
+    body = client.get("/jobs/abcdefabcdef/sources").json()
+    assert body["sources"][0]["archived"] and body["sources"][0]["note"] == ""
+
+
+def test_progress_does_not_name_the_processor(client, tmp_path, monkeypatch):
+    """The depth is a field of its own and the card labels it in the picker's
+    words, so naming the processor here put "ultra" next to "Exhaustive"."""
+    source = (Path(__file__).resolve().parent.parent / "app.py").read_text()
+    for match in re.finditer(r"progress=f?\"[^\"]*\"", source):
+        assert "{processor}" not in match.group(0), match.group(0)
+    assert "Researching on Parallel — this can take a while" in source
 
 
 def test_bundle_zip_holds_report_and_sources(client, tmp_path):

@@ -238,6 +238,28 @@ def test_every_processor_the_api_takes_is_said_in_the_pickers_words(page, server
     assert labels["core2x"] == "Standard ×2"
 
 
+def test_starting_a_job_is_confirmed_in_the_pickers_words(page, server):
+    """The API answers in processor ids — right for curl and the Shortcut,
+    wrong here, where the picker had just said "Exhaustive"."""
+    _card_ready(page, server)
+    page.select_option("#processor", "ultra")
+    page.fill("#question", "What is the current evidence on cold exposure?")
+    page.evaluate("""() => document.getElementById('ask')
+                       .dispatchEvent(new Event('submit', {cancelable: true}))""")
+    note = page.wait_for_selector("#flash:not([hidden])")
+    text = note.inner_text()
+    assert "Exhaustive" in text, text
+    assert "ultra" not in text, text
+
+
+def test_removing_a_job_says_what_it_does_not_delete(page, server):
+    """The dossier lives in a notes folder and stays there; "remove" alone
+    reads like it might not."""
+    _card_ready(page, server)
+    title = page.locator(".job .del").first.get_attribute("title")
+    assert title and "notes" in title.lower(), title
+
+
 def test_a_job_carries_a_date_and_not_only_a_clock(page, server):
     """A dossier is read weeks later, and "11:12" answers a question nobody
     was asking."""

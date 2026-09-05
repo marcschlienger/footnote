@@ -687,9 +687,11 @@ async def run_research(job_id: str) -> None:
     resumed = _servable_report(job.get("report_path") or "")
     try:
         # 1. Deep research on Parallel (created once; resumable by run_id)
+        # The depth is a field of its own and the card labels it in the
+        # words the picker used, so naming the processor here put "ultra"
+        # next to "Exhaustive" in one row.
         _update_job(job_id, status="researching",
-                    progress=f"Researching on Parallel ({processor}) — this "
-                             f"can take a while…")
+                    progress="Researching on Parallel — this can take a while…")
         run_id = job.get("run_id")
         if not run_id:
             run_id = await pipeline.start_task_run(
@@ -1415,6 +1417,9 @@ def _head(path: Path) -> str:
     return pipeline.read_front_matter(path)
 
 
+SOURCE_COPY_GONE = "it was archived, but is no longer in the notes folder"
+
+
 def _source_entries(job: dict, folder: Path) -> list:
     """Every source behind a dossier: what was cited, what was archived.
 
@@ -1429,14 +1434,23 @@ def _source_entries(job: dict, folder: Path) -> list:
     # whole index down when its size is asked for.
     files = {f.name: f for f in sorted((folder / "sources").glob("*.md"))
              if f.is_file() and _inside(f, folder)}
+    # A copy that was saved and has since been moved or deleted in the notes
+    # folder is not the same thing as a page that refused to be archived, and
+    # saying "not archived" about both told the wrong story about one of them.
+
     # Records come off a JSON file that can be edited or truncated; one bad
     # entry should cost that entry, not the whole index.
     stored = job.get("citations")
-    listed = [(_str(cit.get("title")), _str(cit.get("url")),
-               _str(cit.get("file")) if _str(cit.get("file")) in files else "",
-               _str(cit.get("note")))
-              for cit in (stored if isinstance(stored, list) else [])
-              if isinstance(cit, dict)]
+    listed = []
+    for cit in (stored if isinstance(stored, list) else []):
+        if not isinstance(cit, dict):
+            continue
+        recorded, note = _str(cit.get("file")), _str(cit.get("note"))
+        name = recorded if recorded in files else ""
+        if recorded and not name:
+            note = SOURCE_COPY_GONE
+        listed.append((_str(cit.get("title")), _str(cit.get("url")),
+                       name, note))
     known = {name for _, _, name, _ in listed}
     for name, path in files.items():
         if name not in known:
