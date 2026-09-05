@@ -1226,6 +1226,31 @@ def test_the_standalone_pages_do_not_navigate_to_files_either(client, tmp_path):
     assert "navigator.canShare" in doc_js and "createObjectURL" in doc_js
 
 
+def test_the_cookie_follows_the_browsers_scheme_not_ours(monkeypatch, tmp_path):
+    """Behind `tailscale serve` the app sees plain HTTP on loopback while the
+    browser is on https://…ts.net, so the scheme we see is exactly the one
+    that cannot answer the question. The proxy leaves a header that can — and
+    the comment here used to claim the opposite, that such a proxy always
+    made the request look like TLS."""
+    monkeypatch.setattr(app_module, "FOOTNOTE_TOKEN", "s3cret")
+    with TestClient(app_module.app) as client:
+        plain = client.get("/?token=s3cret", follow_redirects=False)
+        assert "footnote_token=" in plain.headers.get("set-cookie", "")
+        assert "Secure" not in plain.headers["set-cookie"]   # a plain-HTTP LAN
+
+        behind = client.get("/?token=s3cret", follow_redirects=False,
+                            headers={"X-Forwarded-Proto": "https"})
+        assert "Secure" in behind.headers["set-cookie"]
+
+        # A chain of proxies leaves a list; the client-facing one is first.
+        chained = client.get("/?token=s3cret", follow_redirects=False,
+                             headers={"X-Forwarded-Proto": "https, http"})
+        assert "Secure" in chained.headers["set-cookie"]
+        spoofed = client.get("/?token=s3cret", follow_redirects=False,
+                             headers={"X-Forwarded-Proto": "gopher"})
+        assert "Secure" not in spoofed.headers["set-cookie"]
+
+
 def test_the_apps_own_code_is_always_revalidated(client):
     """Without this a browser serves a stale app.js for hours.
 

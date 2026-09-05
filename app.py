@@ -1117,6 +1117,27 @@ def _token_matches(presented: str) -> bool:
         return False
 
 
+def _request_is_secure(request: Request) -> bool:
+    """Whether the *browser's* connection is TLS, which is not ours.
+
+    Behind `tailscale serve` — or any proxy that terminates TLS — the app
+    sees plain HTTP on loopback while the browser is on https://…ts.net. So
+    request.url.scheme says "http" and the cookie went out without Secure on
+    a site the browser considers HTTPS. The forwarded header is what the
+    proxy leaves behind to say otherwise.
+
+    Trusting it costs nothing here: a cookie is only ever set on a request
+    that already carried the right token, so nobody without it can provoke
+    one. And where no proxy sets the header, this answers exactly what
+    request.url.scheme answered before.
+    """
+    if request.url.scheme == "https":
+        return True
+    # A chain of proxies leaves a list; the client-facing one is first.
+    forwarded = request.headers.get("x-forwarded-proto", "")
+    return forwarded.split(",")[0].strip().lower() == "https"
+
+
 def _request_token(request: Request) -> str:
     auth = request.headers.get("authorization", "")
     if auth.lower().startswith("bearer "):
@@ -1158,10 +1179,14 @@ async def _require_token(request: Request, call_next):
         response.set_cookie(
             _TOKEN_COOKIE, FOOTNOTE_TOKEN, max_age=365 * 24 * 3600,
             httponly=True, samesite="strict",
-            # Secure when the request came over TLS — behind Tailscale serve
-            # or a reverse proxy that is always; on a plain-HTTP LAN setting
-            # it would stop the cookie being sent at all.
-            secure=request.url.scheme == "https")
+            # Secure when the *browser's* connection is TLS. This used to
+            # say "behind Tailscale serve or a reverse proxy that is always",
+            # which is backwards: such a proxy terminates TLS and speaks
+            # plain HTTP to us, so the scheme we see is exactly the one that
+            # does not tell us. On a plain-HTTP LAN there is no header and
+            # no Secure, which is right — it would stop the cookie being
+            # sent at all.
+            secure=_request_is_secure(request))
         return response
     return await call_next(request)
 

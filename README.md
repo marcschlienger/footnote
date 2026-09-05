@@ -405,22 +405,67 @@ iPhone/iPad/Mac: install the Tailscale app and sign in to the same tailnet.
 
 **2. Point clients at the tailnet address** — `tailscale ip -4` (e.g.
 `100.101.102.103`) or, with MagicDNS, the machine name
-(`http://footnote-box:8010`). Use it in the Shortcut and the PWA; it works
+(`http://<machine>:8010`). Use it in the Shortcut and the PWA; it works
 identically at home and away — no port forwarding, no dynamic DNS.
 
-**3. Optionally, tailnet-only + HTTPS** (recommended, and the clean way to
-get push everywhere):
+**3. Serve it over HTTPS** (recommended — and what switches the offline
+shell and Web Push on at all).
+
+A plain-`http://` address that is not `localhost` is **not a secure
+context**, and browsers withhold whole APIs there rather than refusing them.
+Measured in Chromium against `http://192.168.1.42:8010`:
+`'serviceWorker' in navigator` is `false` — absent, not denied — so the
+offline shell never registers, and `navigator.clipboard` and
+`navigator.canShare` are undefined too. Push needs the same secure origin.
+One line fixes all of it:
 
 ```bash
 # in /etc/footnote/<user>.env:  HOST=127.0.0.1
 sudo systemctl restart footnote@<user>
-sudo tailscale serve --bg 8010
+sudo tailscale serve --bg --https=443 8010
+tailscale serve status                      # confirm
 ```
 
-Footnote is now at `https://footnote-box.<your-tailnet>.ts.net` — real TLS
-certificate, unreachable from the LAN or the internet, and a secure context
-for service workers and Web Push on every platform. `FOOTNOTE_TOKEN` is
-still worth setting on shared tailnets.
+Enable HTTPS certificates for the tailnet once first (admin console → DNS →
+HTTPS Certificates); `serve` cannot get a certificate without it. Footnote is
+then at `https://<machine>.<your-tailnet>.ts.net` — real TLS certificate,
+tailnet-only, and a secure context on every platform. `serve` is not
+`funnel`: nothing is exposed to the internet. `FOOTNOTE_TOKEN` is still worth
+setting on shared tailnets.
+
+**Running Margin on the same machine?** Give each its own HTTPS port —
+`--https=443` for one, `--https=8443` for the other (Tailscale allows 443,
+8443 and 10000). Do **not** try to put them on one name under different paths
+with `--set-path`: both apps address everything from the root (`/static/…`,
+`/manifest.json`, `/jobs/…`), and a service worker's scope is the directory
+it is served from, so one served under `/footnote/` could not control its own
+pages.
+
+**Then, on each device** — easy to miss, and none of it is optional:
+
+1. Open the new URL once with `?token=…` to store the cookie. It now carries
+   `Secure`, taken from `X-Forwarded-Proto`, because Tailscale terminates TLS
+   and speaks plain HTTP to Footnote on loopback.
+2. **Re-add the home-screen app from the HTTPS URL and delete the old one.**
+   A PWA keeps the origin it was installed from, and service workers and
+   caches are per-origin: the existing install will never gain the offline
+   shell.
+3. **Enable notifications again.** Push subscriptions are per-origin too, so
+   the ones registered on the `http://` origin are dead. Footnote prunes them
+   itself when the push service answers 404/410.
+4. Update the iOS Shortcut to the HTTPS URL.
+
+**Can you still reach it over plain HTTP?** Yes — leave `HOST=0.0.0.0`
+(the default) instead of binding to loopback, and `serve` will proxy to the
+same port while the tailnet and LAN addresses keep working. Two things follow.
+The two addresses are two *origins*, so each has its own service worker
+cache, PWA install, push subscription and cookie; only the HTTPS one reads
+offline or notifies. And do not use the **same hostname** over both schemes:
+a `Secure` cookie is only sent to a URI whose scheme is secure
+([RFC 6265 §5.4](https://www.rfc-editor.org/rfc/rfc6265#section-5.4)), so
+the HTTPS session's cookie is never sent over `http://` to that host and you
+would be re-authenticating constantly. Use the machine name for HTTPS and the
+tailnet IP for HTTP, and they stay independent.
 
 ## Install
 
