@@ -30,14 +30,17 @@ OUT="${3:-/home/$USER_NAME/Research/inbox}"
 DATA="/var/lib/footnote/$USER_NAME"
 ENV_FILE="/etc/footnote/$USER_NAME.env"
 
+# shellcheck source=deploy/paths.sh
+. "$(dirname "${BASH_SOURCE[0]}")/paths.sh"
+
 # Everything is checked here, before a single file is written. A relative
 # output directory used to be caught after the env file existed, which left a
 # poisoned /etc/footnote/<user>.env behind — and a corrected re-run keeps an
 # existing env file untouched, so the bad path survived into the service.
-case "$OUT" in
-  /*) ;;
-  *) echo "output-dir must be an absolute path, not: $OUT" >&2; exit 1 ;;
-esac
+# "Absolute" was the whole test, so "/" passed it, and the script would then
+# hand the root of the filesystem to one user at mode 700.
+check_target_dir output-dir "$OUT" || exit 1
+check_target_dir DATA_DIR "$DATA" || exit 1
 case "$PORT" in
   ''|*[!0-9]*) echo "port must be a number, not: $PORT" >&2; exit 1 ;;
 esac
@@ -55,10 +58,17 @@ GROUP_NAME="$(id -gn "$USER_NAME")"
 
 mkdir -p /etc/footnote
 if [ -f "$ENV_FILE" ]; then
+  ENV_EXISTED=yes
   echo "==> $ENV_FILE exists — keeping it (edit it + restart to change settings)"
 else
+  ENV_EXISTED=no
   echo "==> Writing $ENV_FILE"
   TOKEN="$("$APP_DIR/.venv/bin/python" -c 'import secrets; print(secrets.token_urlsafe(24))')"
+  # The token is a credential from the moment the first byte lands. Written
+  # first and chmodded afterwards, it was world-readable in between, and an
+  # interrupted run left it that way.
+  OLD_UMASK="$(umask)"
+  umask 077
   cat > "$ENV_FILE" <<EOF
 HOST=0.0.0.0
 PORT=$PORT
@@ -71,6 +81,7 @@ FOOTNOTE_TOKEN=$TOKEN
 #NOTION_API_KEY=
 #NOTION_DATABASE_ID=
 EOF
+  umask "$OLD_UMASK"
   chmod 600 "$ENV_FILE"
 fi
 
@@ -125,20 +136,55 @@ read_env_port() {
   esac
 }
 
-if [ -f "$ENV_FILE" ]; then
-  EXISTING_OUT="$(read_env_path OUTPUT_DIR)"
-  EXISTING_DATA="$(read_env_path DATA_DIR)"
-  EXISTING_PORT="$(read_env_port)"
-  [ -n "$EXISTING_OUT" ] && OUT="$EXISTING_OUT"
-  [ -n "$EXISTING_DATA" ] && DATA="$EXISTING_DATA"
-  # The stored port is what systemd will actually use. Re-running with a
-  # different one used to change nothing and then advertise the new number,
-  # so the URL printed at the end pointed at a port nothing was listening on.
-  if [ -n "$EXISTING_PORT" ] && [ "$EXISTING_PORT" != "$PORT" ]; then
-    echo "==> $ENV_FILE already sets PORT=$EXISTING_PORT — keeping it."
+# The stored file is what systemd reads, so it decides — and where it does
+# not say, this script has nothing to fall back on. The arguments are not a
+# fallback: systemd never sees them. Falling back to them meant creating
+# directories the service would not use and printing a URL on a port nothing
+# was listening on, which is a worse outcome than stopping.
+check_stored_env() {
+  local bad=0
+  STORED_OUT="$(read_env_path OUTPUT_DIR)"
+  STORED_DATA="$(read_env_path DATA_DIR)"
+  STORED_PORT="$(read_env_port)"
+  if [ -z "$STORED_OUT" ]; then
+    echo "  OUTPUT_DIR: missing, or not an absolute path this can read" >&2
+    bad=1
+  elif ! check_target_dir OUTPUT_DIR "$STORED_OUT"; then
+    bad=1
+  fi
+  if [ -z "$STORED_DATA" ]; then
+    echo "  DATA_DIR: missing, or not an absolute path this can read" >&2
+    bad=1
+  elif ! check_target_dir DATA_DIR "$STORED_DATA"; then
+    bad=1
+  fi
+  if [ -z "$STORED_PORT" ]; then
+    echo "  PORT: missing, or not a number" >&2
+    bad=1
+  elif [ "$STORED_PORT" -lt 1 ] || [ "$STORED_PORT" -gt 65535 ]; then
+    echo "  PORT: $STORED_PORT is not between 1 and 65535" >&2
+    bad=1
+  fi
+  [ "$bad" -eq 0 ] || return 1
+  return 0
+}
+
+if [ "$ENV_EXISTED" = yes ]; then
+  if ! check_stored_env; then
+    echo >&2
+    echo "$ENV_FILE does not say what this instance runs as, and this script" >&2
+    echo "will not invent it: systemd reads that file, not this command line." >&2
+    echo "Fix the settings above and re-run, or delete the file to have a" >&2
+    echo "fresh one written." >&2
+    exit 1
+  fi
+  if [ "$STORED_PORT" != "$PORT" ]; then
+    echo "==> $ENV_FILE already sets PORT=$STORED_PORT — keeping it."
     echo "    Edit that file and restart footnote@$USER_NAME to change it."
   fi
-  [ -n "$EXISTING_PORT" ] && PORT="$EXISTING_PORT"
+  OUT="$STORED_OUT"
+  DATA="$STORED_DATA"
+  PORT="$STORED_PORT"
 fi
 
 echo "==> Creating output directory $OUT and data directory $DATA"

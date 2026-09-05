@@ -473,8 +473,25 @@ Dossier and data directories are created `0700` and the unit runs with
 default is; the shared `/opt/footnote/.env` is `0640` and readable through a
 `footnote` group each instance user joins, rather than by every local
 account.
-Both are idempotent. API keys resolve per-person first
-(`/etc/footnote/<user>.env`), then shared (`/opt/footnote/.env`).
+Both are idempotent, and both refuse a destination that is not theirs:
+`/`, a top-level system directory, or a populated directory that is not a
+Footnote installation. Both run as root and turn a path into the target of
+`chown`, a recursive `chmod` and — for the application directory —
+`rsync --delete`, so a mistyped one is not a misconfiguration to correct on
+the next run. `add-instance.sh` also stops rather than guessing when an
+existing `/etc/footnote/<user>.env` does not say what the instance runs as:
+systemd reads that file, not the command line. API keys resolve per-person
+first (`/etc/footnote/<user>.env`), then shared (`/opt/footnote/.env`).
+
+Versions are lower bounds in `requirements.txt`, so an install resolves them
+afresh and two installs a month apart are not the same software. Generate
+`deploy/constraints.txt` on the server, test it, commit it, and every later
+install gets exactly those versions:
+
+```bash
+bash deploy/make-constraints.sh python3   # on the server, not on a laptop
+.venv/bin/python -m pytest
+```
 
 Upgrading is `install.sh` plus a restart, and `install.sh` repairs what it
 needs to: existing instance users are added to the `footnote` group so they
@@ -584,7 +601,8 @@ Tailscale, WireGuard) and/or use the per-instance `FOOTNOTE_TOKEN`.
 | `app.py` | FastAPI server: endpoints, auth, job store, orchestrator, PWA shell |
 | `pipeline.py` | Parallel + Firecrawl clients, dossier writer, Notion mirror |
 | `static/` | PWA (HTML/JS/CSS, service worker, manifest, icon SVG + PNGs) |
-| `tests/` | Unit tests (`pip install -r requirements-dev.txt && python -m pytest`) — no network |
+| `tests/test_footnote.py` | Unit tests (`pip install -r requirements-dev.txt && python -m pytest`) — no network |
+| `tests/test_browser.py` | Browser tests: polling, panels, downloads, service worker. Needs `playwright install chromium`; skips without it |
 | `deploy/` | Ubuntu installer, per-person instance script, systemd template, icon regeneration |
 | `description.md` | Architecture: job lifecycle, API contracts, dossier format, design decisions |
 | `shortcut_setup.md` | Step-by-step iOS Shortcut construction |

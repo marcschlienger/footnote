@@ -155,6 +155,8 @@ MAX_CITATIONS_KEPT = 100     # per job, so jobs.json stays small
 PUSH_CONCURRENCY = 4         # devices notified at once
 PUSH_CONNECT_TIMEOUT_S = 5   # per device; the library's default is no limit
 PUSH_READ_TIMEOUT_S = 15     # inactivity, not total — see _push_one
+PUSH_TOTAL_TIMEOUT_S = 45    # how long a job waits for one device, whatever
+                             # the endpoint does
 MAX_SUBSCRIPTIONS = 50       # devices kept; a personal server has a handful
 MAX_ENDPOINT_CHARS = 2000
 
@@ -527,37 +529,54 @@ def _push_session():
 
 
 async def _push_in_thread(sub: dict, payload: dict) -> bool:
-    """Run one blocking push on a thread the interpreter will not wait for.
+    """Run one blocking push without letting it hold anything up.
 
-    pywebpush is synchronous, so this has to leave the loop. It must not
+    pywebpush is synchronous, so this has to leave the loop, and it must not
     leave on a ThreadPoolExecutor thread: those are not daemons and the
-    interpreter joins them on the way out, so shutdown(wait=False) returns
-    at once and the process still sits there for as long as the call takes —
-    measured at the full length of a sleeping worker. A push that is still
-    dribbling has nothing local worth waiting for; the device either got it
-    or it did not, and a restart should not be held up for the answer.
+    interpreter joins them on the way out, so shutdown(wait=False) returned
+    at once and the process still sat there for as long as the call took.
+
+    The slot is held by the thread, not by whoever is waiting for it, and it
+    is taken without queueing. Waiting for it was the second half of the same
+    problem: four endpoints that never answer occupied all four slots, and
+    every later notification queued behind them — so every finished job stayed
+    suspended in notify_all, holding its task and its result alive for as long
+    as the process ran. Four stuck devices should cost four stuck devices.
     """
+    slots = getattr(app.state, "push_slots", None)
+    if slots is not None and not slots.acquire(blocking=False):
+        print("all push slots are busy; skipping one notification", flush=True)
+        return True                  # not evidence that the device is gone
     loop = asyncio.get_running_loop()
     done = loop.create_future()
 
-    def finish(setter, value):
-        if not done.cancelled():
-            setter(value)
+    def finish(alive):
+        if not done.done():
+            done.set_result(alive)
 
     def run():
+        alive = True
         try:
-            result = _push_one(sub, payload)
+            alive = _push_one(sub, payload)
         except BaseException as exc:                       # noqa: BLE001
-            call = (done.set_exception, exc)
-        else:
-            call = (done.set_result, result)
+            # _push_one answers for everything it can; this is the rest.
+            print(f"push failed: {type(exc).__name__}", flush=True)
+        finally:
+            if slots is not None:
+                slots.release()
         try:
-            loop.call_soon_threadsafe(finish, *call)
+            loop.call_soon_threadsafe(finish, alive)
         except RuntimeError:
             pass                    # the loop closed first; nobody is waiting
-    threading.Thread(target=run, daemon=True,
-                     name="footnote-push").start()
-    return await done
+
+    threading.Thread(target=run, daemon=True, name="footnote-push").start()
+    try:
+        # Shielded, so the thread keeps its slot and can still release it.
+        return await asyncio.wait_for(asyncio.shield(done),
+                                      PUSH_TOTAL_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        print("a push is still running; not waiting for it", flush=True)
+        return True                  # still not evidence the device is gone
 
 
 def _push_one(sub: dict, payload: dict) -> bool:
@@ -624,17 +643,13 @@ async def _notify_all(title: str, body: str, url: str) -> None:
         return
     payload = {"title": title, "body": body, "url": url,
                "icon": "/static/icon-192.png", "badge": "/static/icon-192.png"}
-    # Slots sized once for the process. A semaphore per call gave two jobs
-    # finishing together twice the slots, and asyncio.to_thread would put
-    # these on the default executor — the same one write_report uses, so a
-    # hung push would eventually stall saving a dossier.
-    slots = getattr(app.state, "push_slots", None)
-
+    # Slots are sized once for the process and taken inside _push_in_thread.
+    # A semaphore per call gave two jobs finishing together twice the slots,
+    # and asyncio.to_thread would put these on the default executor — the
+    # same one write_report uses, so a hung push would eventually stall
+    # saving a dossier.
     async def deliver(key, sub):
-        if slots is None:                      # outside the app's lifespan
-            return key, await _push_in_thread(sub, payload)
-        async with slots:
-            return key, await _push_in_thread(sub, payload)
+        return key, await _push_in_thread(sub, payload)
 
     results = await asyncio.gather(
         *(deliver(k, v) for k, v in list(subs.data.items())))
@@ -970,7 +985,9 @@ async def lifespan(application: FastAPI):
     # dossiers written".
     application.state.robots = (pipeline.RobotsCache()
                                if RESPECT_ROBOTS else None)
-    application.state.push_slots = asyncio.Semaphore(PUSH_CONCURRENCY)
+    # A threading semaphore, not an asyncio one: it is held by the worker
+    # thread across a blocking call, and released there.
+    application.state.push_slots = threading.BoundedSemaphore(PUSH_CONCURRENCY)
     # Jobs interrupted by a restart: the Parallel run survives server-side,
     # so re-attach by run_id; jobs that never got a run_id start over.
     application.state.tasks = set()

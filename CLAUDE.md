@@ -21,8 +21,11 @@ folder). Web Push notifies on completion; Notion mirroring is optional.
 - `static/` — PWA (index.html, app.js, style.css, service-worker.js,
   manifest.json, icon.svg + generated PNGs).
 - `deploy/` — `gen_icons.py` (re-render PNGs from icon.svg), systemd unit,
-  `install.sh` + `add-instance.sh` (Ubuntu, one instance per person).
-- `tests/` — pytest, no network (httpx.MockTransport + TestClient).
+  `install.sh` + `add-instance.sh` (Ubuntu, one instance per person),
+  `paths.sh` (shared path guards), `make-constraints.sh` (version pins).
+- `tests/` — `test_footnote.py`: pytest, no network (httpx.MockTransport +
+  TestClient). `test_browser.py`: Playwright against a real server on a
+  loopback port, for what only exists in a browser; skips without chromium.
 - `description.md` — architecture doc (job lifecycle, API contracts, dossier
   format, design decisions); `README.md` — full user-facing reference. Keep
   both in sync with behavior changes.
@@ -30,9 +33,11 @@ folder). Web Push notifies on completion; Notion mirroring is optional.
 ## Commands
 
 ```bash
-.venv/bin/python -m pytest            # run tests
+.venv/bin/python -m pytest            # run tests (browser suite skips w/o chromium)
+.venv/bin/playwright install chromium # enable tests/test_browser.py
 ./start.sh                            # run server (port 8010)
 .venv/bin/python deploy/gen_icons.py  # regenerate icons after editing SVG
+bash deploy/make-constraints.sh       # regenerate pins — on the target host only
 ```
 
 ## Verified API contracts (do not "fix" from memory)

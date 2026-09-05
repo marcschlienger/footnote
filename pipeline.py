@@ -654,9 +654,8 @@ class RobotsCache:
             if left <= 0:
                 return None
             try:
-                async with self._fetch_slots():
-                    kind, value = await asyncio.wait_for(
-                        self._one_hop(client, url), timeout=left)
+                kind, value = await asyncio.wait_for(
+                    self._hop_under_slot(client, url), timeout=left)
             except Exception:                              # noqa: BLE001
                 return None                                # unreadable
             if kind != "redirect":
@@ -664,10 +663,25 @@ class RobotsCache:
             url = value
         return None                     # round in circles: treat as unreadable
 
+    async def _hop_under_slot(self, client: httpx.AsyncClient, url: str):
+        """Waiting for a slot is part of the fetch, so the deadline covers it.
+
+        Taken outside the timeout, the remaining time was computed before the
+        wait and applied after it, so the bound measured the request alone:
+        with enough origins queued, "twenty seconds including redirects"
+        stretched as far as the queue was long.
+        """
+        async with self._fetch_slots():
+            return await self._one_hop(client, url)
+
     async def _one_hop(self, client: httpx.AsyncClient, url: str):
         """One request. ("redirect", url) to follow, or ("rules", parser)."""
         request = client.build_request(
-            "GET", url, timeout=httpx.Timeout(ROBOTS_TIMEOUT_S))
+            "GET", url, timeout=httpx.Timeout(ROBOTS_TIMEOUT_S),
+            # The limit below counts bytes off the wire, so ask for bytes we
+            # can count: a compressed body is only bounded once it has been
+            # expanded, which is too late to be a bound.
+            headers={"Accept-Encoding": "identity"})
         resp = await client.send(request, stream=True, follow_redirects=False)
         try:
             if resp.is_redirect:
@@ -681,16 +695,28 @@ class RobotsCache:
                 return "rules", _ALLOW_ALL       # no rules: everything goes
             if resp.status_code >= 500:
                 return "rules", None
+            # Refused before a byte of it is read. The limit below counts
+            # what the decoder produced, and a compressed body is bounded
+            # only after it has been expanded: ten kilobytes on the wire
+            # became ten megabytes in memory against a two-kilobyte limit.
+            # Sending a coding the request did not accept is a protocol
+            # violation anyway, so this costs nothing that behaves.
+            encoding = resp.headers.get("content-encoding", "").strip().lower()
+            if encoding and encoding != "identity":
+                return "rules", None      # unreadable: assume complete disallow
+            # One byte past the limit, so a body that ends exactly on it can
+            # be told from one that was cut in half.
             body, size = [], 0
             async for chunk in resp.aiter_bytes():
                 body.append(chunk)
                 size += len(chunk)
-                if size >= ROBOTS_MAX_BYTES:
+                if size > ROBOTS_MAX_BYTES:
                     break
         finally:
             await resp.aclose()
+        truncated = size > ROBOTS_MAX_BYTES
         text = b"".join(body)[:ROBOTS_MAX_BYTES].decode("utf-8", "replace")
-        if size > ROBOTS_MAX_BYTES:
+        if truncated:
             # The cut landed mid-line, and half a Disallow is not a rule.
             text = text[:text.rfind("\n") + 1]
         parser = RobotFileParser()

@@ -279,9 +279,23 @@ afterwards. A client that buffers the response has already accepted the
 megabytes by the time `[:ROBOTS_MAX_BYTES]` trims them — a 2 MB robots.txt
 was read in full. And httpx's timeout measures inactivity, not elapsed
 time, so a server sending one byte every few seconds resets it for as long
-as it likes. So: read until `ROBOTS_MAX_BYTES` and stop, truncating at the
-last complete line because half a `Disallow` is not a rule, under a
-`ROBOTS_DEADLINE_S` wall clock that covers every hop together.
+as it likes. So: read to `ROBOTS_MAX_BYTES` and stop, under a
+`ROBOTS_DEADLINE_S` wall clock that covers every hop *and* the wait for a
+fetch slot — computed before that wait and applied after it, the bound
+measured the request alone and stretched as far as the queue was long.
+
+Two details of that read matter more than they look. The request asks for
+`Accept-Encoding: identity` and a response that arrives with a content
+coding anyway is refused unread: the limit counts what the decoder produced,
+so a compressed body is bounded only after it has been expanded, and 10 kB
+on the wire became 10 MB in memory against a 2 kB limit. Sending a coding
+the request did not accept is a protocol violation, so refusing it costs
+nothing that behaves. And the read stops one byte *past* the limit, so a
+body that ends exactly on it can be told from one that was cut in half:
+stopping at the limit kept a half-arrived last line, and `Disallow: /priv`
+is a rule the site never wrote. Which way such an invention errs is luck —
+an `Allow` cut the same way hands out permission — so an unfinished line is
+dropped.
 
 `ROBOTS_CONCURRENCY` caps these fetches across all jobs. The per-origin lock
 stops one site being asked twice at once; it does nothing about fifty
@@ -365,8 +379,8 @@ recorded as text in the dossier itself.
 
 ### Web Push
 
-`pywebpush` with VAPID keys; the blocking `webpush()` call runs in a thread
-(`asyncio.to_thread`) per subscription. Subscriptions are keyed by a UUIDv5
+`pywebpush` with VAPID keys; the blocking `webpush()` call runs on a daemon
+thread per subscription, bounded by `PUSH_CONCURRENCY` slots. Subscriptions are keyed by a UUIDv5
 of their endpoint (idempotent re-subscribe); a `404`/`410` from the push
 service deletes the subscription. The payload carries `title`, `body`, and a
 `url` (`/jobs/{id}/report`), which the service worker opens on tap.
@@ -661,14 +675,27 @@ optionally hardened one notch.
   on a reachable instance and spend the Parallel key, which with
   `FOOTNOTE_TOKEN` unset is the default install. `FOOTNOTE_CORS_ORIGINS`
   names origins explicitly when a browser client of your own needs one.
-- Pushes run on a thread pool of their own, sized once for the process. A
-  semaphore per notification gave two jobs finishing together twice the
-  slots, and `asyncio.to_thread` would put them on the default executor —
-  the one `write_report` uses — so a push to an endpoint that dribbles a byte
-  inside every read timeout could eventually stall saving a dossier. The
-  timeout is a connect/read pair rather than a scalar, because `requests`
-  reads a scalar as *inactivity* and not total time; the pool is what bounds
-  what a slow drip can cost.
+- Pushes run on daemon threads of their own, `PUSH_CONCURRENCY` of them, and
+  nothing about one waits indefinitely. A semaphore per notification gave two
+  jobs finishing together twice the slots, and `asyncio.to_thread` would put
+  them on the default executor — the one `write_report` uses — so a push to
+  an endpoint that dribbles a byte inside every read timeout could eventually
+  stall saving a dossier. The timeout is a connect/read pair rather than a
+  scalar, because `requests` reads a scalar as *inactivity*, not total time.
+
+  Three things follow from a push having no local effect worth waiting for.
+  The threads are daemons, because a `ThreadPoolExecutor`'s workers are not
+  and the interpreter joins them on the way out: `shutdown(wait=False)`
+  returned immediately and the process still waited the full length of the
+  call. The slot is held by the thread rather than by whoever is waiting for
+  it, and taken without queueing — held by the waiter, four endpoints that
+  never answer took all four slots and every later notification queued behind
+  them, so every finished job stayed suspended in `notify_all` for the life
+  of the process, holding its task and its result. And the wait itself is
+  bounded by `PUSH_TOTAL_TIMEOUT_S`, after which the thread may go on but the
+  job does not. A dropped or abandoned notification is reported as delivered,
+  because failing to wait for an answer is not evidence that the device is
+  gone.
 - Push endpoints are subject to `is_push_endpoint`, not the general link
   policy: a subscription names an address the *server* then POSTs to, so
   accepting `http://127.0.0.1:8010/internal` made blind server-side request
@@ -745,9 +772,12 @@ optionally hardened one notch.
 | `data/subscriptions.json` | push subscriptions (runtime; gitignored) |
 | `deploy/install.sh` | Ubuntu: shared platform into `/opt/footnote` |
 | `deploy/add-instance.sh` | Ubuntu: per-person env file + service instance |
+| `deploy/paths.sh` | path checks both installers share (sourced, not run) |
+| `deploy/make-constraints.sh` | regenerate `deploy/constraints.txt` on the target host |
 | `deploy/footnote@.service` | systemd template unit |
 | `deploy/gen_icons.py` | re-render icon PNGs from the SVG (Playwright) |
-| `tests/` | pytest suite, fully offline |
+| `tests/test_footnote.py` | pytest suite, fully offline |
+| `tests/test_browser.py` | Playwright suite: polling, panels, downloads, service worker |
 
 ## Dependencies
 
@@ -759,7 +789,15 @@ optionally hardened one notch.
 | `python-dotenv` | `.env` loading (env vars win — enables the shared/per-user key layering) |
 | `pywebpush` | Web Push with VAPID (optional at runtime) |
 | `markdown` | server-side report rendering (optional at runtime) |
-| `playwright` + `pillow` | dev only: icon generation |
+| `playwright` + `pillow` | dev only: icon generation, and the browser suite |
+
+Versions are lower bounds — what Footnote needs, and what is worth reading.
+`deploy/constraints.txt`, when present, pins the resolution an install
+actually gets; `deploy/make-constraints.sh` regenerates it, and must be run
+on the platform and interpreter the instances run on, because wheels and
+dependency markers differ by both. A fresh checkout has no constraints file
+and installs resolve freely, which is the right default for a repository and
+the wrong one for a machine you depend on.
 
 ## Running the Server
 
@@ -778,22 +816,39 @@ journalctl -u footnote@<user> -f   # logs
 ```
 
 Both scripts run as root and both have a destructive edge, so both check
-their arguments before writing anything:
+their arguments before writing anything. `deploy/paths.sh` holds the checks
+they share, because both turn a path — from the command line, or from an env
+file somebody edited months ago — into the target of `mkdir`, `chown`, a
+recursive `chmod`, and in one case `rsync --delete`.
 
-- `install.sh` copies with `rsync --delete` and then walks the destination
-  with a recursive `chmod`. `APP_DIR` is an override, so pointed at `/opt`,
-  `/usr`, or any populated directory that is not a Footnote installation,
-  "install" means "delete what was there". It refuses unless the
-  destination is empty, carries the `.footnote-install` marker it writes
-  after a successful copy, or is recognisably a Footnote installation from
-  before the marker existed — that last case being the upgrade path the
-  script exists to be. System directories and the checkout itself are
-  refused outright.
-- `add-instance.sh` treats an existing env file as authoritative and re-reads
-  the port from it, not only the paths. Re-running an instance with a
-  different port used to change nothing — correctly, since the file is kept —
-  and then print the new number as the instance's URL, which pointed at a
-  port nothing was listening on.
+- **A destination is never a system directory.** `check_target_dir` refuses
+  `/` and the top-level directories, relative paths, and anything containing
+  `.` or `..`, comparing both the name as given and the path it resolves to —
+  so `/opt/`, a symlink to `/opt`, and `/opt` are all the same answer.
+  "Absolute" had been the whole test for an instance's output directory,
+  which meant `/` passed it and the script would then hand the root of the
+  filesystem to one user at mode 700.
+- **`install.sh` refuses a directory it did not install.** The copy is
+  `rsync --delete` and the permissions pass is a recursive `chmod`, so
+  pointed at a populated directory that is not a Footnote installation,
+  "install" means "delete what was there". It accepts an empty directory,
+  one carrying the `.footnote-install` marker it writes after a successful
+  copy, or one recognisable as an installation from before the marker
+  existed — that last case being the upgrade path the script exists to be.
+  The checkout itself, and any destination inside it, are refused: the copy
+  would empty its own source.
+- **`add-instance.sh` will not describe a configuration it did not apply.**
+  systemd reads the env file, not the command line, so where an existing file
+  is missing or unreadable — no `PORT`, a port that is not a number or not in
+  range, a path that cannot be parsed or is a system directory — the script
+  stops and says which setting, rather than falling back to its arguments.
+  Falling back meant creating directories the service would not use and
+  printing a URL on a port nothing was listening on.
+- **A credential is never briefly world-readable.** The per-instance env file
+  is written under `umask 077`, and the recursive `chmod a+rX` that gives
+  instances read access to the shared code steps over the shared `.env`
+  rather than widening it and putting it back. Both were windows an
+  interrupted run could leave open permanently.
 
 **macOS — Launch Agent (auto-starts at login):** save the plist below as
 `~/Library/LaunchAgents/<label>.plist`, where `<label>` is the reverse-DNS

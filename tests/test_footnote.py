@@ -455,6 +455,123 @@ def test_an_enormous_robots_file_is_read_only_to_the_limit(monkeypatch):
     assert not parser.can_fetch(pipeline.ROBOTS_AGENT, "http://x/private/y")
 
 
+def _robots_over_a_socket(monkeypatch, body, headers=b"", chunks=None):
+    """Serve one robots.txt from a real socket and return the parser.
+
+    A real transport, because these are about what comes off the wire:
+    MockTransport hands over a body that has already been decoded and
+    materialised. The address guard is stood down so the server can be a
+    loopback one.
+    """
+    monkeypatch.setattr(pipeline, "is_public_http_url", lambda url: True)
+
+    async def run():
+        async def serve(reader, writer):
+            await reader.readuntil(b"\r\n\r\n")
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
+                         + headers
+                         + b"Content-Length: %d\r\nConnection: close\r\n\r\n"
+                         % len(body))
+            for piece in (chunks or [body]):
+                writer.write(piece)
+                try:
+                    await writer.drain()
+                except Exception:                          # noqa: BLE001
+                    return
+                await asyncio.sleep(0.02)
+
+        server = await asyncio.start_server(serve, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        async with httpx.AsyncClient() as client:
+            parser = await pipeline.RobotsCache()._fetch(
+                client, f"http://127.0.0.1:{port}")
+        server.close()
+        return parser
+
+    return asyncio.run(run())
+
+
+def test_a_compressed_robots_response_is_refused_unread(monkeypatch):
+    """The limit counts what the decoder produced, so a compressed body is
+    bounded only once it has been expanded — which is not a bound. Measured:
+    10,264 bytes on the wire became 10 MiB in memory against a 2 KiB limit.
+    Footnote asks for identity, and a coding it did not accept is a protocol
+    violation, so the response is refused before a byte of it is read."""
+    import gzip
+    monkeypatch.setattr(pipeline, "ROBOTS_MAX_BYTES", 2048)
+    plain = b"User-agent: *\nDisallow: /private\n# " + b"x" * (8 * 1024 * 1024)
+    parser = _robots_over_a_socket(monkeypatch, gzip.compress(plain),
+                                   headers=b"Content-Encoding: gzip\r\n")
+    assert parser is None               # unreadable, so the site is off limits
+
+
+def test_the_robots_request_asks_for_bytes_it_can_count(monkeypatch):
+    """Refusing an encoded body only works if one is not invited."""
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["accept-encoding"] = request.headers.get("accept-encoding")
+        return httpx.Response(200, text="User-agent: *\nAllow: /\n")
+
+    async def run():
+        async with httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)) as client:
+            await pipeline.RobotsCache().allows(client, "https://a.test/x")
+
+    asyncio.run(run())
+    assert seen["accept-encoding"] == "identity"
+
+
+def test_half_a_line_is_not_treated_as_a_rule(monkeypatch):
+    """Reading stopped at size >= limit, so a body whose chunks landed
+    exactly on it kept its last, half-arrived line: "Disallow: /priv" is a
+    rule the site never wrote, and it applies to paths the site never named.
+    Which way such an invention errs is luck — an Allow cut the same way
+    hands out permission — so a line that did not finish is dropped."""
+    rules = b"User-agent: *\nDisallow: /private\n"
+    cut = rules.index(b"/private") + len(b"/priv")
+    monkeypatch.setattr(pipeline, "ROBOTS_MAX_BYTES", cut)
+    parser = _robots_over_a_socket(monkeypatch, rules,
+                                   chunks=[rules[:cut], rules[cut:]])
+    # "/privileged" was never disallowed by anything the site published.
+    assert parser.can_fetch(pipeline.ROBOTS_AGENT, "http://x/privileged")
+
+
+def test_a_body_that_ends_exactly_on_the_limit_keeps_its_rules(monkeypatch):
+    """The other half of reading one byte past it: an exact fit is not a
+    truncation, and its last line is whole."""
+    rules = b"User-agent: *\nDisallow: /private\n"
+    monkeypatch.setattr(pipeline, "ROBOTS_MAX_BYTES", len(rules))
+    parser = _robots_over_a_socket(monkeypatch, rules)
+    assert not parser.can_fetch(pipeline.ROBOTS_AGENT, "http://x/private/y")
+    assert parser.can_fetch(pipeline.ROBOTS_AGENT, "http://x/ok")
+
+
+def test_waiting_for_a_robots_slot_counts_against_the_deadline(monkeypatch):
+    """The remaining time was computed before the wait and applied after it,
+    so the bound measured the request alone: with origins queued behind one
+    slot, "twenty seconds including redirects" stretched as far as the queue."""
+    monkeypatch.setattr(pipeline, "ROBOTS_DEADLINE_S", 0.05)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(0.04)
+        return httpx.Response(200, text="User-agent: *\nAllow: /\n")
+
+    async def run():
+        robots = pipeline.RobotsCache(concurrency=1)
+        async with httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)) as client:
+            return await asyncio.gather(
+                robots.allows(client, "https://first.test/a"),
+                robots.allows(client, "https://second.test/a"))
+
+    (first, _), (second, why) = asyncio.run(run())
+    assert first                        # it fitted inside the deadline
+    # The second waited 40ms for the slot and then had 40ms of its own to
+    # run, which is more than the deadline it was given.
+    assert not second and why == pipeline.ROBOTS_UNAVAILABLE
+
+
 def test_a_dribbling_server_cannot_hold_the_fetch_open(monkeypatch):
     """httpx's timeout is inactivity; one byte at a time resets it forever."""
     monkeypatch.setattr(pipeline, "is_public_http_url", lambda url: True)
@@ -1848,12 +1965,13 @@ def _run_add_instance_parser(env_text, keys):
 def _run_app_dir_check(app_dir, repo_dir=""):
     """Execute install.sh's APP_DIR guard; returns its exit status."""
     import subprocess
-    script = (Path(__file__).resolve().parent.parent
-              / "deploy" / "install.sh").read_text()
+    deploy = Path(__file__).resolve().parent.parent / "deploy"
+    script = (deploy / "install.sh").read_text()
     body = script.split("check_app_dir() {")[1].split("\n}")[0]
     with tempfile.TemporaryDirectory() as tmp:
         runner = Path(tmp) / "run.sh"
-        runner.write_text('APP_MARKER=".footnote-install"\n'
+        runner.write_text(f'. "{deploy / "paths.sh"}"\n'
+                          'APP_MARKER=".footnote-install"\n'
                           f'check_app_dir() {{{body}\n}}\n'
                           f'check_app_dir "{app_dir}" "{repo_dir}"\n')
         return subprocess.run(["bash", str(runner)], capture_output=True,
@@ -1909,6 +2027,24 @@ def test_the_installer_leaves_its_marker_behind():
     assert '--exclude "$APP_MARKER"' in rsync[:rsync.index('"$APP_DIR/"')]
 
 
+def test_the_installer_pins_versions_when_it_has_been_told_them():
+    """requirements.txt is lower bounds, so every install resolves afresh and
+    two installs a month apart are not the same software. A constraints file
+    generated on the target platform decides instead — and is optional, since
+    a fresh checkout has none."""
+    deploy = Path(__file__).resolve().parent.parent / "deploy"
+    install = (deploy / "install.sh").read_text()
+    assert '-c "$APP_DIR/deploy/constraints.txt"' in install
+    assert 'if [ -f "$APP_DIR/deploy/constraints.txt" ]; then' in install
+    # Both paths install the requirements; neither is a no-op.
+    assert install.count('-r "$APP_DIR/requirements.txt" -q') == 2
+    generator = (deploy / "make-constraints.sh").read_text()
+    assert "pip\" freeze" in generator or "bin/pip\" freeze" in generator
+    # Generated where it will be used, not on whatever laptop wrote it.
+    assert "sys.version_info >= (3, 10)" in generator
+    assert "same platform" in generator
+
+
 def test_the_deployment_parser_handles_real_env_files():
     """Executed, not asserted as text: quoting is where this goes wrong."""
     parsed = _run_add_instance_parser(
@@ -1925,6 +2061,76 @@ def test_the_deployment_parser_handles_real_env_files():
     # Syntax this cannot resolve is refused rather than half-parsed.
     assert parsed["ESCAPED"] == "" and parsed["VARREF"] == ""
     assert parsed["REL"] == ""                 # relative paths are not paths
+
+
+def _run_stored_env_check(env_text):
+    """Execute add-instance.sh's check on an existing env file."""
+    import subprocess
+    deploy = Path(__file__).resolve().parent.parent / "deploy"
+    script = (deploy / "add-instance.sh").read_text()
+
+    def extract(name):
+        return script.split(f"{name}() {{")[1].split("\n}")[0]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        env_file = Path(tmp) / "instance.env"
+        env_file.write_text(env_text)
+        runner = Path(tmp) / "run.sh"
+        runner.write_text(
+            f'. "{deploy / "paths.sh"}"\nENV_FILE={env_file}\n'
+            + "".join(f"{name}() {{{extract(name)}\n}}\n"
+                      for name in ("read_env_value", "read_env_path",
+                                   "read_env_port", "check_stored_env"))
+            + "check_stored_env\n")
+        done = subprocess.run(["bash", str(runner)], capture_output=True,
+                              text=True)
+    return done.returncode, done.stderr
+
+
+def test_an_instance_directory_is_never_a_system_directory(tmp_path):
+    """"Absolute" was the whole test, so "/" passed it — and the script then
+    ran install -d -o <user> -m 700 on whatever it was given, as root."""
+    deploy = Path(__file__).resolve().parent.parent / "deploy"
+    import subprocess
+
+    def check(path):
+        return subprocess.run(
+            ["bash", "-c", f'. "{deploy / "paths.sh"}"; '
+                           f'check_target_dir OUTPUT_DIR "{path}"'],
+            capture_output=True, text=True).returncode
+
+    for system in ("/", "/home", "/srv", "/var", "/etc", "/opt", "/tmp"):
+        assert check(system) != 0, system
+    assert check("/opt/") != 0                 # the same directory, spelled on
+    assert check("/srv/../etc") != 0           # …and reached by another route
+    assert check("notes") != 0
+    assert check("/home/someone/Research/inbox") == 0
+    assert check(str(tmp_path / "inbox")) == 0
+
+    # A symlink that lands on one is refused under the name it was given.
+    link = tmp_path / "shortcut"
+    link.symlink_to("/", target_is_directory=True)
+    assert check(str(link)) != 0
+
+
+def test_an_incomplete_env_file_stops_the_script():
+    """The arguments are not a fallback: systemd never sees them. Falling
+    back to them created directories the service would not use and printed a
+    URL on a port nothing was listening on."""
+    good = "PORT=8010\nOUTPUT_DIR=/srv/notes\nDATA_DIR=/var/lib/footnote/x\n"
+    assert _run_stored_env_check(good)[0] == 0
+
+    for broken, expected in (
+            ("OUTPUT_DIR=/srv/notes\nDATA_DIR=/var/lib/f/x\n", "PORT"),
+            ("PORT=notaport\nOUTPUT_DIR=/srv/n\nDATA_DIR=/var/lib/f/x\n", "PORT"),
+            ("PORT=99999\nOUTPUT_DIR=/srv/n\nDATA_DIR=/var/lib/f/x\n", "65535"),
+            ("PORT=8010\nDATA_DIR=/var/lib/f/x\n", "OUTPUT_DIR"),
+            ("PORT=8010\nOUTPUT_DIR=/srv/n\n", "DATA_DIR"),
+            ("PORT=8010\nOUTPUT_DIR=/\nDATA_DIR=/var/lib/f/x\n", "OUTPUT_DIR"),
+            ("PORT=8010\nOUTPUT_DIR=notes\nDATA_DIR=/var/lib/f/x\n", "OUTPUT_DIR")):
+        code, err = _run_stored_env_check(broken)
+        assert code != 0, broken
+        assert expected in err, (broken, err)
 
 
 def test_an_existing_instance_keeps_its_stored_port():
@@ -1944,7 +2150,7 @@ def test_an_existing_instance_keeps_its_stored_port():
 def test_the_installer_advertises_the_port_it_actually_uses():
     script = (Path(__file__).resolve().parent.parent
               / "deploy" / "add-instance.sh").read_text()
-    reread = script.index("EXISTING_PORT=")
+    reread = script.index("check_stored_env")
     assert script.index('App URL:') > reread          # printed after re-reading
 
 
@@ -1953,7 +2159,7 @@ def test_the_instance_script_validates_before_it_writes():
            / "deploy" / "add-instance.sh").read_text()
     # The checks come before the env file is created, or a bad first run
     # leaves a poisoned file that a corrected run will not replace.
-    assert add.index("output-dir must be an absolute path") < add.index("cat > \"$ENV_FILE\"")
+    assert add.index("check_target_dir output-dir") < add.index("cat > \"$ENV_FILE\"")
     assert add.index("port must be between 1 and 65535") < add.index("cat > \"$ENV_FILE\"")
     assert "-m 700 -- " in add                 # install(1) reads a leading dash
     assert "is-active --quiet" in add          # do not claim success on failure
@@ -2033,7 +2239,9 @@ def test_push_calls_are_bounded(client, monkeypatch):
 
 def test_the_push_slots_are_one_per_process(client):
     """A semaphore per notification gave two jobs twice the slots."""
-    assert isinstance(app_module.app.state.push_slots, asyncio.Semaphore)
+    import threading
+    assert isinstance(app_module.app.state.push_slots,
+                      type(threading.BoundedSemaphore(1)))
     # And these do not run on the executor asyncio.to_thread would use,
     # which is the one write_report runs on.
     source = _app_source()
@@ -2043,6 +2251,54 @@ def test_the_push_slots_are_one_per_process(client):
 
 def _app_source():
     return (Path(__file__).resolve().parent.parent / "app.py").read_text()
+
+
+def test_a_stuck_endpoint_does_not_queue_every_later_notification(monkeypatch):
+    """The slot was held by whoever was waiting, so four endpoints that never
+    answer took all four and everything queued behind them — every finished
+    job then sat in notify_all for the life of the process, holding its task
+    and its result. Four stuck devices should cost four stuck devices."""
+    import threading
+    held = threading.Event()
+    monkeypatch.setattr(app_module, "_push_one",
+                        lambda sub, payload: held.wait(10) or True)
+    monkeypatch.setattr(app_module.app.state, "push_slots",
+                        threading.BoundedSemaphore(2))
+
+    async def run():
+        stuck = [asyncio.ensure_future(app_module._push_in_thread({}, {}))
+                 for _ in range(2)]
+        await asyncio.sleep(0.2)               # let both take a slot
+        started = time.monotonic()
+        third = await app_module._push_in_thread({}, {})
+        waited = time.monotonic() - started
+        held.set()
+        await asyncio.gather(*stuck)
+        return third, waited
+
+    third, waited = asyncio.run(run())
+    assert third is True                # not evidence the device is gone
+    assert waited < 1.0, waited         # dropped, not queued behind the two
+
+
+def test_a_push_that_never_answers_is_given_up_on(monkeypatch):
+    """The thread may go on; the job that is waiting for it may not."""
+    import threading
+    held = threading.Event()
+    monkeypatch.setattr(app_module, "_push_one",
+                        lambda sub, payload: held.wait(10) or True)
+    monkeypatch.setattr(app_module, "PUSH_TOTAL_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(app_module.app.state, "push_slots",
+                        threading.BoundedSemaphore(2))
+
+    async def run():
+        started = time.monotonic()
+        alive = await app_module._push_in_thread({}, {})
+        return alive, time.monotonic() - started
+
+    alive, waited = asyncio.run(run())
+    held.set()
+    assert alive is True and waited < 2.0, waited
 
 
 def test_a_hung_push_does_not_delay_shutdown(tmp_path):
@@ -2264,7 +2520,7 @@ def test_the_installer_rebuilds_a_venv_that_is_too_old():
     assert '.venv/bin/python' in install and "rm -rf" in install
     add = (Path(__file__).resolve().parent.parent
            / "deploy" / "add-instance.sh").read_text()
-    assert "EXISTING_OUT" in add        # repair the paths the instance uses
+    assert "STORED_OUT" in add          # the paths the instance actually uses
 
 
 def test_a_lone_surrogate_cannot_reach_the_store(client, monkeypatch):

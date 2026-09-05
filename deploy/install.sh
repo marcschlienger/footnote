@@ -26,6 +26,9 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # installation from a directory that merely happens to be there.
 APP_MARKER=".footnote-install"
 
+# shellcheck source=deploy/paths.sh
+. "$(dirname "${BASH_SOURCE[0]}")/paths.sh"
+
 # APP_DIR is an override and everything below runs as root: the copy is
 # rsync --delete, which empties the destination, and the permissions pass is
 # a recursive chmod. Aimed at /opt, /usr, or any populated directory that is
@@ -34,26 +37,26 @@ APP_MARKER=".footnote-install"
 # marker, or is recognisably a Footnote installation from before the marker
 # existed.
 check_app_dir() {
-  local dir="$1" repo="${2:-}"
-  case "$dir" in
-    /*) ;;
-    *) echo "APP_DIR must be an absolute path, not: $dir" >&2; return 1 ;;
-  esac
-  case "$dir" in
-    */..|*/../*|*/.|*/./*)
-      echo "APP_DIR must not contain . or ..: $dir" >&2; return 1 ;;
-  esac
-  case "$dir" in
-    / | /bin | /boot | /dev | /etc | /home | /lib | /lib32 | /lib64 | /media       | /mnt | /opt | /proc | /root | /run | /sbin | /srv | /sys | /tmp       | /usr | /var)
-      echo "APP_DIR=$dir is a system directory, and the copy below would" >&2
-      echo "delete everything in it. Use a directory of its own, e.g." >&2
-      echo "/opt/footnote." >&2
-      return 1 ;;
-  esac
-  if [ -n "$repo" ] && [ "$dir" = "$repo" ]; then
-    echo "APP_DIR is this checkout; install to a directory of its own." >&2
-    return 1
+  local dir="$1" repo="${2:-}" resolved repo_resolved
+  check_target_dir APP_DIR "$dir" || return 1
+  # Compared after resolving, not as typed: "/opt/footnote/" and a symlink
+  # both name the same directory as "/opt/footnote", and both walked past a
+  # check that compared the strings.
+  resolved="$(canon_path "$dir")"
+  if [ -n "$repo" ]; then
+    repo_resolved="$(canon_path "$repo")"
+    if [ "$resolved" = "$repo_resolved" ]; then
+      echo "APP_DIR is this checkout; install to a directory of its own." >&2
+      return 1
+    fi
+    case "$resolved/" in
+      "$repo_resolved"/*)
+        echo "APP_DIR=$dir is inside this checkout, which rsync --delete" >&2
+        echo "would then empty out from under itself." >&2
+        return 1 ;;
+    esac
   fi
+  dir="$resolved"
   if [ -e "$dir" ] && [ ! -d "$dir" ]; then
     echo "APP_DIR=$dir exists and is not a directory." >&2
     return 1
@@ -111,7 +114,15 @@ echo "Footnote application directory, managed by deploy/install.sh." \
 # per-person key overrides) live in /etc/footnote/<user>.env, which wins:
 # systemd exports it into the process environment, and load_dotenv() never
 # overrides existing environment variables.
-[ -f "$APP_DIR/.env" ] || cp "$APP_DIR/.env.example" "$APP_DIR/.env"
+# Created under a private umask and given its group and mode straight away.
+# Written first and secured afterwards, an interrupted run left the shared
+# API keys readable by every account on the machine.
+groupadd -f "$SHARED_GROUP"
+if [ ! -f "$APP_DIR/.env" ]; then
+  (umask 077 && cp "$APP_DIR/.env.example" "$APP_DIR/.env")
+fi
+chgrp "$SHARED_GROUP" "$APP_DIR/.env"
+chmod 640 "$APP_DIR/.env"
 
 echo "==> Creating virtualenv and installing Python dependencies"
 # An existing venv is reused only if its interpreter is new enough. One built
@@ -124,15 +135,26 @@ if [ -d "$APP_DIR/.venv" ] && ! "$APP_DIR/.venv/bin/python" -c \
 fi
 [ -d "$APP_DIR/.venv" ] || "$PYTHON" -m venv "$APP_DIR/.venv"
 "$APP_DIR/.venv/bin/pip" install --upgrade pip -q
-"$APP_DIR/.venv/bin/pip" install -r "$APP_DIR/requirements.txt" -q
+# requirements.txt states lower bounds, so an install resolves them afresh
+# and two installs a month apart are not the same software. When a
+# constraints file has been generated on this platform (see
+# deploy/make-constraints.sh) it decides the versions instead.
+if [ -f "$APP_DIR/deploy/constraints.txt" ]; then
+  echo "    pinned by deploy/constraints.txt"
+  "$APP_DIR/.venv/bin/pip" install -c "$APP_DIR/deploy/constraints.txt" \
+    -r "$APP_DIR/requirements.txt" -q
+else
+  echo "    no deploy/constraints.txt — resolving versions afresh"
+  "$APP_DIR/.venv/bin/pip" install -r "$APP_DIR/requirements.txt" -q
+fi
 
-# Instances run as their own users — they need read access to the shared code
-chmod -R a+rX "$APP_DIR"
-# …but not to the shared API keys. A dedicated group carries that access;
-# add-instance.sh puts each instance's user into it.
-groupadd -f "$SHARED_GROUP"
-chgrp "$SHARED_GROUP" "$APP_DIR/.env"
-chmod 640 "$APP_DIR/.env"
+# Instances run as their own users — they need read access to the shared
+# code, but not to the shared API keys, which a dedicated group carries
+# instead (add-instance.sh puts each instance's user into it). The recursive
+# pass steps over the env file rather than widening it and putting it back:
+# between those two commands the keys were world-readable, and an interrupted
+# run left them that way.
+find "$APP_DIR" -path "$APP_DIR/.env" -prune -o -exec chmod a+rX {} +
 # Instances that already exist were created before the group did, and the
 # upgrade path is this script plus a restart — so put their users in it here
 # rather than leaving a service that cannot read its own keys.
