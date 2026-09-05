@@ -206,8 +206,10 @@ Body: a standard
 [PushSubscription JSON](https://developer.mozilla.org/en-US/docs/Web/API/PushSubscription/toJSON)
 (the PWA does this for you). Subscriptions are stored server-side in
 `data/subscriptions.json`, so **every** registered device gets notified on
-completion, not only the one that asked. Dead subscriptions (HTTP 404/410
-from the push service) are pruned automatically. `GET /vapid-public-key`
+completion, not only the one that asked — `PUSH_CONCURRENCY` bounds how many
+deliveries are in flight at once, not how many happen. Dead subscriptions
+(HTTP 404/410 from the push service) are pruned automatically, unless the
+device re-subscribed while that delivery was in the air. `GET /vapid-public-key`
 supplies the key the browser needs to subscribe.
 
 ### `GET /processors`

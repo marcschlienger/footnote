@@ -38,6 +38,7 @@ folder). Web Push notifies on completion; Notion mirroring is optional.
 ./start.sh                            # run server (port 8010)
 .venv/bin/python deploy/gen_icons.py  # regenerate icons after editing SVG
 bash deploy/make-constraints.sh       # regenerate pins — on the target host only
+shellcheck -x deploy/*.sh             # -x, or it stops at the sourced paths.sh
 ```
 
 ## Verified API contracts (do not "fix" from memory)

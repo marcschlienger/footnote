@@ -68,6 +68,28 @@ const isDossier = (url) =>
 // back to the last copy only when the network is gone.
 const isSourceIndex = (url) => /^\/jobs\/[^/]+\/sources$/.test(url.pathname);
 
+// Jobs deleted during this worker's lifetime. A refresh that was already in
+// flight when the delete arrived finishes its cache.put afterwards and puts
+// the dossier back, so an offline read resurrects a job that is gone. The
+// list is only as long as one worker's lifetime needs it to be — a restarted
+// worker has no requests in flight to catch.
+const forgotten = new Set();
+const FORGOTTEN_MAX = 100;
+
+const jobOf = (url) => {
+  const found = new URL(url).pathname.match(/^\/jobs\/([^/]+)\//);
+  return found ? found[1] : "";
+};
+
+// The only way anything is written to a cache: checked before the put and
+// again after it, because the delete can land between those two lines.
+async function keep(cache, request, response) {
+  const job = jobOf(request.url);
+  if (job && forgotten.has(job)) return;
+  await cache.put(request, response);
+  if (job && forgotten.has(job)) await cache.delete(request);
+}
+
 self.addEventListener("fetch", (event) => {
   if (event.request.method !== "GET") return;
   const url = new URL(event.request.url);
@@ -99,7 +121,7 @@ async function networkFirst(request, cacheName, markFallback = false) {
     // as though it were the app.
     // Awaited: an unawaited put can still be in flight when the response
     // settles, and the browser is free to stop the worker at that point.
-    if (res.ok) await (await caches.open(cacheName)).put(request, res.clone());
+    if (res.ok) await keep(await caches.open(cacheName), request, res.clone());
     else if (res.status === 401) await forgetEverything();
     else if (res.status === 404 || res.status === 410) await forgetJob(url);
     return res;
@@ -115,7 +137,7 @@ async function cacheThenRefresh(event) {
   const cached = await cache.match(event.request);
   const fresh = fetch(event.request).then(async (res) => {
     if (res.ok) {
-      await cache.put(event.request, res.clone());
+      await keep(cache, event.request, res.clone());
       await trim(cache, DOSSIER_MAX);
     } else if (res.status === 401) {
       await forgetEverything();
@@ -137,6 +159,10 @@ async function cacheThenRefresh(event) {
 async function forgetJob(url) {
   const job = url.pathname.match(/^\/jobs\/([^/]+)\//);
   if (!job) return;
+  forgotten.add(job[1]);
+  while (forgotten.size > FORGOTTEN_MAX) {
+    forgotten.delete(forgotten.values().next().value);
+  }
   const prefix = `/jobs/${job[1]}/`;
   for (const name of [DOSSIER_CACHE, SHELL_CACHE]) {
     const cache = await caches.open(name);

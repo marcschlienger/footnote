@@ -537,16 +537,16 @@ async def _push_in_thread(sub: dict, payload: dict) -> bool:
     at once and the process still sat there for as long as the call took.
 
     The slot is held by the thread, not by whoever is waiting for it, and it
-    is taken without queueing. Waiting for it was the second half of the same
-    problem: four endpoints that never answer occupied all four slots, and
-    every later notification queued behind them — so every finished job stayed
-    suspended in notify_all, holding its task and its result alive for as long
-    as the process ran. Four stuck devices should cost four stuck devices.
+    is waited for *in* the thread with a deadline. Both halves matter. Held by
+    the waiter, four endpoints that never answer occupied all four slots and
+    every later notification queued behind them, so every finished job stayed
+    suspended in notify_all for as long as the process ran. Taken without
+    queueing at all — which is how that was first fixed — six healthy devices
+    and four slots meant two devices were simply not told, and the promise is
+    every registered device. A slot is worth waiting for; it is not worth
+    waiting for forever.
     """
     slots = getattr(app.state, "push_slots", None)
-    if slots is not None and not slots.acquire(blocking=False):
-        print("all push slots are busy; skipping one notification", flush=True)
-        return True                  # not evidence that the device is gone
     loop = asyncio.get_running_loop()
     done = loop.create_future()
 
@@ -555,14 +555,21 @@ async def _push_in_thread(sub: dict, payload: dict) -> bool:
             done.set_result(alive)
 
     def run():
-        alive = True
+        alive, held = True, False
         try:
-            alive = _push_one(sub, payload)
+            held = slots is None or slots.acquire(timeout=PUSH_TOTAL_TIMEOUT_S)
+            if not held:
+                # Every slot has been stuck for the whole deadline, so this
+                # is a jammed push service rather than a busy one.
+                print("push slots stayed busy; giving up on one device",
+                      flush=True)
+            else:
+                alive = _push_one(sub, payload)
         except BaseException as exc:                       # noqa: BLE001
             # _push_one answers for everything it can; this is the rest.
             print(f"push failed: {type(exc).__name__}", flush=True)
         finally:
-            if slots is not None:
+            if held and slots is not None:
                 slots.release()
         try:
             loop.call_soon_threadsafe(finish, alive)
@@ -627,6 +634,11 @@ def _push_one(sub: dict, payload: dict) -> bool:
 async def notify_all(title: str, body: str, url: str = "/") -> None:
     """Send a notification to every registered device.
 
+    Every one of them: the slots bound how many are in flight at once, not
+    how many are told. A device is given up on only if the whole pool has
+    been stuck for PUSH_TOTAL_TIMEOUT_S, which is a jammed push service
+    rather than a busy one.
+
     Best-effort to the last: this is called from inside run_research's try,
     so anything escaping here would rewrite a finished job as failed. Nothing
     escapes.
@@ -649,11 +661,18 @@ async def _notify_all(title: str, body: str, url: str) -> None:
     # same one write_report uses, so a hung push would eventually stall
     # saving a dossier.
     async def deliver(key, sub):
-        return key, await _push_in_thread(sub, payload)
+        return key, sub, await _push_in_thread(sub, payload)
 
     results = await asyncio.gather(
         *(deliver(k, v) for k, v in list(subs.data.items())))
-    dead = [key for key, alive in results if not alive]
+    # Pruned only if the record is still the one that failed. A subscription
+    # is keyed by a UUIDv5 of its endpoint, so a browser that re-subscribes
+    # lands on the same key with new keys of its own — and a delivery that
+    # started before that and came back "gone" was talking about the record
+    # it has just replaced. Compared by value, not identity: a save() in
+    # between rebuilds the records from their cleaned form.
+    dead = [key for key, sub, alive in results
+            if not alive and subs.data.get(key) == sub]
     for key in dead:
         subs.data.pop(key, None)
     if dead:

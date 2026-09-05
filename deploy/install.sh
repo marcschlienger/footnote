@@ -55,6 +55,17 @@ check_app_dir() {
         echo "would then empty out from under itself." >&2
         return 1 ;;
     esac
+    # And the other way round, which the marker check would otherwise wave
+    # through: a checkout living inside an installation is deleted by the
+    # same rsync that is reading from it, half way through, leaving neither
+    # a checkout nor a finished install.
+    case "$repo_resolved/" in
+      "$resolved"/*)
+        echo "This checkout is inside APP_DIR=$dir. The copy below is" >&2
+        echo "rsync --delete, which would delete the checkout while it is" >&2
+        echo "reading from it. Keep the two apart." >&2
+        return 1 ;;
+    esac
   fi
   dir="$resolved"
   if [ -e "$dir" ] && [ ! -d "$dir" ]; then
@@ -125,13 +136,19 @@ chgrp "$SHARED_GROUP" "$APP_DIR/.env"
 chmod 640 "$APP_DIR/.env"
 
 echo "==> Creating virtualenv and installing Python dependencies"
-# An existing venv is reused only if its interpreter is new enough. One built
-# under 3.8 would otherwise survive an upgrade run with 3.12, and the
-# installer would report success for a service that fails inside jobs.
-if [ -d "$APP_DIR/.venv" ] && ! "$APP_DIR/.venv/bin/python" -c \
-    'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' 2>/dev/null; then
-  echo "    existing virtualenv is too old or broken; rebuilding it"
-  rm -rf "$APP_DIR/.venv"
+# An existing venv is reused only if it *is* the interpreter that was asked
+# for. "New enough" was the old test, and it kept a 3.10 environment on a run
+# that said PYTHON=/usr/bin/python3.12 — so the override silently did nothing
+# and pins resolved for 3.12 were then installed into 3.10.
+PY_IDENTITY='import sys; print("%d.%d %s" % (sys.version_info[0], sys.version_info[1], getattr(sys, "base_prefix", sys.prefix)))'
+WANT_PY="$("$PYTHON" -c "$PY_IDENTITY")"
+if [ -d "$APP_DIR/.venv" ]; then
+  HAVE_PY="$("$APP_DIR/.venv/bin/python" -c "$PY_IDENTITY" 2>/dev/null || true)"
+  if [ "$HAVE_PY" != "$WANT_PY" ]; then
+    echo "    virtualenv is ${HAVE_PY:-unreadable}; $PYTHON is $WANT_PY"
+    echo "    rebuilding it"
+    rm -rf "$APP_DIR/.venv"
+  fi
 fi
 [ -d "$APP_DIR/.venv" ] || "$PYTHON" -m venv "$APP_DIR/.venv"
 "$APP_DIR/.venv/bin/pip" install --upgrade pip -q
@@ -140,7 +157,20 @@ fi
 # constraints file has been generated on this platform (see
 # deploy/make-constraints.sh) it decides the versions instead.
 if [ -f "$APP_DIR/deploy/constraints.txt" ]; then
-  echo "    pinned by deploy/constraints.txt"
+  # Wheels and dependency markers differ by interpreter and platform, so a
+  # constraints file resolved elsewhere is a set of pins for software this
+  # machine is not running. It says where it came from; check before using it.
+  RESOLVED_FOR="$("$APP_DIR/.venv/bin/python" -c \
+    'import sys; print("Python %d.%d, %s" % (sys.version_info[0], sys.version_info[1], sys.platform))')"
+  if ! grep -qF "$RESOLVED_FOR" "$APP_DIR/deploy/constraints.txt"; then
+    echo "deploy/constraints.txt was not resolved for $RESOLVED_FOR:" >&2
+    grep -m1 '^# Resolved from' "$APP_DIR/deploy/constraints.txt" >&2 || true
+    echo "Regenerate it here and run the tests:" >&2
+    echo "  bash $REPO_DIR/deploy/make-constraints.sh $PYTHON" >&2
+    echo "or delete it to resolve versions afresh." >&2
+    exit 1
+  fi
+  echo "    pinned by deploy/constraints.txt ($RESOLVED_FOR)"
   "$APP_DIR/.venv/bin/pip" install -c "$APP_DIR/deploy/constraints.txt" \
     -r "$APP_DIR/requirements.txt" -q
 else

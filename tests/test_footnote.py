@@ -2043,6 +2043,74 @@ def test_the_installer_refuses_to_empty_a_directory_it_does_not_own(tmp_path):
     assert _run_app_dir_check(str(empty), str(empty)) != 0
 
 
+def test_the_installer_refuses_a_checkout_inside_the_installation(tmp_path):
+    """The marker check waved this through: a checkout living inside an
+    installation is deleted by the same rsync --delete that is reading from
+    it. Reproduced in a temp tree: rsync exited 23 and left neither the
+    checkout nor a finished install."""
+    app_dir = tmp_path / "opt-footnote"
+    (app_dir / "src" / "static").mkdir(parents=True)
+    (app_dir / ".footnote-install").write_text("")
+    for name in ("app.py", "pipeline.py"):
+        (app_dir / name).write_text("")
+        (app_dir / "src" / name).write_text("")
+    (app_dir / "static").mkdir()
+    assert _run_app_dir_check(str(app_dir), str(app_dir / "src")) != 0
+    # The ordinary arrangement, checkout beside the installation, is fine.
+    beside = tmp_path / "checkout"
+    beside.mkdir()
+    assert _run_app_dir_check(str(app_dir), str(beside)) == 0
+
+
+def test_the_shell_scripts_declare_their_dialect():
+    """paths.sh has no shebang because it is sourced, and ShellCheck stops
+    at SC2148 without knowing what to assume. With the directive, and with
+    -x so it follows the source, all four scripts come back clean."""
+    deploy = Path(__file__).resolve().parent.parent / "deploy"
+    assert "# shellcheck shell=bash" in (deploy / "paths.sh").read_text()
+    for name in ("install.sh", "add-instance.sh", "make-constraints.sh"):
+        assert (deploy / name).read_text().startswith("#!/usr/bin/env bash")
+
+
+def test_an_env_value_that_cannot_be_read_back_is_refused():
+    """A path with a $ or a backslash is written verbatim on the first run
+    and refused by the parser on the next, so the run that is supposed to be
+    idempotent stops instead. Caught before anything is written."""
+    import subprocess
+    deploy = Path(__file__).resolve().parent.parent / "deploy"
+
+    def check(value):
+        return subprocess.run(
+            ["bash", "-c", f'. "{deploy / "paths.sh"}"; '
+                           f'check_storable output-dir "$1"', "sh", value],
+            capture_output=True, text=True).returncode
+
+    assert check("/home/someone/Research/inbox") == 0
+    assert check("/srv/My Notes") == 0                  # a space is fine
+    for bad in ("/home/me/$research", "/home/me/back\\slash",
+                '/home/me/qu"ote', "/home/me/apos'trophe",
+                "/home/me/two\nlines"):
+        assert check(bad) != 0, bad
+    add = (deploy / "add-instance.sh").read_text()
+    assert add.index("check_storable output-dir") < add.index('cat > "$ENV_FILE"')
+
+
+def test_the_installer_rebuilds_a_venv_from_another_interpreter():
+    """"New enough" kept a 3.10 environment on a run that said
+    PYTHON=/usr/bin/python3.12, so the override silently did nothing — and
+    pins resolved for 3.12 were then installed into 3.10."""
+    install = (Path(__file__).resolve().parent.parent
+               / "deploy" / "install.sh").read_text()
+    assert "PY_IDENTITY=" in install
+    assert 'base_prefix' in install          # version alone is not identity
+    assert '"$HAVE_PY" != "$WANT_PY"' in install
+    # And a constraints file resolved elsewhere is refused rather than used.
+    assert "was not resolved for" in install
+    generator = (Path(__file__).resolve().parent.parent
+                 / "deploy" / "make-constraints.sh").read_text()
+    assert '"# Resolved from requirements.txt on {where}."' in generator
+
+
 def test_the_installer_leaves_its_marker_behind():
     """The guard above is only as good as the thing it looks for."""
     script = (Path(__file__).resolve().parent.parent
@@ -2279,17 +2347,96 @@ def _app_source():
     return (Path(__file__).resolve().parent.parent / "app.py").read_text()
 
 
-def test_a_stuck_endpoint_does_not_queue_every_later_notification(monkeypatch):
-    """The slot was held by whoever was waiting, so four endpoints that never
-    answer took all four and everything queued behind them — every finished
-    job then sat in notify_all for the life of the process, holding its task
-    and its result. Four stuck devices should cost four stuck devices."""
+def test_every_registered_device_is_told(monkeypatch):
+    """The slots bound how many deliveries are in flight, not how many
+    happen. Taking a slot without queueing meant six subscriptions and two
+    slots told two devices and silently dropped four."""
+    import threading
+    attempted = []
+    guard = threading.Lock()
+
+    def record(sub, payload):
+        with guard:
+            attempted.append(sub["endpoint"])
+        time.sleep(0.02)
+        return True
+
+    monkeypatch.setattr(app_module, "_push_one", record)
+    monkeypatch.setattr(app_module, "webpush", record)
+    monkeypatch.setattr(app_module, "VAPID_PRIVATE_KEY", "priv")
+    monkeypatch.setattr(app_module, "VAPID_PUBLIC_KEY", "pub")
+    monkeypatch.setattr(app_module, "VAPID_CLAIM_EMAIL", "me@example.test")
+    monkeypatch.setattr(app_module.app.state, "push_slots",
+                        threading.BoundedSemaphore(2), raising=False)
+    monkeypatch.setattr(app_module.subs, "data",
+                        {f"k{n}": {"endpoint": f"https://push.test/{n}"}
+                         for n in range(6)})
+    monkeypatch.setattr(app_module.subs, "save", lambda: None)
+
+    asyncio.run(app_module._notify_all("t", "b", "/jobs/x/report"))
+    assert sorted(attempted) == [f"https://push.test/{n}" for n in range(6)]
+
+
+def test_a_renewed_subscription_survives_the_old_ones_failure(monkeypatch):
+    """A subscription is keyed by a UUIDv5 of its endpoint, so a browser that
+    re-subscribes lands on the same key. A delivery that started before that
+    and came back "gone" was talking about the record it has just replaced."""
+    import threading
+    started = threading.Event()
+
+    def slow_and_gone(sub, payload):
+        started.set()
+        time.sleep(0.3)
+        return False                     # the old registration is dead
+
+    monkeypatch.setattr(app_module, "_push_one", slow_and_gone)
+    monkeypatch.setattr(app_module, "webpush", slow_and_gone)
+    monkeypatch.setattr(app_module, "VAPID_PRIVATE_KEY", "priv")
+    monkeypatch.setattr(app_module, "VAPID_PUBLIC_KEY", "pub")
+    monkeypatch.setattr(app_module, "VAPID_CLAIM_EMAIL", "me@example.test")
+    monkeypatch.setattr(app_module.app.state, "push_slots",
+                        threading.BoundedSemaphore(4), raising=False)
+    key = "one-key"
+    monkeypatch.setattr(app_module.subs, "data",
+                        {key: {"endpoint": "https://push.test/x",
+                               "keys": {"p256dh": "OLD"}}})
+    monkeypatch.setattr(app_module.subs, "save", lambda: None)
+
+    async def run():
+        sending = asyncio.ensure_future(
+            app_module._notify_all("t", "b", "/jobs/x/report"))
+        await asyncio.get_event_loop().run_in_executor(None, started.wait, 5)
+        app_module.subs.data[key] = {"endpoint": "https://push.test/x",
+                                     "keys": {"p256dh": "NEW"}}
+        await sending
+
+    asyncio.run(run())
+    assert app_module.subs.data.get(key, {}).get("keys") == {"p256dh": "NEW"}
+
+    # And a record that has *not* been replaced is still pruned.
+    app_module.subs.data[key] = {"endpoint": "https://push.test/x",
+                                 "keys": {"p256dh": "OLD"}}
+    asyncio.run(app_module._notify_all("t", "b", "/jobs/x/report"))
+    assert key not in app_module.subs.data
+
+
+def test_stuck_endpoints_cost_only_their_own_slots(monkeypatch):
+    """Two things had to be true at once, and each fix broke the other.
+
+    Held by whoever was waiting, four endpoints that never answer occupied
+    all four slots and every later notification queued behind them, so every
+    finished job stayed suspended in notify_all for the life of the process.
+    Taken without queueing, six devices and four slots told four. So: the
+    slot is waited for, in the thread, with a deadline — and the job waiting
+    on the delivery has a deadline of its own.
+    """
     import threading
     held = threading.Event()
     monkeypatch.setattr(app_module, "_push_one",
                         lambda sub, payload: held.wait(10) or True)
+    monkeypatch.setattr(app_module, "PUSH_TOTAL_TIMEOUT_S", 0.4)
     monkeypatch.setattr(app_module.app.state, "push_slots",
-                        threading.BoundedSemaphore(2))
+                        threading.BoundedSemaphore(2), raising=False)
 
     async def run():
         stuck = [asyncio.ensure_future(app_module._push_in_thread({}, {}))
@@ -2303,8 +2450,9 @@ def test_a_stuck_endpoint_does_not_queue_every_later_notification(monkeypatch):
         return third, waited
 
     third, waited = asyncio.run(run())
-    assert third is True                # not evidence the device is gone
-    assert waited < 1.0, waited         # dropped, not queued behind the two
+    # Not dropped on the spot, and not waited on for ever either.
+    assert third is True                # never evidence that a device is gone
+    assert waited < 3.0, waited
 
 
 def test_a_push_that_never_answers_is_given_up_on(monkeypatch):
@@ -2315,7 +2463,7 @@ def test_a_push_that_never_answers_is_given_up_on(monkeypatch):
                         lambda sub, payload: held.wait(10) or True)
     monkeypatch.setattr(app_module, "PUSH_TOTAL_TIMEOUT_S", 0.2)
     monkeypatch.setattr(app_module.app.state, "push_slots",
-                        threading.BoundedSemaphore(2))
+                        threading.BoundedSemaphore(2), raising=False)
 
     async def run():
         started = time.monotonic()

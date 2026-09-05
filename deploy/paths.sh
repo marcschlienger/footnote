@@ -2,7 +2,11 @@
 # Licensed under the GNU AGPL v3.0 or later; see the LICENSE file for details.
 # SPDX-License-Identifier: AGPL-3.0-or-later
 #
-# Path checks shared by install.sh and add-instance.sh. Sourced, not run.
+# shellcheck shell=bash
+#
+# Path checks shared by install.sh and add-instance.sh. Sourced, not run —
+# hence the directive above, which tells ShellCheck what dialect to assume
+# for a file with no shebang.
 #
 # Both scripts run as root, and both turn a path — from the command line, or
 # from an env file somebody edited months ago — into the target of mkdir,
@@ -51,6 +55,30 @@ is_broad_dir() {
       return 0 ;;
   esac
   return 1
+}
+
+# A value that survives a round trip through the env file. systemd's
+# EnvironmentFile treats $ and backslashes as syntax, and the parser that
+# reads the file back on the next run refuses both rather than guess. A path
+# that goes in and cannot come out again works on the first run and breaks
+# every repair after it — the run that was supposed to be idempotent.
+check_storable() {
+  local label="$1" value="$2"
+  case "$value" in
+    *'$'*|*\\*|*'"'*|*"'"*)
+      echo "$label must not contain \$ \\ \" or ': $value" >&2
+      echo "systemd would read it differently from the way it is written," >&2
+      echo "and the next run could not read it back at all." >&2
+      return 1 ;;
+  esac
+  # $'…' rather than $(printf …): command substitution strips the trailing
+  # newline, so the pattern became "**" and refused every path there is.
+  case "$value" in
+    *$'\n'*|*$'\t'*|*$'\r'*)
+      echo "$label must not contain a newline or a tab: $value" >&2
+      return 1 ;;
+  esac
+  return 0
 }
 
 # An absolute path, free of . and .., that is not one of the above. `label`

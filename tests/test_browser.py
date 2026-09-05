@@ -60,7 +60,11 @@ def _fixture_dossier(root: Path):
     return report
 
 
-@pytest.fixture(scope="module")
+# Function scope, not module: these tests press the app's real controls, and
+# one of them presses Remove. A server shared across the file meant that
+# deletion was permanent for every test that ran after it — the failure
+# looked like a caching bug and was a fixture leaking state.
+@pytest.fixture
 def server(tmp_path_factory):
     root = tmp_path_factory.mktemp("browser")
     output, data = root / "out", root / "data"
@@ -111,14 +115,15 @@ def _wait_for(base, process):
 
 @pytest.fixture(scope="module")
 def browser():
-    # Installed and *usable* are different questions: the package can be
-    # present with no browser behind it, and that is a missing tool, not a
-    # broken Footnote.
+    # A missing browser is a missing tool and skips; anything else is a
+    # failure. Catching every launch error turned a sandbox problem, a
+    # crashing binary or a CI regression into twenty green skips labelled
+    # "chromium is not installed", which is all the behavioural coverage
+    # there is, quietly gone.
     with sync_playwright() as play:
-        try:
-            engine = play.chromium.launch()
-        except Exception as why:                           # noqa: BLE001
-            pytest.skip(f"chromium is not installed for playwright: {why}")
+        if not Path(play.chromium.executable_path).exists():
+            pytest.skip("chromium is not installed: playwright install chromium")
+        engine = play.chromium.launch()
         yield engine
         engine.close()
 
@@ -129,6 +134,17 @@ def page(browser, server):
     sheet = context.new_page()
     yield sheet
     context.close()
+
+
+def test_the_suite_skips_only_when_the_browser_is_absent():
+    """Catching every launch error turned a sandbox problem, a crashing
+    binary or a CI regression into twenty green skips labelled "chromium is
+    not installed" — all the behavioural coverage there is, quietly gone."""
+    source = Path(__file__).read_text()
+    fixture = source[source.index("def browser():"):]
+    fixture = fixture[:fixture.index("\n\n\n")]
+    assert "executable_path" in fixture      # asked before it is launched
+    assert "except" not in fixture           # and nothing swallows the rest
 
 
 def _card_ready(sheet, base):
@@ -554,7 +570,9 @@ def test_a_dossier_read_once_is_readable_with_no_network(page, server):
 
 def test_removing_a_job_empties_its_cache(page, server):
     """A deleted dossier that stays in the cache is readable offline for
-    ever, which is not what "remove" means."""
+    ever, which is not what "remove" means. Driven through the real control,
+    because the button is what a person presses — and because posting the
+    message by hand skipped the part where the app has to send it at all."""
     _service_worker_ready(page, server)
     page.goto(f"{server}/jobs/{JOB_ID}/report")
     page.wait_for_selector(".report-body")
@@ -562,8 +580,37 @@ def test_removing_a_job_empties_its_cache(page, server):
 
     page.goto(server)
     page.wait_for_selector(".job .del")
-    page.evaluate(
-        """(id) => navigator.serviceWorker.controller.postMessage(
-             {type: 'forget-job', jobId: id})""", JOB_ID)
+    page.locator(".job .del").first.click()
     assert _poll(page, CACHED_JOB, JOB_ID, False), \
         "the dossier is still cached after the job was removed"
+
+
+def test_a_refresh_in_flight_cannot_put_a_removed_job_back(page, server):
+    """cacheThenRefresh serves the cached page and refreshes behind it, and
+    that refresh can finish its cache.put after the delete has emptied the
+    cache — leaving a dossier readable offline for a job that is gone.
+
+    Driven through the worker's own functions, because the ordering cannot be
+    staged from outside: a sync-API route handler that sleeps blocks the
+    driver as well, so the click it is supposed to interleave with cannot
+    happen until it returns. What is asserted is the ordering itself.
+    """
+    _service_worker_ready(page, server)
+    page.goto(f"{server}/jobs/{JOB_ID}/report")
+    page.wait_for_selector(".report-body")
+    assert page.evaluate(CACHED_JOB, JOB_ID)
+
+    worker = page.context.service_workers[0]
+    still_cached = worker.evaluate("""async (id) => {
+      const cache = await caches.open('footnote-dossier-v2');
+      const request = new Request(
+        new URL('/jobs/' + id + '/report', self.location.origin));
+      // The delete lands first…
+      await forgetJob(new URL(request.url));
+      // …and the refresh that was already in flight finishes afterwards.
+      await keep(cache, request, new Response('<p>late</p>',
+                                              {headers: {'Content-Type': 'text/html'}}));
+      return !!(await cache.match(request));
+    }""", JOB_ID)
+    assert still_cached is False, "a late refresh put the removed dossier back"
+    assert not page.evaluate(CACHED_JOB, JOB_ID)

@@ -1,4 +1,4 @@
 -r requirements.txt
 pytest>=8.0
-playwright>=1.49   # deploy/gen_icons.py only
+playwright>=1.49   # tests/test_browser.py and deploy/gen_icons.py
 pillow>=10.0       # deploy/gen_icons.py only (favicon.ico bundling)

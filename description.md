@@ -718,6 +718,13 @@ optionally hardened one notch.
   recorded can since have become a link to anything the service account can
   read; the index lists only what the read endpoint would actually serve, so
   the two can never disagree.
+- A failed delivery prunes the subscription only if the stored record is
+  still the one that failed. Subscriptions are keyed by a UUIDv5 of the
+  endpoint, so a browser that re-subscribes lands on the same key with new
+  keys of its own — and a delivery that began before that and came back
+  "gone" was describing the record it has just replaced. Compared by value
+  rather than identity, because a `save()` in between rebuilds the records
+  from their cleaned form.
 - A push endpoint must be HTTPS, at a public address, and carry no
   credentials in the URL — stricter than the link policy the dossier uses,
   where `mailto:` is a legitimate citation and not somewhere a notification
@@ -739,6 +746,12 @@ optionally hardened one notch.
   an endpoint that dribbles a byte inside every read timeout could eventually
   stall saving a dossier. The timeout is a connect/read pair rather than a
   scalar, because `requests` reads a scalar as *inactivity*, not total time.
+
+  Every registered device is told: the slots bound how many deliveries are in
+  flight, not how many are attempted. Taking a slot without queueing at all
+  was how the first version bounded them, and six devices against four slots
+  then told four. A slot is worth waiting for; it is not worth waiting for
+  forever, so the wait happens in the thread and has a deadline of its own.
 
   Three things follow from a push having no local effect worth waiting for.
   The threads are daemons, because a `ThreadPoolExecutor`'s workers are not

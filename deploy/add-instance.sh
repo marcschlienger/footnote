@@ -41,6 +41,8 @@ ENV_FILE="/etc/footnote/$USER_NAME.env"
 # hand the root of the filesystem to one user at mode 700.
 check_target_dir output-dir "$OUT" || exit 1
 check_target_dir DATA_DIR "$DATA" || exit 1
+check_storable output-dir "$OUT" || exit 1
+check_storable DATA_DIR "$DATA" || exit 1
 case "$PORT" in
   ''|*[!0-9]*) echo "port must be a number, not: $PORT" >&2; exit 1 ;;
 esac
