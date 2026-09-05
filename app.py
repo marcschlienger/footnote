@@ -38,11 +38,11 @@ import re
 import secrets
 import sys
 import tempfile
+import threading
 import time
 import traceback
 import uuid
 import zipfile
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from html import escape
@@ -526,6 +526,40 @@ def _push_session():
     return session
 
 
+async def _push_in_thread(sub: dict, payload: dict) -> bool:
+    """Run one blocking push on a thread the interpreter will not wait for.
+
+    pywebpush is synchronous, so this has to leave the loop. It must not
+    leave on a ThreadPoolExecutor thread: those are not daemons and the
+    interpreter joins them on the way out, so shutdown(wait=False) returns
+    at once and the process still sits there for as long as the call takes —
+    measured at the full length of a sleeping worker. A push that is still
+    dribbling has nothing local worth waiting for; the device either got it
+    or it did not, and a restart should not be held up for the answer.
+    """
+    loop = asyncio.get_running_loop()
+    done = loop.create_future()
+
+    def finish(setter, value):
+        if not done.cancelled():
+            setter(value)
+
+    def run():
+        try:
+            result = _push_one(sub, payload)
+        except BaseException as exc:                       # noqa: BLE001
+            call = (done.set_exception, exc)
+        else:
+            call = (done.set_result, result)
+        try:
+            loop.call_soon_threadsafe(finish, *call)
+        except RuntimeError:
+            pass                    # the loop closed first; nobody is waiting
+    threading.Thread(target=run, daemon=True,
+                     name="footnote-push").start()
+    return await done
+
+
 def _push_one(sub: dict, payload: dict) -> bool:
     """Blocking pywebpush call; returns False if the subscription is dead."""
     session = _push_session()
@@ -590,17 +624,17 @@ async def _notify_all(title: str, body: str, url: str) -> None:
         return
     payload = {"title": title, "body": body, "url": url,
                "icon": "/static/icon-192.png", "badge": "/static/icon-192.png"}
-    # A pool of its own, sized once for the process. A semaphore per call
-    # gave two jobs finishing together twice the slots, and asyncio.to_thread
-    # would put these on the default executor — the same one write_report
-    # uses, so a hung push would eventually stall saving a dossier.
-    loop = asyncio.get_event_loop()
-    pool = getattr(app.state, "push_pool", None)
+    # Slots sized once for the process. A semaphore per call gave two jobs
+    # finishing together twice the slots, and asyncio.to_thread would put
+    # these on the default executor — the same one write_report uses, so a
+    # hung push would eventually stall saving a dossier.
+    slots = getattr(app.state, "push_slots", None)
 
     async def deliver(key, sub):
-        if pool is None:                       # outside the app's lifespan
-            return key, await asyncio.to_thread(_push_one, sub, payload)
-        return key, await loop.run_in_executor(pool, _push_one, sub, payload)
+        if slots is None:                      # outside the app's lifespan
+            return key, await _push_in_thread(sub, payload)
+        async with slots:
+            return key, await _push_in_thread(sub, payload)
 
     results = await asyncio.gather(
         *(deliver(k, v) for k, v in list(subs.data.items())))
@@ -936,8 +970,7 @@ async def lifespan(application: FastAPI):
     # dossiers written".
     application.state.robots = (pipeline.RobotsCache()
                                if RESPECT_ROBOTS else None)
-    application.state.push_pool = ThreadPoolExecutor(
-        max_workers=PUSH_CONCURRENCY, thread_name_prefix="footnote-push")
+    application.state.push_slots = asyncio.Semaphore(PUSH_CONCURRENCY)
     # Jobs interrupted by a restart: the Parallel run survives server-side,
     # so re-attach by run_id; jobs that never got a run_id start over.
     application.state.tasks = set()
@@ -953,9 +986,6 @@ async def lifespan(application: FastAPI):
     # Unwind before the client closes — a task cancelled mid-request would
     # otherwise wake up holding a closed transport.
     await asyncio.gather(*tasks, return_exceptions=True)
-    # Not waited on: a thread stuck in a push cannot be interrupted, and
-    # shutdown should not be held hostage to one.
-    application.state.push_pool.shutdown(wait=False)
     await application.state.client.aclose()
 
 

@@ -86,7 +86,7 @@ fi
 # quotes attached and have install(1) create a relative directory of that
 # name. Sourcing the file as root is not an option, so: strip one layer of
 # matching quotes and accept the result only if it is an absolute path.
-read_env_path() {
+read_env_value() {
   local raw
   raw="$(sed -n "s/^[[:space:]]*$1=//p" "$ENV_FILE" | tail -1)"
   # Trim surrounding whitespace, then one layer of matching quotes.
@@ -98,9 +98,17 @@ read_env_path() {
   esac
   case "$raw" in
     # Escapes and variable references are systemd syntax this cannot resolve.
-    # Say so rather than silently repairing the wrong directory.
-    *\\*|*'$'*) echo "cannot parse $1 in $ENV_FILE; leaving its directory alone" >&2
+    # Say so rather than acting on a half-read value.
+    *\\*|*'$'*) echo "cannot parse $1 in $ENV_FILE; leaving it alone" >&2
                 printf '' ;;
+    *) printf '%s' "$raw" ;;
+  esac
+}
+
+read_env_path() {
+  local raw
+  raw="$(read_env_value "$1")"
+  case "$raw" in
     /*) printf '%s' "$raw" ;;
     "") printf '' ;;
     *)  echo "$1 in $ENV_FILE is not an absolute path; leaving it alone" >&2
@@ -108,11 +116,29 @@ read_env_path() {
   esac
 }
 
+read_env_port() {
+  local raw
+  raw="$(read_env_value PORT)"
+  case "$raw" in
+    ''|*[!0-9]*) printf '' ;;
+    *) printf '%s' "$raw" ;;
+  esac
+}
+
 if [ -f "$ENV_FILE" ]; then
   EXISTING_OUT="$(read_env_path OUTPUT_DIR)"
   EXISTING_DATA="$(read_env_path DATA_DIR)"
+  EXISTING_PORT="$(read_env_port)"
   [ -n "$EXISTING_OUT" ] && OUT="$EXISTING_OUT"
   [ -n "$EXISTING_DATA" ] && DATA="$EXISTING_DATA"
+  # The stored port is what systemd will actually use. Re-running with a
+  # different one used to change nothing and then advertise the new number,
+  # so the URL printed at the end pointed at a port nothing was listening on.
+  if [ -n "$EXISTING_PORT" ] && [ "$EXISTING_PORT" != "$PORT" ]; then
+    echo "==> $ENV_FILE already sets PORT=$EXISTING_PORT — keeping it."
+    echo "    Edit that file and restart footnote@$USER_NAME to change it."
+  fi
+  [ -n "$EXISTING_PORT" ] && PORT="$EXISTING_PORT"
 fi
 
 echo "==> Creating output directory $OUT and data directory $DATA"

@@ -245,6 +245,10 @@ li.job {
   border-left: 3px solid var(--ink-soft);
   border-radius: 8px;
 }
+.file-note {
+  color: var(--rule-red);
+  font-weight: 500;
+}
 .file-actions {
   display: flex;
   flex-wrap: wrap;

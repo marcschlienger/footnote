@@ -265,6 +265,29 @@ link-local, multicast and site-local addresses are refused, and the check
 lives inside `RobotsCache.allows` rather than only at the call site, because
 that method makes a request to whatever it is handed.
 
+Checking the address the citation names is not enough on its own, because
+the site chooses where the request goes next. `RobotsCache` therefore
+follows redirects by hand — `follow_redirects=False`, up to `ROBOTS_MAX_HOPS`
+hops, each target run through `is_public_http_url` before it is requested.
+Left to the client, a cited page answering `302 → http://127.0.0.1:8010/`
+had Footnote make that request and then read whatever came back as the
+site's rules, which could say "allowed". A chain that cannot be resolved
+inside the hop limit counts as unreadable, which is the disallowing answer.
+
+The body is streamed, for two reasons that both defeat a limit applied
+afterwards. A client that buffers the response has already accepted the
+megabytes by the time `[:ROBOTS_MAX_BYTES]` trims them — a 2 MB robots.txt
+was read in full. And httpx's timeout measures inactivity, not elapsed
+time, so a server sending one byte every few seconds resets it for as long
+as it likes. So: read until `ROBOTS_MAX_BYTES` and stop, truncating at the
+last complete line because half a `Disallow` is not a rule, under a
+`ROBOTS_DEADLINE_S` wall clock that covers every hop together.
+
+`ROBOTS_CONCURRENCY` caps these fetches across all jobs. The per-origin lock
+stops one site being asked twice at once; it does nothing about fifty
+origins at once, and these requests go straight to the sites, ahead of the
+Firecrawl semaphore that paces everything after them.
+
 ### Firecrawl
 
 `POST https://api.firecrawl.dev/v2/scrape`, `Authorization: Bearer …`:
@@ -527,6 +550,23 @@ Behavior notes:
   cached, so a poll — every five seconds while a job is running — cannot make
   what you are reading disappear or refetch it. A trailing Close returns
   focus to the control that opened it, which by then is well above the fold.
+- **Off-site is decided by origin, not by prefix.** `href.startsWith("http")`
+  is a prefix test, and `HTTP://example.com` is a valid absolute URL that
+  fails it — the server's own URL policy is case-insensitive, so such a
+  citation reaches the page and the link then replaced the app in its own
+  tab. Resolving the URL and comparing origins answers the question that was
+  being asked.
+- **A failed action says so.** The standalone pages have no flash area, and
+  their handlers caught everything into an empty block: Copy, Save and
+  Download were indistinguishable from a button that does nothing. They now
+  write the reason next to the control.
+- **Only the newest refresh renders.** A refresh is started by the poll, by
+  submitting a question and by removing a job, so two can be in flight;
+  `clearTimeout` at the top cancels a scheduled poll, not a request already
+  out. A slow first response landed after a fast second one and put the older
+  list back, and both calls armed a timer, so every submission permanently
+  doubled the poll rate. A generation counter decides which response owns the
+  render and the next timer.
 - **Copying works without HTTPS.** The Clipboard API is a secure-context
   feature and Footnote is normally reached over plain HTTP on a home network,
   where `navigator.clipboard` does not exist at all — Copy threw a
@@ -607,9 +647,10 @@ optionally hardened one notch.
   recorded can since have become a link to anything the service account can
   read; the index lists only what the read endpoint would actually serve, so
   the two can never disagree.
-- A push endpoint must be `http(s)`, which is stricter than the link policy
-  the dossier uses: `mailto:` is a legitimate citation and not somewhere a
-  notification can be delivered.
+- A push endpoint must be HTTPS, at a public address, and carry no
+  credentials in the URL — stricter than the link policy the dossier uses,
+  where `mailto:` is a legitimate citation and not somewhere a notification
+  can be delivered.
 - Rendered Markdown is rebuilt from an allowlist, so an archived page
   cannot run script on the origin that holds the session cookie.
 - Server filesystem paths stay server-side (see *What the client is not
@@ -735,6 +776,24 @@ optionally hardened one notch.
 systemctl status footnote@<user>
 journalctl -u footnote@<user> -f   # logs
 ```
+
+Both scripts run as root and both have a destructive edge, so both check
+their arguments before writing anything:
+
+- `install.sh` copies with `rsync --delete` and then walks the destination
+  with a recursive `chmod`. `APP_DIR` is an override, so pointed at `/opt`,
+  `/usr`, or any populated directory that is not a Footnote installation,
+  "install" means "delete what was there". It refuses unless the
+  destination is empty, carries the `.footnote-install` marker it writes
+  after a successful copy, or is recognisably a Footnote installation from
+  before the marker existed — that last case being the upgrade path the
+  script exists to be. System directories and the checkout itself are
+  refused outright.
+- `add-instance.sh` treats an existing env file as authoritative and re-reads
+  the port from it, not only the paths. Re-running an instance with a
+  different port used to change nothing — correctly, since the file is kept —
+  and then print the new number as the instance's URL, which pointed at a
+  port nothing was listening on.
 
 **macOS — Launch Agent (auto-starts at login):** save the plist below as
 `~/Library/LaunchAgents/<label>.plist`, where `<label>` is the reverse-DNS

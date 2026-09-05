@@ -6,6 +6,10 @@
 const $ = (id) => document.getElementById(id);
 const ACTIVE = new Set(["queued", "researching", "archiving", "saving"]);
 let pollTimer = null;
+// Refreshes are started by the poll, by submitting, and by removing a job,
+// so two can be in flight at once. The last response to arrive is not
+// necessarily the newest one.
+let pollGeneration = 0;
 let pushConfigured = false;
 // Which source panels the reader has open, and what they hold — polling
 // re-renders the whole list, and an open panel must survive that.
@@ -101,6 +105,12 @@ $("ask").addEventListener("submit", async (ev) => {
 
 async function refreshJobs() {
   clearTimeout(pollTimer);
+  // Whoever started last owns the render and the next timer. Without this a
+  // slow first response landed after a fast second one and put the older
+  // list back on screen, and both of them armed a timer — so every
+  // submission and every removal permanently doubled the poll rate.
+  const generation = ++pollGeneration;
+  const current = () => generation === pollGeneration;
   // Not fetchJSON: the service worker marks a list it served from cache
   // because the network was gone, and that is worth saying out loud.
   let data, fromCache = false;
@@ -109,7 +119,11 @@ async function refreshJobs() {
     if (!res.ok) throw new Error(res.statusText);
     fromCache = res.headers.get("X-Footnote-Cached") === "1";
     data = await res.json();
-  } catch (e) { pollTimer = setTimeout(refreshJobs, 15000); return; }
+  } catch (e) {
+    if (current()) pollTimer = setTimeout(refreshJobs, 15000);
+    return;
+  }
+  if (!current()) return;         // a newer refresh has this in hand
 
   const list = $("jobs");
   $("jobs-section").hidden = data.jobs.length === 0;
@@ -662,7 +676,15 @@ function link(href, label) {
   const a = document.createElement("a");
   a.href = href;
   a.textContent = label;
-  if (href.startsWith("http")) {         // off-site: new tab, no opener handle
+  // Off-site: new tab, no opener handle. Decided by the origin the URL
+  // actually resolves to, not by a prefix — "HTTP://example.com" is a
+  // perfectly good absolute URL that starts with neither "http" nor
+  // "https" as written, and would have replaced the app in its own tab.
+  let elsewhere = false;
+  try {
+    elsewhere = new URL(href, location.href).origin !== location.origin;
+  } catch (e) { /* not a URL we can resolve: treat it as our own */ }
+  if (elsewhere) {
     a.target = "_blank";
     a.rel = "noopener noreferrer";
   }

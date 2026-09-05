@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, urljoin, urlsplit
 from urllib.robotparser import RobotFileParser
 
 import httpx
@@ -541,9 +541,12 @@ CREDIT_COOLDOWN_S = 15 * 60
 # line for it.
 ROBOTS_AGENT = "FirecrawlAgent"
 ROBOTS_TTL_S = 3600          # re-read a site's rules occasionally
-ROBOTS_TIMEOUT_S = 10.0
+ROBOTS_TIMEOUT_S = 10.0      # per network operation; see ROBOTS_DEADLINE_S
+ROBOTS_DEADLINE_S = 20.0     # wall clock for one fetch, redirects included
 ROBOTS_MAX_BYTES = 512 * 1024
+ROBOTS_MAX_HOPS = 5          # redirects followed, each one re-checked
 ROBOTS_MAX_SITES = 500       # remembered rule sets, oldest dropped first
+ROBOTS_CONCURRENCY = 4       # robots.txt fetches in flight across all jobs
 ROBOTS_DISALLOWED = "the site's robots.txt asks agents not to fetch this"
 ROBOTS_UNAVAILABLE = "the site's robots.txt could not be read"
 ROBOTS_NOT_PUBLIC = "not a public web address"
@@ -561,12 +564,28 @@ class RobotsCache:
     """
 
     def __init__(self, agent: str = ROBOTS_AGENT, ttl_s: float = ROBOTS_TTL_S,
-                 max_sites: int = ROBOTS_MAX_SITES):
+                 max_sites: int = ROBOTS_MAX_SITES,
+                 concurrency: int = ROBOTS_CONCURRENCY):
         self.agent = agent
         self.ttl_s = ttl_s
         self.max_sites = max_sites
+        self.concurrency = max(1, concurrency)
         self._rules: dict = {}          # origin → (parser | None, fetched_at)
         self._locks: dict = {}
+        self._slots = None
+
+    def _fetch_slots(self) -> asyncio.Semaphore:
+        """A ceiling on robots.txt requests in flight, across every job.
+
+        The per-origin lock stops two citations from the same site racing,
+        and nothing stopped fifty origins from being asked at once — these
+        requests go straight to the sites, ahead of the Firecrawl semaphore
+        that paces everything after them. Built on first use so it binds to
+        the running loop, which asyncio.Semaphore does before 3.10.
+        """
+        if self._slots is None:
+            self._slots = asyncio.Semaphore(self.concurrency)
+        return self._slots
 
     async def allows(self, client: httpx.AsyncClient, url: str) -> tuple:
         """(allowed, reason). The reason is empty when it is allowed."""
@@ -608,24 +627,75 @@ class RobotsCache:
         return parser
 
     async def _fetch(self, client: httpx.AsyncClient, origin: str):
+        """Read one origin's robots.txt: hop by hop, under a wall clock.
+
+        Redirects are followed by hand because each hop is a request to a
+        host nobody cited. Letting the client follow them turned this check
+        — whose whole job is to be the thing that decides — into a way to
+        make Footnote fetch any address a cited site names: a 302 to
+        http://127.0.0.1:8010/ was requested, and whatever came back was
+        then read as that site's rules.
+
+        The body is streamed for two reasons. A buffering client has no size
+        limit at all — trimming resp.text happens after the megabytes have
+        arrived — and httpx's timeout measures inactivity, so a server
+        dripping one byte at a time can hold the request open for as long as
+        it likes. The deadline is elapsed time and applies to every hop
+        together.
+        """
+        url = f"{origin}/robots.txt"
+        deadline = time.monotonic() + ROBOTS_DEADLINE_S
+        for _ in range(ROBOTS_MAX_HOPS + 1):
+            # Every hop, not only the first: the origin was checked before we
+            # got here, but a redirect target is chosen by the site.
+            if not is_public_http_url(url):
+                return None
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return None
+            try:
+                async with self._fetch_slots():
+                    kind, value = await asyncio.wait_for(
+                        self._one_hop(client, url), timeout=left)
+            except Exception:                              # noqa: BLE001
+                return None                                # unreadable
+            if kind != "redirect":
+                return value
+            url = value
+        return None                     # round in circles: treat as unreadable
+
+    async def _one_hop(self, client: httpx.AsyncClient, url: str):
+        """One request. ("redirect", url) to follow, or ("rules", parser)."""
+        request = client.build_request(
+            "GET", url, timeout=httpx.Timeout(ROBOTS_TIMEOUT_S))
+        resp = await client.send(request, stream=True, follow_redirects=False)
         try:
-            resp = await client.get(f"{origin}/robots.txt",
-                                    timeout=httpx.Timeout(ROBOTS_TIMEOUT_S),
-                                    follow_redirects=True)
-        except Exception:                                  # noqa: BLE001
-            return None                                    # unreadable
-        if resp.status_code in (401, 403):
-            # Access to the rules themselves is restricted: RFC 9309 says
-            # that means the whole site is disallowed.
-            return None
-        if 400 <= resp.status_code < 500:
-            return _ALLOW_ALL             # no rules published: everything goes
-        if resp.status_code >= 500:
-            return None
-        body = resp.text[:ROBOTS_MAX_BYTES]
+            if resp.is_redirect:
+                return "redirect", urljoin(str(resp.url),
+                                           resp.headers["location"])
+            if resp.status_code in (401, 403):
+                # Access to the rules themselves is restricted: RFC 9309 says
+                # that means the whole site is disallowed.
+                return "rules", None
+            if 400 <= resp.status_code < 500:
+                return "rules", _ALLOW_ALL       # no rules: everything goes
+            if resp.status_code >= 500:
+                return "rules", None
+            body, size = [], 0
+            async for chunk in resp.aiter_bytes():
+                body.append(chunk)
+                size += len(chunk)
+                if size >= ROBOTS_MAX_BYTES:
+                    break
+        finally:
+            await resp.aclose()
+        text = b"".join(body)[:ROBOTS_MAX_BYTES].decode("utf-8", "replace")
+        if size > ROBOTS_MAX_BYTES:
+            # The cut landed mid-line, and half a Disallow is not a rule.
+            text = text[:text.rfind("\n") + 1]
         parser = RobotFileParser()
-        parser.parse(body.splitlines())
-        return parser
+        parser.parse(text.splitlines())
+        return "rules", parser
 
 
 class _AllowAll:

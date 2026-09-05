@@ -18,7 +18,8 @@ document.addEventListener("DOMContentLoaded", () => {
       if (anchor.dataset.file === "text") {
         toggle(anchor, href);
       } else {
-        takeBinary(href).catch(() => {});
+        takeBinary(href).catch(
+          (e) => complain(anchor, "Could not download that file: " + e.message));
       }
     });
   }
@@ -100,7 +101,12 @@ function actions(name, body) {
   const label = document.createElement("span");
   label.textContent = name;
   row.appendChild(label);
-  row.appendChild(button("Copy", () => copyText(body)));
+  row.appendChild(button("Copy", async () => {
+    if (!await copyText(body)) {
+      throw new Error("this browser would not let the page do it — " +
+                      "select the text below instead");
+    }
+  }));
   const file = () => new File([body], name, { type: "text/markdown" });
   try {
     if (navigator.canShare && navigator.canShare({ files: [file()] })) {
@@ -137,6 +143,22 @@ function button(label, run) {
   const el = document.createElement("button");
   el.className = "linkish";
   el.textContent = label;
-  el.onclick = () => Promise.resolve().then(run).catch(() => {});
+  el.onclick = () => Promise.resolve().then(run).catch(
+    (e) => complain(el, `Could not ${label.toLowerCase()}: ` + e.message));
   return el;
+}
+
+// These pages have no flash area, and an empty catch is why Copy, Save and
+// Download could each fail in silence — indistinguishable, from the reader's
+// side, from a button that does nothing.
+function complain(near, message) {
+  const row = near.closest(".file-actions") || near.closest("p")
+    || near.parentNode;
+  let note = row.querySelector(".file-note");
+  if (!note) {
+    note = document.createElement("span");
+    note.className = "file-note";
+    row.appendChild(note);
+  }
+  note.textContent = message;
 }

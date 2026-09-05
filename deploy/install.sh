@@ -22,11 +22,64 @@ set -euo pipefail
 APP_DIR="${APP_DIR:-/opt/footnote}"
 SHARED_GROUP="${SHARED_GROUP:-footnote}"
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Written after a successful copy, so a later run can tell its own
+# installation from a directory that merely happens to be there.
+APP_MARKER=".footnote-install"
+
+# APP_DIR is an override and everything below runs as root: the copy is
+# rsync --delete, which empties the destination, and the permissions pass is
+# a recursive chmod. Aimed at /opt, /usr, or any populated directory that is
+# not a Footnote installation, that is not an install — it is a deletion of
+# whatever was there. Refuse unless the destination is empty, carries the
+# marker, or is recognisably a Footnote installation from before the marker
+# existed.
+check_app_dir() {
+  local dir="$1" repo="${2:-}"
+  case "$dir" in
+    /*) ;;
+    *) echo "APP_DIR must be an absolute path, not: $dir" >&2; return 1 ;;
+  esac
+  case "$dir" in
+    */..|*/../*|*/.|*/./*)
+      echo "APP_DIR must not contain . or ..: $dir" >&2; return 1 ;;
+  esac
+  case "$dir" in
+    / | /bin | /boot | /dev | /etc | /home | /lib | /lib32 | /lib64 | /media       | /mnt | /opt | /proc | /root | /run | /sbin | /srv | /sys | /tmp       | /usr | /var)
+      echo "APP_DIR=$dir is a system directory, and the copy below would" >&2
+      echo "delete everything in it. Use a directory of its own, e.g." >&2
+      echo "/opt/footnote." >&2
+      return 1 ;;
+  esac
+  if [ -n "$repo" ] && [ "$dir" = "$repo" ]; then
+    echo "APP_DIR is this checkout; install to a directory of its own." >&2
+    return 1
+  fi
+  if [ -e "$dir" ] && [ ! -d "$dir" ]; then
+    echo "APP_DIR=$dir exists and is not a directory." >&2
+    return 1
+  fi
+  [ -d "$dir" ] || return 0                       # nothing there yet: fine
+  [ -f "$dir/$APP_MARKER" ] && return 0           # ours, from a previous run
+  # An installation made before the marker existed: recognise it rather than
+  # refusing the upgrade path this script exists to be.
+  if [ -f "$dir/app.py" ] && [ -f "$dir/pipeline.py" ] && [ -d "$dir/static" ]
+  then
+    return 0
+  fi
+  [ -z "$(ls -A -- "$dir" 2>/dev/null)" ] && return 0
+  echo "APP_DIR=$dir is not empty and was not installed by this script." >&2
+  echo "Copying into it runs rsync --delete, which would remove what is" >&2
+  echo "there. Choose an empty directory, or if this really is a Footnote" >&2
+  echo "installation, create $dir/$APP_MARKER and re-run." >&2
+  return 1
+}
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "Run as root: sudo bash deploy/install.sh" >&2
   exit 1
 fi
+
+check_app_dir "$APP_DIR" "$REPO_DIR" || exit 1
 
 echo "==> Installing system packages"
 apt-get update
@@ -49,7 +102,10 @@ mkdir -p "$APP_DIR"
 rsync -a --delete \
   --exclude '.venv' --exclude '__pycache__' --exclude '.git' \
   --exclude '.env' --exclude 'data' --exclude 'server.log' \
+  --exclude "$APP_MARKER" \
   "$REPO_DIR/" "$APP_DIR/"
+echo "Footnote application directory, managed by deploy/install.sh." \
+  > "$APP_DIR/$APP_MARKER"
 # Shared, instance-independent secrets (Parallel/Firecrawl/Notion/VAPID keys)
 # live here; per-person settings (port, output dir, token, DATA_DIR — and any
 # per-person key overrides) live in /etc/footnote/<user>.env, which wins:

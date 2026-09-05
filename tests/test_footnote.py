@@ -11,7 +11,9 @@ import asyncio
 import base64
 import io
 import json
+import os
 import re
+import sys
 import tempfile
 import time
 import uuid
@@ -327,6 +329,183 @@ def test_the_robots_fetch_cannot_be_aimed_inwards():
     for allowed, why in asyncio.run(run()):
         assert not allowed and why == pipeline.ROBOTS_NOT_PUBLIC
     assert reached == []                  # nothing was requested at all
+
+
+def test_a_robots_redirect_cannot_be_aimed_inwards():
+    """The first address is checked; every later one is chosen by the site.
+
+    Following redirects in the client made this check — the thing that
+    decides whether a fetch may happen — into a way to make Footnote request
+    any address a cited site cares to name, and then read the answer as that
+    site's rules.
+    """
+    reached = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        reached.append(str(request.url))
+        if request.url.host == "redirector.test":
+            return httpx.Response(
+                302, headers={"location": "http://127.0.0.1:8010/internal"})
+        return httpx.Response(200, text="User-agent: *\nAllow: /\n")
+
+    async def run():
+        robots = pipeline.RobotsCache()
+        async with httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)) as client:
+            return await robots.allows(client, "https://redirector.test/a")
+
+    allowed, why = asyncio.run(run())
+    assert reached == ["https://redirector.test/robots.txt"]
+    # Unreadable, not allowed: the answer we were pointed at does not count.
+    assert not allowed and why == pipeline.ROBOTS_UNAVAILABLE
+
+
+def test_a_robots_redirect_between_public_hosts_is_followed():
+    """A site that serves its rules from a CDN is not thereby unreadable."""
+    reached = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        reached.append(str(request.url))
+        if request.url.host == "moved.test":
+            return httpx.Response(
+                301, headers={"location": "https://cdn.test/robots.txt"})
+        return httpx.Response(200, text="User-agent: *\nDisallow: /no\n")
+
+    async def run():
+        robots = pipeline.RobotsCache()
+        async with httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)) as client:
+            return [await robots.allows(client, u)
+                    for u in ("https://moved.test/yes", "https://moved.test/no")]
+
+    (yes, _), (no, why) = asyncio.run(run())
+    assert reached == ["https://moved.test/robots.txt",
+                       "https://cdn.test/robots.txt"]
+    assert yes and not no and why == pipeline.ROBOTS_DISALLOWED
+
+
+def test_a_redirect_loop_gives_up():
+    reached = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        reached.append(str(request.url))
+        return httpx.Response(302, headers={"location": "https://b.test/robots.txt"}
+                              if request.url.host == "a.test"
+                              else {"location": "https://a.test/robots.txt"})
+
+    async def run():
+        robots = pipeline.RobotsCache()
+        async with httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)) as client:
+            return await robots.allows(client, "https://a.test/x")
+
+    allowed, why = asyncio.run(run())
+    assert not allowed and why == pipeline.ROBOTS_UNAVAILABLE
+    assert len(reached) == pipeline.ROBOTS_MAX_HOPS + 1
+
+
+def test_an_enormous_robots_file_is_read_only_to_the_limit(monkeypatch):
+    """A real socket, because the bug was that the client buffered first.
+
+    resp.text[:LIMIT] trims a body that has already arrived in full, so a
+    2 MB robots.txt was read entirely and the limit measured nothing. What
+    is counted here is what the server got down the socket: with the read
+    bounded that is one socket buffer's worth, and without it, all forty
+    megabytes. The address guard is stood down so the server can be a
+    loopback one; the read is what is under test.
+    """
+    monkeypatch.setattr(pipeline, "is_public_http_url", lambda url: True)
+    monkeypatch.setattr(pipeline, "ROBOTS_MAX_BYTES", 2048)
+    head = b"User-agent: *\nDisallow: /private\n# "
+    total = 40 * 1024 * 1024
+    sent = 0
+
+    async def run():
+        nonlocal sent
+
+        async def serve(reader, writer):
+            nonlocal sent
+            await reader.readuntil(b"\r\n\r\n")
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
+                         b"Content-Length: %d\r\nConnection: close\r\n\r\n"
+                         % total)
+            writer.write(head)
+            sent += len(head)
+            chunk = b"x" * 65536
+            while sent < total:
+                writer.write(chunk)
+                try:
+                    await writer.drain()
+                except Exception:                          # noqa: BLE001
+                    return
+                sent += len(chunk)
+
+        server = await asyncio.start_server(serve, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        robots = pipeline.RobotsCache()
+        async with httpx.AsyncClient() as client:
+            parser = await robots._fetch(client, f"http://127.0.0.1:{port}")
+        server.close()
+        return parser
+
+    parser = asyncio.run(run())
+    assert sent < 5_000_000, sent       # one buffer, not the whole file
+    # Truncated at a line boundary, so the rules that did arrive still hold.
+    assert parser.can_fetch(pipeline.ROBOTS_AGENT, "http://x/ok")
+    assert not parser.can_fetch(pipeline.ROBOTS_AGENT, "http://x/private/y")
+
+
+def test_a_dribbling_server_cannot_hold_the_fetch_open(monkeypatch):
+    """httpx's timeout is inactivity; one byte at a time resets it forever."""
+    monkeypatch.setattr(pipeline, "is_public_http_url", lambda url: True)
+    monkeypatch.setattr(pipeline, "ROBOTS_DEADLINE_S", 0.4)
+
+    async def run():
+        async def serve(reader, writer):
+            await reader.readuntil(b"\r\n\r\n")
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\n")
+            for _ in range(100):
+                writer.write(b"#")
+                try:
+                    await writer.drain()
+                except Exception:                          # noqa: BLE001
+                    return
+                await asyncio.sleep(0.1)
+        server = await asyncio.start_server(serve, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        robots = pipeline.RobotsCache()
+        started = time.monotonic()
+        async with httpx.AsyncClient() as client:
+            parser = await robots._fetch(client, f"http://127.0.0.1:{port}")
+        server.close()
+        return parser, time.monotonic() - started
+
+    parser, elapsed = asyncio.run(run())
+    assert parser is None               # unreadable, so the site is off limits
+    assert elapsed < 3.0, elapsed       # the server would have gone on for 10s
+
+
+def test_robots_fetches_are_bounded_across_jobs():
+    """Per-origin locks stop duplicates; nothing stopped fifty at once."""
+    live, peak = 0, 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal live, peak
+        live += 1
+        peak = max(peak, live)
+        await asyncio.sleep(0.02)
+        live -= 1
+        return httpx.Response(200, text="User-agent: *\nAllow: /\n")
+
+    async def run():
+        robots = pipeline.RobotsCache(concurrency=3)
+        async with httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)) as client:
+            await asyncio.gather(*(robots.allows(client, f"https://s{n}.test/a")
+                                   for n in range(20)))
+
+    asyncio.run(run())
+    assert peak <= 3, peak
 
 
 def test_internal_citations_are_never_archived():
@@ -991,6 +1170,53 @@ def test_copying_works_without_a_secure_context():
         assert "navigator.clipboard" not in elsewhere, name
 
 
+def test_an_off_site_link_is_decided_by_its_origin():
+    """href.startsWith("http") is a prefix test, and "HTTP://example.com" is
+    a perfectly good absolute URL that fails it — the citation then replaced
+    the app in its own tab, which is the dead end all of this exists to
+    avoid. The server's own URL policy is case-insensitive, so such a link
+    does reach the page."""
+    app_js = (Path(__file__).resolve().parent.parent
+              / "static" / "app.js").read_text()
+    body = app_js[app_js.index("function link(href, label)"):]
+    body = body[:body.index("\n}")]
+    assert "new URL(href, location.href).origin" in body
+    assert 'startsWith("http")' not in body
+    # And the server does let one through, so this is not hypothetical.
+    assert pipeline.is_http_url("HTTP://example.test/a")
+
+
+def test_the_standalone_pages_say_when_an_action_fails():
+    """Empty catches made Copy, Save and Download indistinguishable from a
+    button that does nothing."""
+    doc_js = (Path(__file__).resolve().parent.parent
+              / "static" / "document.js").read_text()
+    assert "catch(() => {})" not in doc_js.replace(" ", "")
+    assert "function complain(" in doc_js
+    css = (Path(__file__).resolve().parent.parent
+           / "static" / "style.css").read_text()
+    assert ".file-note" in css
+
+
+def test_only_the_newest_refresh_renders_and_arms_the_timer():
+    """Submitting and removing both start a refresh of their own, so two can
+    be in flight. Driven in a browser with a slow first response and a fast
+    second: the older list was rendered last and both calls armed a timer,
+    which doubled the poll rate for the rest of the session."""
+    app_js = (Path(__file__).resolve().parent.parent
+              / "static" / "app.js").read_text()
+    body = app_js[app_js.index("async function refreshJobs()"):]
+    body = body[:body.index("\nfunction renderJob")]
+    assert "++pollGeneration" in body
+    # Both exits are guarded: the render, and every setTimeout in here.
+    assert "if (!current()) return;" in body
+    for match in re.finditer(r"pollTimer = setTimeout", body):
+        line_start = body.rfind("\n", 0, match.start()) + 1
+        assert "current()" in body[line_start:match.start()] or \
+            "if (!current()) return;" in body[:match.start()], \
+            body[line_start:body.index("\n", match.start())]
+
+
 def test_the_pwa_can_read_in_place():
     app_js = (Path(__file__).resolve().parent.parent
               / "static" / "app.js").read_text()
@@ -1599,17 +1825,88 @@ def _run_add_instance_parser(env_text, keys):
     import subprocess
     script = (Path(__file__).resolve().parent.parent
               / "deploy" / "add-instance.sh").read_text()
-    body = script.split("read_env_path() {")[1].split("\n}")[0]
+
+    def extract(name):
+        return script.split(f"{name}() {{")[1].split("\n}")[0]
+
     with tempfile.TemporaryDirectory() as tmp:
         env_file = Path(tmp) / "instance.env"
         env_file.write_text(env_text)
         runner = Path(tmp) / "run.sh"
         runner.write_text(
-            f'ENV_FILE={env_file}\nread_env_path() {{{body}\n}}\n'
-            + "".join(f'echo "{k}=$(read_env_path {k})"\n' for k in keys))
+            f"ENV_FILE={env_file}\n"
+            + "".join(f"{name}() {{{extract(name)}\n}}\n"
+                      for name in ("read_env_value", "read_env_path",
+                                   "read_env_port"))
+            + "".join(f'echo "{k}=$({"read_env_port" if k == "PORT" else f"read_env_path {k}"})"\n'
+                      for k in keys))
         out = subprocess.run(["bash", str(runner)], capture_output=True,
                              text=True)
     return dict(line.split("=", 1) for line in out.stdout.splitlines())
+
+
+def _run_app_dir_check(app_dir, repo_dir=""):
+    """Execute install.sh's APP_DIR guard; returns its exit status."""
+    import subprocess
+    script = (Path(__file__).resolve().parent.parent
+              / "deploy" / "install.sh").read_text()
+    body = script.split("check_app_dir() {")[1].split("\n}")[0]
+    with tempfile.TemporaryDirectory() as tmp:
+        runner = Path(tmp) / "run.sh"
+        runner.write_text('APP_MARKER=".footnote-install"\n'
+                          f'check_app_dir() {{{body}\n}}\n'
+                          f'check_app_dir "{app_dir}" "{repo_dir}"\n')
+        return subprocess.run(["bash", str(runner)], capture_output=True,
+                              text=True).returncode
+
+
+def test_the_installer_refuses_to_empty_a_directory_it_does_not_own(tmp_path):
+    """APP_DIR is an override, and the copy is rsync --delete as root.
+
+    Aimed at /opt or at any populated directory, "install" means "delete
+    what is there". Only an empty directory, one carrying the marker, or
+    one that is recognisably a Footnote installation may be a destination.
+    """
+    for system in ("/", "/opt", "/usr", "/var", "/home", "/etc"):
+        assert _run_app_dir_check(system) != 0, system
+    assert _run_app_dir_check("relative/path") != 0
+    assert _run_app_dir_check("/srv/../etc") != 0
+
+    empty = tmp_path / "fresh"
+    empty.mkdir()
+    assert _run_app_dir_check(str(empty)) == 0
+    assert _run_app_dir_check(str(tmp_path / "does-not-exist-yet")) == 0
+
+    occupied = tmp_path / "someone-elses"
+    occupied.mkdir()
+    (occupied / "important.conf").write_text("keep me")
+    assert _run_app_dir_check(str(occupied)) != 0
+
+    # The upgrade path this script exists to be: an installation made before
+    # the marker existed is recognised, not refused.
+    (occupied / "app.py").write_text("")
+    (occupied / "pipeline.py").write_text("")
+    (occupied / "static").mkdir()
+    assert _run_app_dir_check(str(occupied)) == 0
+
+    marked = tmp_path / "ours"
+    marked.mkdir()
+    (marked / "stuff").write_text("x")
+    (marked / ".footnote-install").write_text("")
+    assert _run_app_dir_check(str(marked)) == 0
+
+    # And never onto the checkout it is copying from.
+    assert _run_app_dir_check(str(empty), str(empty)) != 0
+
+
+def test_the_installer_leaves_its_marker_behind():
+    """The guard above is only as good as the thing it looks for."""
+    script = (Path(__file__).resolve().parent.parent
+              / "deploy" / "install.sh").read_text()
+    assert '> "$APP_DIR/$APP_MARKER"' in script
+    # rsync --delete would otherwise remove it: it is not in the checkout.
+    rsync = script[script.index("rsync -a --delete"):]
+    assert '--exclude "$APP_MARKER"' in rsync[:rsync.index('"$APP_DIR/"')]
 
 
 def test_the_deployment_parser_handles_real_env_files():
@@ -1628,6 +1925,27 @@ def test_the_deployment_parser_handles_real_env_files():
     # Syntax this cannot resolve is refused rather than half-parsed.
     assert parsed["ESCAPED"] == "" and parsed["VARREF"] == ""
     assert parsed["REL"] == ""                 # relative paths are not paths
+
+
+def test_an_existing_instance_keeps_its_stored_port():
+    """The env file is authoritative and only its paths were re-read, so a
+    re-run with a different port changed nothing and then printed the new
+    number as the instance's URL."""
+    parsed = _run_add_instance_parser(
+        "PORT=8010\nOUTPUT_DIR=/srv/notes\n", ["PORT", "OUTPUT_DIR"])
+    assert parsed["PORT"] == "8010"
+    # Anything that is not a port is no answer at all — better to fall back
+    # to the argument than to advertise a parse artefact.
+    for bad in ("PORT=\nX=1\n", "PORT=eighty-ten\n", 'PORT="$SOMEVAR"\n'):
+        assert _run_add_instance_parser(bad, ["PORT"])["PORT"] == "", bad
+    assert _run_add_instance_parser('PORT="9000"\n', ["PORT"])["PORT"] == "9000"
+
+
+def test_the_installer_advertises_the_port_it_actually_uses():
+    script = (Path(__file__).resolve().parent.parent
+              / "deploy" / "add-instance.sh").read_text()
+    reread = script.index("EXISTING_PORT=")
+    assert script.index('App URL:') > reread          # printed after re-reading
 
 
 def test_the_instance_script_validates_before_it_writes():
@@ -1713,13 +2031,50 @@ def test_push_calls_are_bounded(client, monkeypatch):
     app_module.subs.data.clear()
 
 
-def test_the_push_pool_is_one_per_process(client):
+def test_the_push_slots_are_one_per_process(client):
     """A semaphore per notification gave two jobs twice the slots."""
-    pool = app_module.app.state.push_pool
-    assert pool._max_workers == app_module.PUSH_CONCURRENCY
-    # And it is not the executor asyncio.to_thread would use, which is the
-    # one write_report runs on.
-    assert pool is not None
+    assert isinstance(app_module.app.state.push_slots, asyncio.Semaphore)
+    # And these do not run on the executor asyncio.to_thread would use,
+    # which is the one write_report runs on.
+    source = _app_source()
+    assert "ThreadPoolExecutor(" not in source
+    assert "run_in_executor" not in source
+
+
+def _app_source():
+    return (Path(__file__).resolve().parent.parent / "app.py").read_text()
+
+
+def test_a_hung_push_does_not_delay_shutdown(tmp_path):
+    """A ThreadPoolExecutor's workers are not daemons, and the interpreter
+    joins them on the way out: shutdown(wait=False) returned immediately and
+    the process still waited for the whole call. A push that is still
+    dribbling has nothing local worth waiting for."""
+    import subprocess
+    import textwrap
+    repo = Path(__file__).resolve().parent.parent
+    program = textwrap.dedent("""
+        import asyncio, sys, time
+        sys.path.insert(0, %r)
+        import app as app_module
+        app_module._push_one = lambda sub, payload: (time.sleep(30), True)[1]
+
+        async def main():
+            task = asyncio.ensure_future(app_module._push_in_thread({}, {}))
+            await asyncio.sleep(0.3)          # let the thread start blocking
+            task.cancel()
+
+        asyncio.run(main())
+    """) % str(repo)
+    env = {"PATH": os.environ.get("PATH", ""),
+           "DATA_DIR": str(tmp_path / "data"),
+           "OUTPUT_DIR": str(tmp_path / "out"),
+           "HOME": str(tmp_path)}
+    started = time.monotonic()
+    subprocess.run([sys.executable, "-c", program], check=True,
+                   capture_output=True, timeout=25, env=env)
+    elapsed = time.monotonic() - started
+    assert elapsed < 10, elapsed          # the push itself sleeps for thirty
 
 
 def test_a_redirecting_endpoint_is_dropped(monkeypatch):
