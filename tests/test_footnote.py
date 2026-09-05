@@ -1247,11 +1247,16 @@ def test_opening_one_panel_does_not_hide_another_control(client, tmp_path):
     Sources opened it a screenful below and looked like nothing happened."""
     app_js = (Path(__file__).resolve().parent.parent
               / "static" / "app.js").read_text()
-    # The cause, not a proxy for it: a card-level panel given an anchor row
-    # is inserted straight after it, which is above the sources list. The
-    # dossier reader must be opened without one, so it appends to the end.
+    # Panels stack in the order their controls sit. The dossier reader was
+    # appended to the end of the card, so opening both put the sources list
+    # above the dossier — the reverse of the row that opens them.
     card_reader = app_js[app_js.index('label: "Read"'):]
-    assert "after:" not in card_reader[:card_reader.index("}))")], card_reader[:200]
+    assert "after: meta" in card_reader[:card_reader.index("}))")], card_reader[:200]
+    # And what makes that ordering safe: whatever was just opened is brought
+    # into view, so a panel below a screenful of text is not mistaken for a
+    # control that did nothing — which is how the old order was arrived at.
+    toggle = app_js[app_js.index("function sourcesToggle("):]
+    assert "reveal(panel)" in toggle[:toggle.index("\n}")]
     assert "function reveal(" in app_js
     assert app_js.count("reveal(panel)") >= 2      # sources and file panels
 

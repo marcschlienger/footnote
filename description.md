@@ -595,11 +595,18 @@ Behavior notes:
 - **Two panels, two independent switches.** "Read" and "Sources" open and
   close separately, and both are remembered by what they show, so a poll
   rebuilding the list closes neither and refetches nothing.
-- **Panels open where the control is.** The source list sits directly under
-  the links that open it; the dossier reader appends below it, a source's
-  reader opens under that source's own row, and whatever was just opened is
-  scrolled into view if it is not. Otherwise a panel opened above the list
-  pushes it a screenful down and the control appears to have done nothing.
+- **Panels stack in the order their controls sit.** The row reads `Read ·
+  Sources`, so the dossier reader opens directly under it and the source list
+  below that; a source's own reader opens under that source's row. The reader
+  used to be appended to the end of the card, which put the sources list above
+  the dossier — the reverse of the row that opens them.
+  What makes that order safe is that whatever was just opened is scrolled
+  into view: the dossier between the links and the list can be a screenful,
+  and without the scroll a control that worked looks like one that did
+  nothing. That is a browser test rather than an assertion about the source,
+  because it depends on layout — and on `requestAnimationFrame`, which never
+  fires while the document is hidden, so it can only be observed on a page
+  someone is actually looking at.
   Buttons keep their labels and carry `aria-expanded`, because two toggles in
   a row both renaming themselves "close" say nothing about which panel they
   close.

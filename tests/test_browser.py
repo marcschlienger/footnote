@@ -179,6 +179,51 @@ def test_only_the_newest_refresh_renders_and_arms_one_timer(page, server):
     assert result["armed"] == 1
 
 
+def test_panels_stack_in_the_order_their_controls_sit(page, server):
+    """The row reads Read · Sources, and the dossier reader was appended to
+    the end of the card — so opening both put the sources list above the
+    dossier, the reverse of the row that opens them."""
+    _card_ready(page, server)
+    page.get_by_role("button", name="Read").click()
+    page.wait_for_selector(".job > .src-body .src-content")
+    page.get_by_role("button", name="Sources").click()
+    page.wait_for_selector(".sources ol li")
+
+    order = page.eval_on_selector_all(
+        ".job:last-child > *", "els => els.map((e) => e.className)")
+    assert order.index("src-body") < order.index("sources"), order
+
+    # Opening them the other way round gives the same card.
+    page.reload()
+    page.wait_for_selector(".job .links button")
+    page.get_by_role("button", name="Sources").click()
+    page.wait_for_selector(".sources ol li")
+    page.get_by_role("button", name="Read").click()
+    page.wait_for_selector(".job > .src-body .src-content")
+    order = page.eval_on_selector_all(
+        ".job:last-child > *", "els => els.map((e) => e.className)")
+    assert order.index("src-body") < order.index("sources"), order
+
+
+def test_opening_the_sources_list_brings_it_into_view(page, server):
+    """The dossier now sits between the links and the list, which can be a
+    screenful. What stops that from looking like a control that did nothing
+    is that whatever was just opened is scrolled to — so this is the check
+    the panel order rests on."""
+    _card_ready(page, server)
+    page.get_by_role("button", name="Read").click()
+    page.wait_for_selector(".job > .src-body .src-content")
+    page.locator(".job .links").first.scroll_into_view_if_needed()
+    page.wait_for_timeout(200)
+
+    page.get_by_role("button", name="Sources").click()
+    page.wait_for_selector(".sources ol li")
+    assert _poll(page, """() => {
+        const box = document.querySelector('.sources').getBoundingClientRect();
+        return box.top >= 0 && box.top < window.innerHeight;
+      }""", None, True, seconds=5), "the sources list opened off screen"
+
+
 def test_every_open_panel_survives_a_poll(page, server):
     """The five-second poll rebuilds the whole list. Something you are
     part-way through reading must not vanish because a timer fired."""

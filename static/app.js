@@ -198,6 +198,10 @@ function renderJob(job) {
         filename: job.report_name,
         pageUrl: `/jobs/${job.id}/report`,
         host: li,
+        // Directly under the row that opens it, and so above the sources
+        // list: panels should stack in the order their controls sit. Read
+        // is the first control and its panel opened last, below Sources.
+        after: meta,
       }));
       links.appendChild(sourcesToggle(job));
       links.appendChild(bundleButton(`/jobs/${job.id}/bundle.zip`,
@@ -239,8 +243,10 @@ function renderJob(job) {
 
   li.appendChild(meta);
   if (job.status === "done") {
-    // Directly under the links that open it, and before any file or reader
-    // panel, which are appended to the end of the card.
+    // Last in the card, so the dossier reader can sit between the links and
+    // this. Nothing is hidden by that: whatever was just opened is scrolled
+    // into view, which is what stops a panel below a screenful of text from
+    // looking like a control that did nothing.
     const panel = document.createElement("div");
     panel.className = "sources";
     panel.hidden = !openSources.has(job.id);
