@@ -325,6 +325,15 @@ li.job {
   border-right: none;
 }
 .job > .src-body { margin-inline: -.9rem; }
+/* A copy opened from a "local copy" link inside a dossier keeps the rule and
+   the corners: it really is nested, and where you are should stay legible.
+   It still comes out of the list's indent, because it is also the thing you
+   are reading and two-thirds width is what made reading in place worse than
+   the page. */
+.src-content li > .src-body {
+  margin-inline: -1.5rem 0;
+  padding: .8rem .55rem .9rem;
+}
 /* A source sits one level deeper, inside the list's own indent. What you are
    reading should not be narrower for that: the row keeps its number, and the
    text lines up with the dossier's. */

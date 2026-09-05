@@ -315,6 +315,92 @@ def test_the_header_icon_lines_up_with_the_heading(page, server):
     assert abs(boxes["icon"]["height"] - boxes["title"]["height"]) <= 2, boxes
 
 
+def test_a_local_copy_opens_where_it_is_cited(page, server):
+    """Every archived citation ends with a "local copy" link, written into
+    the Markdown itself so the dossier works as a plain file in the notes
+    folder. Rendered in the app it was the one link that left the app: it
+    navigated to the source's own page and took the shell with it, closing
+    the dossier and everything else that was open."""
+    _card_ready(page, server)
+    page.get_by_role("button", name="Read").click()
+    page.wait_for_selector(".job > .src-body .src-content")
+    before = page.url
+
+    link = page.locator(".job > .src-body .src-content a[data-reader]").first
+    assert link.inner_text() == "local copy"
+    link.click()
+    page.wait_for_selector(".src-content li > .src-body .src-content")
+
+    assert page.url == before                     # nothing navigated
+    assert page.locator("#jobs").count() == 1     # still the shell
+    assert page.locator(".job > .src-body").count() == 1   # dossier still open
+    assert link.get_attribute("aria-expanded") == "true"
+    inside = page.eval_on_selector_all(
+        ".src-content li > .src-body .src-actions a, "
+        ".src-content li > .src-body .src-actions button",
+        "els => els.map((e) => e.textContent)")
+    assert "Copy text" in inside and "Open as page ↗" in inside, inside
+
+
+def test_a_local_copy_survives_a_poll_and_closes_again(page, server):
+    _card_ready(page, server)
+    page.get_by_role("button", name="Read").click()
+    page.wait_for_selector(".job > .src-body .src-content")
+    link = page.locator(".job > .src-body .src-content a[data-reader]").first
+    link.click()
+    page.wait_for_selector(".src-content li > .src-body")
+
+    page.evaluate("refreshJobs()")
+    assert _poll(page, "() => document.querySelectorAll("
+                       "'.src-content li > .src-body').length", None, 1), \
+        "a copy opened from the dossier did not survive the poll"
+
+    page.locator(".job > .src-body .src-content a[data-reader]").first.click()
+    assert _poll(page, "() => document.querySelectorAll("
+                       "'.src-content li > .src-body').length", None, 0)
+    page.evaluate("refreshJobs()")
+    page.wait_for_timeout(700)
+    assert page.locator(".src-content li > .src-body").count() == 0
+    assert page.locator(".job > .src-body").count() == 1   # dossier still open
+
+
+def test_the_same_source_in_two_places_is_two_readers(page, server):
+    """An archived page is reachable from the Sources list and from the
+    citation inside the dossier. Remembering open readers by URL alone made
+    opening one silently open the other, and closing either one arrange for
+    the survivor to disappear at the next poll."""
+    _card_ready(page, server)
+    page.get_by_role("button", name="Read").click()
+    page.wait_for_selector(".job > .src-body .src-content a[data-reader]")
+    page.get_by_role("button", name="Sources").click()
+    page.wait_for_selector(".sources ol li")
+
+    page.locator(".sources ol li button.src-title").first.click()
+    page.wait_for_selector(".sources ol li > .src-body")
+    assert page.locator(".src-content li > .src-body").count() == 0
+
+    page.locator(".job > .src-body .src-content a[data-reader]").first.click()
+    page.wait_for_selector(".src-content li > .src-body")
+    assert page.locator(".sources ol li > .src-body").count() == 1
+
+    # Closing the one in the list leaves the cited one, poll and all.
+    page.locator(".sources ol li button.src-title").first.click()
+    page.evaluate("refreshJobs()")
+    page.wait_for_timeout(800)
+    assert page.locator(".sources ol li > .src-body").count() == 0
+    assert page.locator(".src-content li > .src-body").count() == 1
+
+
+def test_the_standalone_page_keeps_the_plain_link(page, server):
+    """There is nothing to stay inside on a page of its own, and without
+    scripting the relative link is the only thing that works at all."""
+    page.goto(f"{server}/jobs/{JOB_ID}/report")
+    page.wait_for_selector(".report-body")
+    link = page.locator(".report-body a", has_text="local copy").first
+    assert link.get_attribute("data-reader") is None
+    assert link.get_attribute("href").startswith("sources/")
+
+
 # ---------------------------------------------------------------------------
 # Taking a file away without leaving the page
 # ---------------------------------------------------------------------------

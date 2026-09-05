@@ -520,7 +520,9 @@ Tailscale, WireGuard) and/or use the per-instance `FOOTNOTE_TOKEN`.
   in the source list, a title opens that archived page in the card. Inside
   whatever you are reading sit **Copy text**, **Save .md** and **Open as
   page ↗**, so the file and the standalone page are things you do with the
-  document rather than other ways of opening it. Nothing in the app
+  document rather than other ways of opening it. Inside a dossier, a
+  **local copy** link opens that source under the citation it belongs to
+  rather than navigating away. Nothing in the app
   navigates to a file: iOS Safari answers that with a view-or-download sheet
   you cannot get back from. Every standalone page has a link back to the app.
   A dossier

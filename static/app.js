@@ -326,6 +326,7 @@ function renderSource(src) {
   if (src.archived) {
     title = reader({
       label: src.title,
+      slot: "list",
       embedUrl: src.read_url + "?embed=1",
       rawUrl: src.download_url,
       filename: src.file,
@@ -365,8 +366,10 @@ function remember(url, body) {
 
 function forgetReaders(jobId) {
   const prefix = `/jobs/${jobId}/`;
-  for (const url of [...openReaders]) {
-    if (url.startsWith(prefix)) openReaders.delete(url);
+  for (const key of [...openReaders]) {
+    // A key may carry a slot name in front of the URL; nothing but a URL
+    // contains "/jobs/<id>/", so looking for it anywhere in the key is safe.
+    if (key.includes(prefix)) openReaders.delete(key);
   }
   for (const url of [...readerCache.keys()]) {
     if (url.startsWith(prefix)) readerCache.delete(url);
@@ -378,20 +381,30 @@ function forgetReaders(jobId) {
 // page — are actions on what you are reading, offered inside the panel
 // rather than competing with it in the row above.
 function reader(spec) {
-  const { label, embedUrl, host, after } = spec;
-  const button = document.createElement("button");
-  button.className = "linkish";
-  button.textContent = label;
+  const { label, embedUrl, host, after, control } = spec;
+  // What is remembered across a poll is a reader, not a document. The same
+  // archived page is reachable from the Sources list and from the citation
+  // inside the dossier, and keying by URL alone made opening one silently
+  // open the other — and closing either one arrange for the survivor to
+  // vanish at the next poll.
+  const slot = spec.slot ? `${spec.slot} ${embedUrl}` : embedUrl;
+  // Usually a button this makes; sometimes a link already in the text that
+  // should stop being a link (see openLocalCopiesHere).
+  const button = control || document.createElement("button");
+  if (!control) {
+    button.className = "linkish";
+    button.textContent = label;
+  }
   button.setAttribute("aria-expanded", "false");
 
   const close = () => {
     host.querySelector(":scope > .src-body")?.remove();
-    openReaders.delete(embedUrl);
+    openReaders.delete(slot);
     button.setAttribute("aria-expanded", "false");
   };
 
   const open = async (auto) => {
-    openReaders.add(embedUrl);
+    openReaders.add(slot);
     button.setAttribute("aria-expanded", "true");
     const panel = document.createElement("div");
     panel.className = "src-body";
@@ -417,6 +430,7 @@ function reader(spec) {
       // Sanitised server-side, by the same allowlist the standalone page uses.
       content.innerHTML = html;
       panel.appendChild(content);
+      openLocalCopiesHere(content, spec);
       // The toggle that opened this is far above by now.
       const foot = document.createElement("div");
       foot.className = "src-actions src-foot";
@@ -424,18 +438,59 @@ function reader(spec) {
       panel.appendChild(foot);
     } catch (e) {
       panel.textContent = "Could not read it: " + e.message;
-      openReaders.delete(embedUrl);
+      openReaders.delete(slot);
       button.setAttribute("aria-expanded", "false");
     }
   };
 
-  button.onclick = () =>
-    host.querySelector(":scope > .src-body") ? close() : open(false);
+  button.onclick = (event) => {
+    if (event) event.preventDefault();   // a link that is not a navigation
+    return host.querySelector(":scope > .src-body") ? close() : open(false);
+  };
   // Deferred: the card is still being assembled, so the row this panel
   // belongs after may not be in the DOM yet. Reopening after a poll must not
   // scroll — the reader did not ask for it this time.
-  if (openReaders.has(embedUrl)) queueMicrotask(() => open(true));
+  if (openReaders.has(slot)) queueMicrotask(() => open(true));
   return button;
+}
+
+// Every archived citation in a dossier ends with a "local copy" link, and it
+// is written into the Markdown file itself, relatively, so the dossier works
+// as a plain file in the notes folder. Rendered here it became the one link
+// in the app that left the app: tapping it navigated to the source's own
+// page and took the shell with it, closing everything else that was open.
+//
+// So inside a reader it opens the same way a source in the Sources panel
+// does — under the citation it belongs to, with the dossier still where it
+// was. The standalone pages keep the plain link, since there is nothing to
+// stay inside there.
+const LOCAL_COPY = /^\/jobs\/[0-9a-f]{12}\/sources\/.+/;
+
+function openLocalCopiesHere(content, spec) {
+  for (const anchor of content.querySelectorAll("a[href]")) {
+    let target;
+    try {
+      target = new URL(anchor.getAttribute("href"), location.href);
+    } catch (e) { continue; }
+    if (target.origin !== location.origin) continue;
+    if (!LOCAL_COPY.test(target.pathname)) continue;
+    const path = target.pathname;
+    if (`${path}?embed=1` === spec.embedUrl) continue;      // itself
+    // One panel per host, because that is how a reader finds its own: the
+    // citation's list item, which is where the copy belongs anyway.
+    const item = anchor.closest("li");
+    if (!item || !content.contains(item)) continue;
+    if (item.querySelector("[data-reader]")) continue;
+    anchor.dataset.reader = "1";
+    reader({
+      control: anchor,
+      slot: "cited",
+      embedUrl: `${path}?embed=1`,
+      rawUrl: `${path}?raw=1`,
+      pageUrl: path,
+      host: item,
+    });
+  }
 }
 
 function readerActions(spec) {

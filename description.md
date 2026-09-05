@@ -548,6 +548,23 @@ Behavior notes:
   `Save .md` and `Open as page ↗` live in a row at the top of the panel. The
   card and a source row now behave identically, which they did not while the
   dossier had a second control and a source did not.
+- **A "local copy" link opens where it is cited.** Every archived citation
+  in a dossier ends with one, written into the Markdown itself and relative
+  (`sources/NN title.md`), so the file works as a plain file in the notes
+  folder. Rendered in the app — the sanitiser resolves relative hrefs against
+  the report's URL — it became the one link that left the app: it navigated
+  to that source's own page and took the shell with it, closing the dossier
+  and everything else that was open, since what is open lives only in page
+  memory. Inside a reader those links are upgraded into readers of their own,
+  opening under the citation they belong to. The standalone pages keep the
+  plain link: there is nothing to stay inside there, and without scripting
+  the relative link is the only thing that works at all.
+- **An open reader is remembered by where it is, not by what it shows.** The
+  same archived page is reachable from the Sources list and from its citation
+  inside the dossier. Keyed by URL alone, opening one silently opened the
+  other, and closing either one arranged for the survivor to disappear at the
+  next poll. The cached content is still keyed by URL, since the document is
+  the same one either way.
 - **Reading in place is not narrower than the page.** Inside the card's
   padding the measure was 276px against the standalone page's 337 on a 375px
   screen — about eight characters a line, and most of why the page "read
