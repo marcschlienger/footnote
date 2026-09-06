@@ -528,6 +528,11 @@ RETRYABLE_STATUS = frozenset({408, 429, 500, 502, 503, 504})
 MAX_ATTEMPTS = 3
 BASE_BACKOFF_S = 2.0
 MAX_BACKOFF_S = 120.0
+# Wall-clock ceiling for one scrape, request and body together. httpx's read
+# timeout only bounds the gap between chunks, so it cannot end a response that
+# keeps trickling — and a stuck scrape holds one of the plan's two browser
+# slots for as long as it lasts.
+SCRAPE_DEADLINE_S = 150.0
 RESULT_RETRY_S = 5.0         # between attempts at a finished run's result
 OUT_OF_CREDITS = "Firecrawl credits exhausted (HTTP 402)"
 # How long a 402 speaks for the whole key. Long enough that the jobs behind
@@ -909,18 +914,32 @@ async def _scrape_one(
                 # landed, or the batch bound becomes the batch size.
                 if limiter.out_of_credits():
                     return SourceCopy(cit.url, cit.title, "", False, OUT_OF_CREDITS)
-                resp = await client.post(
-                    f"{FIRECRAWL_BASE}/scrape",
-                    headers={"Authorization": f"Bearer {api_key}"},
-                    json={
-                        "url": cit.url,
-                        "formats": ["markdown"],
-                        "onlyMainContent": True,
-                    },
-                    timeout=httpx.Timeout(90.0, connect=15.0),
+                # Two bounds, because httpx's read timeout is per chunk —
+                # "the maximum duration to wait for a chunk of data to be
+                # received" — and not a deadline for the request. A server
+                # that dribbles a byte inside every window holds this slot
+                # for as long as it likes. The httpx timeouts stay as the
+                # inactivity bound; wait_for is the wall-clock one, the same
+                # shape the Parallel poll already uses.
+                resp = await asyncio.wait_for(
+                    client.post(
+                        f"{FIRECRAWL_BASE}/scrape",
+                        headers={"Authorization": f"Bearer {api_key}"},
+                        json={
+                            "url": cit.url,
+                            "formats": ["markdown"],
+                            "onlyMainContent": True,
+                        },
+                        timeout=httpx.Timeout(90.0, connect=15.0),
+                    ),
+                    timeout=SCRAPE_DEADLINE_S,
                 )
         except Exception as exc:                           # noqa: BLE001
-            error = clean_text(str(exc))[:200]
+            # A bare TimeoutError stringifies to nothing, and "" as the
+            # reason a source is missing tells the reader of the dossier
+            # less than the exception's own name does.
+            error = (clean_text(str(exc))[:200]
+                     or f"{type(exc).__name__} after {SCRAPE_DEADLINE_S:g}s")
             if attempt == MAX_ATTEMPTS:
                 break
             await asyncio.sleep(min(backoff * random.uniform(0.5, 1.5),

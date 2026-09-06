@@ -221,16 +221,26 @@ build their own depth picker.
 
 ```json
 { "status": "ok", "app": "Footnote",
-  "output_dir_writable": true,
+  "output_dir_writable": true, "data_dir_writable": true,
+  "job_history_usable": true,
   "parallel_configured": true, "firecrawl_configured": true,
   "notion_configured": false, "push_configured": true,
   "auth_required": true, "active_jobs": 1 }
 ```
 
 Always public (it reports `auth_required` so clients can detect the token
-requirement), which is also why it says whether the output folder can be
-written but not where it is. The PWA uses it to warn about missing
-configuration.
+requirement), which is also why it says whether the folders can be written
+but not where they are. The PWA uses it to warn about missing configuration.
+
+Two folders, because they fail independently and the second one costs money:
+`DATA_DIR` holds `jobs.json`, and `jobs.json` holds the Parallel `run_id`
+that lets a restart re-attach to a run instead of paying for it again.
+`job_history_usable` is false when something that is not a regular file is
+sitting where `jobs.json` belongs; not existing yet is the first-run state
+and is fine. Both writability checks ask whether the path *is a directory* —
+a regular file is writable and executable often enough to pass a bare access
+check, and that reported a broken installation as healthy while every write
+failed.
 
 ## The dossier
 

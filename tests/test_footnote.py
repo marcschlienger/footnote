@@ -3839,3 +3839,163 @@ def test_health_and_shell_public_when_locked(locked_client):
     assert locked_client.get("/health").status_code == 200
     assert locked_client.get("/manifest.json").status_code == 200
     assert locked_client.get("/service-worker.js").status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# A review round: a record that was never written must not outlive the request
+# ---------------------------------------------------------------------------
+
+def test_a_job_that_could_not_be_written_down_never_runs(tmp_path, monkeypatch):
+    """/research mutated jobs.data and then saved. A save that failed raised,
+    but the queued record stayed in memory with no task behind it — and any
+    later successful save persisted it, after which startup resumed it and
+    paid Parallel for research nobody asked for twice."""
+    monkeypatch.setattr(app_module, "PARALLEL_API_KEY", "test-key")
+    store = app_module.JsonStore(tmp_path / "jobs.json")
+    monkeypatch.setattr(app_module, "jobs", store)
+
+    def full_disk(self):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(app_module.JsonStore, "save", full_disk)
+    answer = TestClient(app_module.app).post(
+        "/research", json={"question": "What does this cost?"})
+    assert answer.status_code == 503
+    assert "nothing was started" in answer.json()["detail"]
+    assert store.data == {}, "a job nobody wrote down survived the request"
+
+    # And the store is not carrying it for a later save to persist.
+    monkeypatch.undo()
+    monkeypatch.setattr(app_module, "jobs", store)
+    store.save()
+    assert json.loads(store.path.read_text(encoding="utf-8")) == {}
+
+
+def test_a_failed_save_changes_neither_memory_nor_the_folder(tmp_path):
+    """Two halves of the same rule. The cleaning used to be applied to
+    self.data before the file was written, so a failed write left memory
+    holding a state the disk never saw; and the temp file stayed behind, in a
+    directory a sync client may be watching."""
+    store = app_module.JsonStore(tmp_path / "jobs.json")
+    store.data = {"a": {"id": "a", "status": "done"}}
+    store.save()
+    before = dict(store.data)
+
+    def half_written(obj, fh, **kw):
+        fh.write('{"a"')
+        raise OSError(28, "No space left on device")
+
+    real_dump = app_module.json.dump
+    app_module.json.dump = half_written
+    try:
+        with pytest.raises(OSError):
+            store.data["b"] = {"id": "b", "status": "queued"}
+            store.save()
+    finally:
+        app_module.json.dump = real_dump
+
+    assert [p.name for p in tmp_path.iterdir() if p.suffix == ".tmp"] == []
+    assert json.loads(store.path.read_text(encoding="utf-8")) == before
+
+    # Nor did the cleaning touch memory. It used to be applied to self.data
+    # and the file written from it afterwards, so a write that failed left
+    # memory holding a state the disk had never seen — here, a key the
+    # candidate drops. Only a successful write may change what is held.
+    store.data = dict(before)
+    store.data[""] = {"id": "", "status": "queued"}      # not a storable key
+    app_module.json.dump = half_written
+    try:
+        with pytest.raises(OSError):
+            store.save()
+    finally:
+        app_module.json.dump = real_dump
+    assert "" in store.data, "a failed save edited the store it did not write"
+    store.save()
+    assert "" not in store.data                          # …and a good one does
+
+    # save() itself does not roll memory back — staged() is what does.
+    store.data = dict(before)
+    with pytest.raises(OSError):
+        with store.staged():
+            store.data["b"] = {"id": "b", "status": "queued"}
+            app_module.json.dump = half_written
+            try:
+                raise OSError(28, "No space left on device")
+            finally:
+                app_module.json.dump = real_dump
+    assert store.data == before
+
+
+def test_a_directory_is_not_a_file_pretending_to_be_one(tmp_path):
+    """An executable regular file is writable and executable, which is all
+    the access check asked, so /health called a broken installation healthy
+    while every write failed."""
+    victim = tmp_path / "notes"
+    victim.write_text("I am a file\n", encoding="utf-8")
+    victim.chmod(0o755)
+    assert app_module._dir_writable(victim) is False
+    assert app_module._dir_writable(tmp_path) is True
+    # A folder that does not exist yet is judged by the parent that must
+    # hold it, which is the case the walk was written for.
+    assert app_module._dir_writable(tmp_path / "not-yet" / "deeper") is True
+    assert app_module._dir_writable(victim / "under-a-file") is False
+
+
+def test_health_reports_the_folder_that_holds_the_run_id(tmp_path, monkeypatch):
+    """DATA_DIR is the duplicate-payment boundary — it holds the Parallel
+    run_id, and a job whose run_id cannot be written is one a restart pays
+    for again. Health said nothing about it."""
+    monkeypatch.setattr(app_module, "DATA_DIR", tmp_path / "data")
+    monkeypatch.setattr(app_module, "jobs",
+                        app_module.JsonStore(tmp_path / "data" / "jobs.json"))
+    body = TestClient(app_module.app).get("/health").json()
+    assert body["data_dir_writable"] is True
+    assert body["job_history_usable"] is True
+
+    (tmp_path / "data").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "data" / "jobs.json").mkdir()          # a directory, not a file
+    body = TestClient(app_module.app).get("/health").json()
+    assert body["job_history_usable"] is False
+
+
+def test_a_scrape_cannot_hold_a_slot_indefinitely(monkeypatch):
+    """httpx's read timeout is "the maximum duration to wait for a chunk of
+    data to be received" — per chunk, not per request. A server dribbling a
+    byte inside every window held one of the plan's two browser slots for as
+    long as it liked."""
+    monkeypatch.setattr(pipeline, "SCRAPE_DEADLINE_S", 1.0)
+    monkeypatch.setattr(pipeline, "MAX_ATTEMPTS", 1)
+
+    async def run():
+        async def dribble(reader, writer):
+            await reader.readuntil(b"\r\n\r\n")
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                         b"Content-Length: 100000\r\n\r\n")
+            try:
+                while True:
+                    writer.write(b" ")
+                    await writer.drain()
+                    await asyncio.sleep(0.05)
+            except Exception:                              # noqa: BLE001
+                pass
+
+        server = await asyncio.start_server(dribble, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        monkeypatch.setattr(pipeline, "FIRECRAWL_BASE",
+                            f"http://127.0.0.1:{port}/v2")
+        limiter = pipeline.ScrapeLimiter(rate_limit=10, concurrency=2)
+        cit = Citation(url="https://x.test/a", title="A", excerpts=[])
+        async with httpx.AsyncClient() as client:
+            try:
+                return await pipeline._scrape_one(client, "key", cit, limiter)
+            finally:
+                server.close()
+
+    started = time.monotonic()
+    copy = asyncio.run(asyncio.wait_for(run(), 20))
+    took = time.monotonic() - started
+    assert took < 10, f"the scrape ran for {took:.1f}s past a 1s deadline"
+    assert copy.ok is False
+    # A bare TimeoutError stringifies to nothing, and "" is not a reason.
+    assert copy.error.strip()
+    assert "Timeout" in copy.error

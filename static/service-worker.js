@@ -83,11 +83,21 @@ const jobOf = (url) => {
 
 // The only way anything is written to a cache: checked before the put and
 // again after it, because the delete can land between those two lines.
-async function keep(cache, request, response) {
+// A generation for the caches as a whole, bumped when the token is revoked.
+// forgetEverything deletes the caches; a request already in flight then
+// re-opens one by name and writes into it, so what it dropped comes back
+// under the old token. Per-job deletion was guarded and this was not.
+let cacheGeneration = 0;
+
+async function keep(cache, request, response, cacheStartedAt) {
   const job = jobOf(request.url);
   if (job && forgotten.has(job)) return;
+  if (cacheStartedAt !== undefined && cacheGeneration !== cacheStartedAt) return;
   await cache.put(request, response);
-  if (job && forgotten.has(job)) await cache.delete(request);
+  if ((job && forgotten.has(job)) ||
+      (cacheStartedAt !== undefined && cacheGeneration !== cacheStartedAt)) {
+    await cache.delete(request);
+  }
 }
 
 self.addEventListener("fetch", (event) => {
@@ -115,13 +125,17 @@ self.addEventListener("fetch", (event) => {
 
 async function networkFirst(request, cacheName, markFallback = false) {
   const url = new URL(request.url);
+  const cacheStartedAt = cacheGeneration;
   try {
     const res = await fetch(request);
     // Only successful responses: an unauthorized page must never be cached
     // as though it were the app.
     // Awaited: an unawaited put can still be in flight when the response
     // settles, and the browser is free to stop the worker at that point.
-    if (res.ok) await keep(await caches.open(cacheName), request, res.clone());
+    if (res.ok) {
+      await keep(await caches.open(cacheName), request, res.clone(),
+                 cacheStartedAt);
+    }
     else if (res.status === 401) await forgetEverything();
     else if (res.status === 404 || res.status === 410) await forgetJob(url);
     return res;
@@ -135,9 +149,10 @@ async function networkFirst(request, cacheName, markFallback = false) {
 async function cacheThenRefresh(event) {
   const cache = await caches.open(DOSSIER_CACHE);
   const cached = await cache.match(event.request);
+  const cacheStartedAt = cacheGeneration;
   const fresh = fetch(event.request).then(async (res) => {
     if (res.ok) {
-      await keep(cache, event.request, res.clone());
+      await keep(cache, event.request, res.clone(), cacheStartedAt);
       await trim(cache, DOSSIER_MAX);
     } else if (res.status === 401) {
       await forgetEverything();
@@ -187,6 +202,7 @@ self.addEventListener("message", (event) => {
 // until its site data is cleared, which is a property of browser storage, not
 // something a server can revoke.
 async function forgetEverything() {
+  cacheGeneration += 1;
   await Promise.all([caches.delete(SHELL_CACHE), caches.delete(DOSSIER_CACHE)]);
 }
 

@@ -312,11 +312,19 @@ Firecrawl semaphore that paces everything after them.
 
 → `{"success": true, "data": {"markdown": "…", "metadata": {"title": "…"}}}`.
 
-Scraping is **best-effort by design**: up to `MAX_SOURCES` pages, 90 s
-timeout each; any failure (HTTP error, `success: false`, empty extraction)
-demotes that source to the "could not be archived" list with its reason. A
-scrape failure can never fail the job — the dossier's claims and links don't
-depend on it.
+Scraping is **best-effort by design**: up to `MAX_SOURCES` pages; any
+failure (HTTP error, `success: false`, empty extraction) demotes that source
+to the "could not be archived" list with its reason. A scrape failure can
+never fail the job — the dossier's claims and links don't depend on it.
+
+Each scrape carries **two bounds, and it needs both**. httpx's read timeout
+is per chunk — "the maximum duration to wait for a chunk of data to be
+received" — so a server that dribbles a byte inside every window is never
+timed out by it, and one of the plan's two browser slots stays occupied for
+as long as it cares to keep trickling. The httpx timeouts (90 s idle, 15 s
+connect) remain the inactivity bound; `SCRAPE_DEADLINE_S` wraps the whole
+request and body in wall-clock time, the same shape the Parallel poll has
+always used.
 
 **Pacing is built for the free plan**, whose published limits are 10
 `/scrape` requests a minute and 2 concurrent browsers; `FIRECRAWL_RATE_LIMIT`
@@ -700,6 +708,22 @@ Behavior notes:
 Threat model: a personal server on a private network (LAN or tailnet),
 optionally hardened one notch.
 
+- **A job is written down before it exists.** A record whose status is
+  "queued" is resumed at startup and pays Parallel for the research, so the
+  store publishes a change only once `os.replace` has returned: `save()`
+  builds a cleaned candidate, writes and fsyncs it, and adopts it afterwards,
+  and `staged()` restores the previous state if any of that fails. The old
+  order — mutate memory, then write — meant a `/research` whose save failed
+  answered with an error while leaving a queued record behind, which any
+  later successful save then persisted. A failed write also used to leave its
+  temp file in the data directory, which sits beside the dossiers and may be
+  watched by a sync client.
+- **A cache purge cannot be undone by a request that started before it.** A
+  401 means the token was changed or revoked, and the service worker drops
+  both caches — but a fetch already in flight then opens a cache by name,
+  which creates it again, and writes what it fetched under the old token.
+  `cacheGeneration` is captured when a handler starts and re-checked around
+  the `put`, the same guard per-job deletion already had.
 - `FOOTNOTE_TOKEN` gates everything except `/health` and the PWA shell
   assets (icons/manifest/service worker must load for browser chrome and
   home-screen installs; none are sensitive). Comparison is

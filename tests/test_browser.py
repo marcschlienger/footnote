@@ -614,3 +614,38 @@ def test_a_refresh_in_flight_cannot_put_a_removed_job_back(page, server):
     }""", JOB_ID)
     assert still_cached is False, "a late refresh put the removed dossier back"
     assert not page.evaluate(CACHED_JOB, JOB_ID)
+
+
+def test_a_late_response_cannot_reopen_caches_after_a_revoked_token(page, server):
+    """The same race, one level up. A 401 means the token was changed or
+    revoked, and forgetEverything drops both caches — but a request that was
+    already in flight then opens a cache *by name*, which creates it again,
+    and writes what it fetched under the old token into it.
+
+    Per-job deletion was guarded by `forgotten`; the whole-cache purge had
+    nothing equivalent until cacheGeneration. Driven through the worker's own
+    functions, because the ordering cannot be staged from outside.
+    """
+    _service_worker_ready(page, server)
+    page.goto(f"{server}/jobs/{JOB_ID}/report")
+    page.wait_for_selector(".report-body")
+    assert page.evaluate(CACHED_JOB, JOB_ID)
+
+    worker = page.context.service_workers[0]
+    reopened = worker.evaluate("""async (id) => {
+      const request = new Request(
+        new URL('/jobs/' + id + '/report', self.location.origin));
+      // What a fetch handler captures when it starts…
+      const startedAt = cacheGeneration;
+      // …then the 401 arrives on another request and empties everything…
+      await forgetEverything();
+      // …and the first one finishes, opening the cache again by name.
+      await keep(await caches.open('footnote-dossier-v2'), request,
+                 new Response('<p>late</p>',
+                              {headers: {'Content-Type': 'text/html'}}),
+                 startedAt);
+      const cache = await caches.open('footnote-dossier-v2');
+      return !!(await cache.match(request));
+    }""", JOB_ID)
+    assert reopened is False, "a late response restored a cache the 401 emptied"
+    assert not page.evaluate(CACHED_JOB, JOB_ID)

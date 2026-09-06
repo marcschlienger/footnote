@@ -31,6 +31,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import contextlib
+import copy
 import io
 import json
 import os
@@ -251,23 +253,60 @@ class JsonStore:
                       flush=True)
 
     def save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=self.path.parent, suffix=".tmp")
+        """Write the store, then adopt what was written.
+
+        In that order, because a job record is a promise to spend money. The
+        cleaning used to be applied to self.data first and the file written
+        afterwards, so a write that failed left memory holding a state that
+        never reached the disk — and any later successful save persisted it.
+        Nothing here touches self.data until os.replace has returned.
+        """
         # clean_json rather than a fallback: escaping a surrogate kept the
         # file writable but reloaded it as a surrogate, so the problem came
         # back on the next read. Cleaning here makes the file structurally
-        # unable to hold something a later load could choke on.
-        # The cleaned structure becomes the store, not just the bytes: the
-        # invariant is about what is held in memory, and a copy that only the
-        # file gets is an invariant nobody can rely on. Values only — a key
-        # is already required to be storable, and cleaning keys is how two of
-        # them came to collide.
-        self.data = {key: pipeline.clean_json(value)
+        # unable to hold something a later load could choke on. Values only —
+        # a key is already required to be storable, and cleaning keys is how
+        # two of them came to collide.
+        candidate = {key: pipeline.clean_json(value)
                      for key, value in self.data.items()
                      if _storable_key(key)}   # keys are already normalized
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(self.data, fh, ensure_ascii=False, indent=1)
-        os.replace(tmp, self.path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=self.path.parent, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(candidate, fh, ensure_ascii=False, indent=1)
+                fh.flush()
+                # The rename is atomic; the bytes reaching the platter are
+                # not. Without this a power cut can leave jobs.json intact
+                # and empty, which is what the temp file was there to stop.
+                os.fsync(fh.fileno())
+            os.replace(tmp, self.path)
+        except BaseException:
+            # The data directory sits beside the dossiers and may be watched
+            # by a sync client; a failed save used to leave its temp file
+            # there for good.
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        self.data = candidate
+
+    @contextlib.contextmanager
+    def staged(self):
+        """Change the store only if the change reaches the disk.
+
+        A record that says "queued" is resumed at startup and pays for the
+        research, so one that was never written down must not outlive the
+        request that failed to write it.
+        """
+        snapshot = copy.deepcopy(self.data)
+        try:
+            yield
+            self.save()
+        except BaseException:
+            self.data = snapshot
+            raise
 
 
 jobs = JsonStore(DATA_DIR / "jobs.json")
@@ -498,11 +537,16 @@ def _update_job(job_id: str, **fields) -> None:
     job = jobs.data.get(job_id)
     if job is None:
         return
-    job.update(fields)
-    # Provider text arrives through here; cleaning the whole record beats a
-    # list of field names that has to be kept in step with the record.
-    _put_job(job_id, job)
-    jobs.save()
+    # Staged for the same reason a new job is: run_id in particular is the
+    # boundary that stops a restart paying for the same research twice, and
+    # memory claiming to hold one that the disk does not is the state that
+    # makes it happen.
+    with jobs.staged():
+        job = copy.deepcopy(job)
+        job.update(fields)
+        # Provider text arrives through here; cleaning the whole record beats
+        # a list of field names that has to be kept in step with the record.
+        _put_job(job_id, job)
 
 
 # ---------------------------------------------------------------------------
@@ -843,17 +887,27 @@ def _scrub(text) -> str:
     return out
 
 
-def _output_dir_writable() -> bool:
-    """Whether a dossier folder could be created, asked of the right directory.
+def _dir_writable(path: Path) -> bool:
+    """Whether a folder could be created at `path`, asked of the right place.
 
-    Once OUTPUT_DIR exists it is the only directory that matters — a writable
+    Once `path` exists it is the only directory that matters — a writable
     parent says nothing about a read-only folder inside it. Before it exists,
     the nearest ancestor that does is what mkdir will have to write into.
+
+    is_dir, not exists: a regular file at the path is writable and executable
+    often enough to pass the access check, and this then called a broken
+    installation healthy while every write failed.
     """
-    target = OUTPUT_DIR
-    while not target.exists() and target.parent != target:
+    target = path
+    while not target.is_dir() and target.parent != target:
+        if target.exists():
+            return False        # something is there, and it is not a folder
         target = target.parent
     return os.access(target, os.W_OK | os.X_OK)
+
+
+def _output_dir_writable() -> bool:
+    return _dir_writable(OUTPUT_DIR)
 
 
 def _now() -> str:
@@ -1304,13 +1358,23 @@ async def start_research(req: ResearchRequest):
         raise HTTPException(422, f"unknown processor {processor!r}; "
                                  f"one of: {', '.join(ALL_PROCESSORS)}")
     job_id = uuid.uuid4().hex[:12]
-    _put_job(job_id, {
-        "id": job_id, "question": req.question, "processor": processor,
-        "status": "queued", "progress": "Queued", "created_at": _now(),
-        "run_id": "", "report_path": "", "notion_url": "", "error": "",
-    })
-    _trim_jobs()
-    jobs.save()
+    # Written down before it exists as far as this process is concerned. A
+    # queued record is resumed at startup and pays Parallel for the research,
+    # so one whose save failed must not be left in memory for a later save to
+    # persist — the request reported failure and nothing should run.
+    try:
+        with jobs.staged():
+            _put_job(job_id, {
+                "id": job_id, "question": req.question, "processor": processor,
+                "status": "queued", "progress": "Queued", "created_at": _now(),
+                "run_id": "", "report_path": "", "notion_url": "", "error": "",
+            })
+            _trim_jobs()
+    except OSError as exc:
+        print(f"could not record job {job_id}: {exc}", flush=True)
+        raise HTTPException(
+            503, "Could not write the job history, so nothing was started. "
+                 "Check that the data directory exists and has room.") from exc
     task = asyncio.create_task(run_research(job_id))
     app.state.tasks.add(task)
     task.add_done_callback(app.state.tasks.discard)
@@ -1644,6 +1708,13 @@ async def health():
         # Where the dossiers are filed is the server's business — clients get
         # told whether the folder works, not where it is.
         "output_dir_writable": _output_dir_writable(),
+        # The data directory is the duplicate-payment boundary: it holds the
+        # Parallel run_id, and a job whose run_id cannot be written is a job
+        # a restart pays for again. Health said nothing about it at all.
+        "data_dir_writable": _dir_writable(DATA_DIR),
+        # A jobs.json that is a directory, or a symlink to nowhere, breaks
+        # every save; not existing yet is fine and is the first-run state.
+        "job_history_usable": jobs.path.is_file() or not jobs.path.exists(),
         "parallel_configured": bool(PARALLEL_API_KEY),
         "firecrawl_configured": bool(FIRECRAWL_API_KEY),
         "respects_robots": RESPECT_ROBOTS,
