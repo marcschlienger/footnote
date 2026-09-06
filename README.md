@@ -489,8 +489,18 @@ tailnet. `100.64.0.0/10` is the Shared Address Space of
 [RFC 6598][rfc6598] — reserved for carrier-grade NAT, which is to say for
 traffic that needs another layer of translation before it reaches the
 internet, and which nothing routes across it. Tailscale hands its node
-addresses out of that range for exactly that reason; `tailscale ip` prints
-yours, one from it and one from Tailscale's IPv6 ULA prefix. That
+addresses out of that range for exactly that reason.
+
+`tailscale ip` prints yours: one from that range, and one from
+`fd7a:115c:a1e0::/48`. That second prefix is not per-tailnet — it is a
+constant compiled into the client, `TailscaleULARange()` in
+[net/tsaddr/tsaddr.go][tsaddr], the IPv6 counterpart of `100.64.0.0/10`. It
+is an RFC 4193 Unique Local Address prefix: `fd` for a locally assigned ULA,
+then the 40-bit global ID Tailscale picked, `7a:115c:a1e0`. The same file
+puts MagicDNS's own resolver at `fd7a:115c:a1e0::53`, the twin of
+`100.100.100.100`, which is the giveaway that these are fixed for everyone
+rather than issued per tailnet. Check it against your own with
+`tailscale ip -6` before trusting it. That
 matters more here than for most self-hosted things: a `POST /research` that
 reaches the server spends Parallel credit, and the only thing in the way is
 `FOOTNOTE_TOKEN` — one shared bearer token, no rate limiting, no lockout.
@@ -514,21 +524,30 @@ footnote.example.com {
 	tls {
 		dns cloudflare {env.CLOUDFLARE_API_TOKEN}
 	}
-	# A backstop, not the mechanism: if that A record is ever changed to a
-	# public address, this turns the mistake into a 403 rather than an
-	# exposure. remote_ip matches the immediate peer, which over Tailscale
-	# is the 100.x address, and Caddy's directive order puts respond ahead
-	# of reverse_proxy, so the refusal happens before the proxy sees it.
-	# Both families: a node has a v4 and a v6 tailnet address, and a
-	# request arriving over the v6 one would fail a v4-only match.
-	# It is a backstop and not a wall: the same range is what ISPs put
-	# their own CGNAT customers behind, so a public record plus this
-	# matcher would still admit some of them.
+	# Both address families: a node has one of each, and a request over
+	# the v6 one would fail a v4-only match. See below — this line does
+	# more work than it looks like.
 	@outside not remote_ip 100.64.0.0/10 fd7a:115c:a1e0::/48
 	respond @outside 403
 	reverse_proxy 127.0.0.1:8010
 }
 ```
+
+**That `remote_ip` line is the enforcing control, not decoration.** If this
+proxy already serves another site, it is listening on every interface, and a
+vhost answers to whatever name is asked for — a client that connects to the
+public address and sends this hostname as SNI reaches the site, whatever the
+DNS record says. The record keeps the name from resolving anywhere useful;
+the matcher is what refuses the connection. Note its limit: `100.64.0.0/10`
+is also where ISPs put their own CGNAT customers, so it identifies "arrived
+over something CGNAT-shaped", not "arrived over your tailnet".
+
+The airtight version is `bind <tailnet-address>` in the site block, which
+stops anything from listening publicly for these names at all. Two costs
+before you reach for it: Caddy does not share vhosts across listeners, so
+every *other* site on this proxy stops answering on that address, and the
+listener needs the interface to exist when Caddy starts, which means ordering
+the unit after `tailscaled`.
 
 Two Caddy defaults are already what Footnote needs. It "sets the
 `X-Forwarded-Proto` header field" ([reverse_proxy][caddy-rp]), which is what
@@ -571,6 +590,7 @@ Order matters: prove the new path works before closing the old one.
 
 [caddy-rp]: https://caddyserver.com/docs/caddyfile/directives/reverse_proxy
 [rfc6598]: https://www.rfc-editor.org/rfc/rfc6598#section-7
+[tsaddr]: https://github.com/tailscale/tailscale/blob/main/net/tsaddr/tsaddr.go
 
 ## Install
 
