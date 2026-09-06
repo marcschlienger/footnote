@@ -704,7 +704,11 @@ optionally hardened one notch.
   assets (icons/manifest/service worker must load for browser chrome and
   home-screen installs; none are sensitive). Comparison is
   `secrets.compare_digest`; the cookie is `HttpOnly` + `SameSite=Strict`,
-  which also closes the CSRF window an open LAN server has.
+  which closes the cross-site half of the CSRF window an open LAN server
+  has. Only that half: `Strict` is about the site, and a site is the scheme
+  plus the registrable domain, so another service on the same host — a
+  different port is the same site — sends the cookie along with its
+  requests.
 - Job IDs are 12 hex chars of UUID4 — unguessable enough for the threat
   model, and the report/source endpoints resolve only through the job
   store (no filesystem paths from the client; source filenames are checked

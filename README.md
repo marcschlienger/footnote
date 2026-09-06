@@ -357,8 +357,11 @@ Clients can present the token three ways, same contract as Margin:
   server's access log — the redirect limits the exposure rather than erasing
   it. After that the PWA works with no decoration. The home-screen app
   authenticates the same way — its cookie storage is separate from Safari's,
-  so it shows a token form on first launch. Because the cookie is `Strict`,
-  other websites can never ride it.
+  so it shows a token form on first launch. `Strict` stops other *sites*
+  riding the cookie. It is not the same as other origins: a site is the
+  scheme plus the registrable domain and does not include the port, so a
+  page served by a different service on the same host still counts as
+  same-site and its requests carry the cookie.
 
 ## Push notifications
 
@@ -466,6 +469,108 @@ a `Secure` cookie is only sent to a URI whose scheme is secure
 the HTTPS session's cookie is never sent over `http://` to that host and you
 would be re-authenticating constantly. Use the machine name for HTTPS and the
 tailnet IP for HTTP, and they stay independent.
+
+## Behind a reverse proxy (Caddy)
+
+If a proxy already terminates TLS for other services on this machine, that is
+the tidier home for Footnote too: one thing owns certificates and renewal,
+the config sits in a file beside everything else's, and each app gets a
+hostname you chose instead of a port number.
+
+**None of this has to be public.** Point the DNS record at the server's
+*tailnet* address rather than its public one:
+
+```
+footnote.example.com.    A    100.101.102.103      # tailscale ip -4
+```
+
+The name then resolves for anyone and connects for nobody outside the
+tailnet. `100.64.0.0/10` is the Shared Address Space of
+[RFC 6598][rfc6598] — reserved for carrier-grade NAT, which is to say for
+traffic that needs another layer of translation before it reaches the
+internet, and which nothing routes across it. Tailscale hands its node
+addresses out of that range for exactly that reason; `tailscale ip` prints
+yours, one from it and one from Tailscale's IPv6 ULA prefix. That
+matters more here than for most self-hosted things: a `POST /research` that
+reaches the server spends Parallel credit, and the only thing in the way is
+`FOOTNOTE_TOKEN` — one shared bearer token, no rate limiting, no lockout.
+
+The one thing that follows: Let's Encrypt cannot reach that address either,
+so the certificate has to come from a **DNS-01 challenge**, which needs a DNS
+provider plugin.
+
+```bash
+sudo caddy add-package github.com/caddy-dns/cloudflare   # your provider
+sudo systemctl restart caddy
+```
+
+`add-package` is marked experimental and replaces the binary in place, so a
+later `apt upgrade caddy` puts the stock one back and certificates stop
+renewing. Pin the package, or build with `xcaddy` and install outside apt's
+reach.
+
+```caddyfile
+footnote.example.com {
+	tls {
+		dns cloudflare {env.CLOUDFLARE_API_TOKEN}
+	}
+	# A backstop, not the mechanism: if that A record is ever changed to a
+	# public address, this turns the mistake into a 403 rather than an
+	# exposure. remote_ip matches the immediate peer, which over Tailscale
+	# is the 100.x address, and Caddy's directive order puts respond ahead
+	# of reverse_proxy, so the refusal happens before the proxy sees it.
+	# Both families: a node has a v4 and a v6 tailnet address, and a
+	# request arriving over the v6 one would fail a v4-only match.
+	# It is a backstop and not a wall: the same range is what ISPs put
+	# their own CGNAT customers behind, so a public record plus this
+	# matcher would still admit some of them.
+	@outside not remote_ip 100.64.0.0/10 fd7a:115c:a1e0::/48
+	respond @outside 403
+	reverse_proxy 127.0.0.1:8010
+}
+```
+
+Two Caddy defaults are already what Footnote needs. It "sets the
+`X-Forwarded-Proto` header field" ([reverse_proxy][caddy-rp]), which is what
+the auth cookie reads to decide it may carry `Secure`; and
+`response_header_timeout` defaults to "No timeout", which matters because a
+job's status is polled while deep research runs for minutes to hours.
+
+Then bind Footnote to loopback, or the plain-HTTP port stays open on the
+tailnet alongside the HTTPS name — two origins for one app, each with its own
+push subscriptions:
+
+```bash
+# /etc/footnote/<user>.env
+HOST=127.0.0.1
+sudo systemctl restart footnote@<user>
+ss -ltnp | grep 8010        # expect 127.0.0.1:8010, not 0.0.0.0:8010
+```
+
+**If you point the record at a public address instead**, add a second gate at
+the proxy — `basic_auth`, mTLS, or an IP allowlist. A token that buys API
+credit is worth guessing at.
+
+### Switching an install that is already running
+
+Order matters: prove the new path works before closing the old one.
+
+1. Add the DNS record, add the Caddy block, `caddy validate` and reload.
+2. Watch `journalctl -u caddy -f` for `certificate obtained successfully`.
+3. Open `https://footnote.example.com/?token=<token>` on one device. Only
+   when that works, set `HOST=127.0.0.1` and restart the service.
+4. On **every** device: open the URL once with `?token=…`, delete the old
+   home-screen app and re-add it from the new address, subscribe to push
+   again, and update the iOS Shortcut. A PWA keeps the origin it was
+   installed from, and service workers, caches, cookies and push
+   subscriptions are all per-origin — the old install will never see the new
+   server. Footnote prunes the dead subscriptions itself once the push
+   service answers 404/410.
+5. Running jobs survive it: a job resumes from its stored Parallel `run_id`
+   across a restart, so a research run in flight is not lost by any of this.
+
+[caddy-rp]: https://caddyserver.com/docs/caddyfile/directives/reverse_proxy
+[rfc6598]: https://www.rfc-editor.org/rfc/rfc6598#section-7
 
 ## Install
 

@@ -21,7 +21,7 @@
 # version number.
 set -euo pipefail
 
-cd "$(dirname "${BASH_SOURCE[0]}")/.."
+cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 PYTHON="${1:-python3}"
 OUT="deploy/constraints.txt"
 
